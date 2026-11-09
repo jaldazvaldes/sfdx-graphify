@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>64.0</apiVersion>
+    <label>Synthetic account example</label>
+    <processType>AutoLaunchedFlow</processType>
+    <status>Draft</status>
+    <start>
+        <object>Account</object>
+        <triggerType>RecordAfterSave</triggerType>
+        <recordTriggerType>Update</recordTriggerType>
+        <filters>
+            <field>Name</field>
+            <operator>EqualTo</operator>
+            <value><stringValue>Sample</stringValue></value>
+        </filters>
+        <connector><targetReference>GetContact</targetReference></connector>
+    </start>
+    <recordLookups>
+        <name>GetContact</name>
+        <label>Get a sample contact</label>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+        <object>Contact</object>
+        <filters>
+            <field>AccountId</field>
+            <operator>EqualTo</operator>
+            <value><elementReference>$Record.Id</elementReference></value>
+        </filters>
+        <getFirstRecordOnly>true</getFirstRecordOnly>
+        <storeOutputAutomatically>true</storeOutputAutomatically>
+        <connector><targetReference>UpdateDescription</targetReference></connector>
+    </recordLookups>
+    <recordUpdates>
+        <name>UpdateDescription</name>
+        <label>Copy the sample contact name</label>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+        <object>Account</object>
+        <filters>
+            <field>Id</field>
+            <operator>EqualTo</operator>
+            <value><elementReference>$Record.Id</elementReference></value>
+        </filters>
+        <inputAssignments>
+            <field>Description</field>
+            <value><elementReference>GetContact.LastName</elementReference></value>
+        </inputAssignments>
+        <connector><targetReference>CallChild</targetReference></connector>
+    </recordUpdates>
+    <subflows>
+        <name>CallChild</name>
+        <label>Call the sample child</label>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+        <flowName>SampleChild</flowName>
+        <connector><targetReference>RunSampleAction</targetReference></connector>
+    </subflows>
+    <actionCalls>
+        <name>RunSampleAction</name>
+        <label>Run the synthetic Apex action</label>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+        <actionType>apex</actionType>
+        <actionName>SampleAction</actionName>
+    </actionCalls>
+</Flow>

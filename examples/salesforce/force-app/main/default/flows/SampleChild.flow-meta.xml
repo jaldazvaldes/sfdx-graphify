@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>64.0</apiVersion>
+    <label>Synthetic child example</label>
+    <processType>AutoLaunchedFlow</processType>
+    <status>Draft</status>
+    <variables>
+        <name>sampleRecord</name>
+        <dataType>SObject</dataType>
+        <objectType>Sample__c</objectType>
+        <isCollection>false</isCollection>
+        <isInput>true</isInput>
+        <isOutput>false</isOutput>
+    </variables>
+</Flow>

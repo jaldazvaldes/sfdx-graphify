@@ -4,3 +4,6 @@
 worked/**/*.html linguist-vendored=true
 graphify-out/**/*.html linguist-vendored=true
 *.html linguist-detectable=false
+
+# Preserve the vendored renderer bytes used by the upstream SRI integrity pin.
+graphify/salesforce/viewer_static/vis-network.min.js -text

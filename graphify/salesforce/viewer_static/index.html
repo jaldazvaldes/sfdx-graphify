@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Salesforce dependency explorer</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <script defer src="/viewer.js"></script>
+</head>
+<body>
+  <header class="page-header">
+    <div><p class="eyebrow">sfdx-graphify · local snapshot</p><h1>Salesforce dependency explorer</h1>
+      <p class="subtitle">Start with a component. Follow a relationship. Check its source evidence.</p></div>
+    <a class="secondary" href="/">← Full project graph</a>
+  </header>
+  <section class="build-strip" aria-label="Snapshot information">
+    <div><span class="meta-label">Source revision</span><strong id="revision">Loading…</strong></div>
+    <div><span class="meta-label">Indexed components</span><strong id="component-count">—</strong></div>
+    <div><span class="meta-label">Freshness</span><strong>Not checked against live source</strong></div>
+    <details class="coverage"><summary id="coverage-label">Coverage details</summary><div id="coverage-details"></div></details>
+  </section>
+  <section id="comparison" class="comparison" hidden aria-label="Snapshot comparison"></section>
+  <main class="workspace">
+    <aside class="controls">
+      <label class="control-title" for="search">Find a component</label>
+      <p class="hint">Search a component, such as a field, Flow, Apex class, or validation rule</p>
+      <div class="search-box"><input id="search" type="search" placeholder="For example, Account.Name" autocomplete="off" maxlength="160" aria-controls="search-results"></div>
+      <p id="search-summary" class="hint" aria-live="polite"></p>
+      <div id="search-results" class="search-results" aria-label="Component search results"></div>
+      <div class="focus-card"><span class="meta-label">Selected component</span><strong id="focus-name">Choose a component</strong><p id="focus-kind" class="hint">Search the full snapshot above.</p><div id="focus-metadata"></div></div>
+      <fieldset class="mode-group"><legend class="control-title">Explore</legend>
+        <button data-mode="impact" class="mode active" aria-pressed="true"><strong>Impact</strong><span>What refers to this component?</span></button>
+        <button data-mode="automation" class="mode" aria-pressed="false"><strong>Automation</strong><span>What does it call, read, or change?</span></button>
+        <button data-mode="schema" class="mode" aria-pressed="false"><strong>Schema</strong><span>Fields and declared lookup targets</span></button>
+      </fieldset>
+      <div class="filter-grid">
+        <label for="depth">Reference depth<select id="depth"><option value="1">1 · direct references</option><option value="2">2 · one step further</option><option value="3">3 · broader context</option></select></label>
+        <label for="status">Local Flow XML status<select id="status"><option value="all">All statuses</option></select></label>
+      </div>
+      <p class="hint">“Active” is a value in source metadata. It does not establish the deployed status.</p>
+      <button id="back" class="secondary" disabled>← Previous component</button>
+      <div class="boundary-note">Missing links do not prove that a dependency is absent. Verify current source before making a consequential change.</div>
+    </aside>
+    <section class="results">
+      <div class="view-heading"><div><p class="eyebrow" id="mode-heading">Impact view</p><h2 id="view-title">Choose where to start</h2><p id="view-description" class="hint">Use search to open a small, named view of the relationships that matter.</p></div><button id="center" class="secondary" disabled>Center selection</button></div>
+      <p id="error" class="error" role="alert" hidden></p>
+      <div id="view-notes" class="view-notes" aria-live="polite"></div>
+      <div id="graph-wrap" class="graph-wrap" tabindex="0" aria-label="Scrollable dependency diagram">
+        <div id="empty" class="empty"><div class="empty-symbol">↗</div><h3>A useful view starts with a question</h3><p>Choose a field to inspect its references, a Flow to explore automation, or an object to see its schema.</p><div class="examples"><button data-example="Account">Object: Account</button><button data-example="Account.Name">Field: Account.Name</button></div></div>
+        <svg id="graph" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Directed dependency relationships" hidden></svg>
+      </div>
+      <div class="graph-footer"><div id="legend" class="legend"></div><span class="hint">Arrows show references, never execution order. Click a node to explore it.</span></div>
+      <section class="evidence-panel" aria-labelledby="evidence-heading">
+        <div class="evidence-heading"><div><p class="eyebrow">Traceable source</p><h2 id="evidence-heading">Relationship evidence</h2></div><span id="evidence-count" class="pill" hidden></span></div>
+        <p id="evidence-empty" class="hint">Select an arrow or a relationship below to see its file, line, and extraction context.</p>
+        <div id="relationship-list" class="relationship-list" aria-label="Visible relationships"></div>
+        <div id="evidence-content" hidden>
+          <div class="evidence-tools"><label for="canonical-relation">Underlying relationship<select id="canonical-relation"></select></label><button id="evidence-snapshot" class="secondary" hidden>Show before evidence</button></div>
+          <p id="qualifiers" class="qualifiers"></p><div class="table-wrap"><table><thead><tr><th>Source file</th><th>Line</th><th>XML / source locator</th><th>Extraction rule</th></tr></thead><tbody id="evidence-rows"></tbody></table></div>
+          <div class="evidence-pager"><span id="evidence-page" class="hint"></span><button id="evidence-more" class="secondary" hidden>Next evidence page →</button></div>
+        </div>
+        <details id="component-diagnostics" class="component-diagnostics" hidden>
+          <summary id="diagnostic-summary">Source diagnostics</summary>
+          <p id="diagnostic-codes" class="qualifiers"></p>
+          <p id="diagnostic-scope" class="hint"></p>
+          <ul id="diagnostic-rows"></ul>
+          <button id="diagnostic-more" class="secondary" hidden>All source diagnostics</button>
+        </details>
+      </section>
+    </section>
+  </main>
+</body>
+</html>
