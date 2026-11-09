@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.1: local Salesforce dependency evidence
+sfdx-graphify 0.5.2: local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
 endorsed by Graphify Labs or Salesforce. Preserve LICENSE, LICENSE-MIT and NOTICE.
@@ -6,9 +6,9 @@ endorsed by Graphify Labs or Salesforce. Preserve LICENSE, LICENSE-MIT and NOTIC
 Run from an isolated Python 3.10+ environment with this checkout installed.
 Install the fixed fork release with:
 
-  python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.1"
+  python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.2"
 
-The Salesforce extractor reports 0.5.1; the inherited graphifyy package keeps
+The Salesforce extractor reports 0.5.2; the inherited graphifyy package keeps
 its upstream version. The sfdx-prefixed Git tag identifies the fork release.
 The module form works without installing the console script:
 
@@ -164,6 +164,14 @@ Classes with a fully resolved local superclass chain also resolve static class
 calls, Database operations and corroborated namespace calls when local or
 inherited members do not shadow the qualifier. Unknown, ambiguous, cyclic or
 unparsed superclass chains remain diagnostic instead of implying a static call.
+Recognized namespace receivers are treated as class qualifiers rather than
+record fields; their arguments still contribute dependencies and diagnostics.
+An enhanced for loop with an explicitly declared single-record element type
+supports direct reads, memory assignments and explicit DML in its body. The
+element binding never leaks into the iterable expression or outside the loop.
+This uses the declared element type, not inference from a collection or a
+method's return value. Unknown, primitive and collection-valued element types
+remain outside coverage. Assigning a field is not proof of a database write.
 Parent paths in static SOQL resolve through declared lookup targets and a small
 explicit standard-schema vocabulary, with the traversal retained in evidence.
 Trigger declarations retain their object and event list with original source
@@ -383,11 +391,14 @@ SYNTHETIC EXAMPLE
 examples/salesforce contains fictional extraction fixtures only. To try them
 before adding the files to Git, use --include-untracked and external output:
 
-  python -m graphify.salesforce build examples/salesforce --include-untracked --out <external-demo-directory>
+  python -m graphify.salesforce build examples/salesforce --include-untracked --include-inactive --out <external-demo-directory>
   python -m graphify.salesforce refs Contact.LastName --snapshot <external-demo-directory>
   python -m graphify.salesforce deps SampleAccount --snapshot <external-demo-directory>
   python -m graphify.salesforce view Contact.LastName --snapshot <external-demo-directory> --depth 2
   python -m graphify.salesforce serve --snapshot <external-demo-directory>
+
+The example Flows are Draft metadata. --include-inactive above includes them
+only for this synthetic demonstration; normal project builds exclude Draft.
 
 AGENT USE
 

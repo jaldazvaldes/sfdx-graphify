@@ -164,10 +164,7 @@ class _TriggerExtractor(_MethodExtractor):
                         if cid:
                             self.constructed.append(_Constructed(binding, cid))
             elif node.type == "enhanced_for_statement":
-                owner, collection = self.record_type(node.child_by_field_name("type"))
-                self.bindings.append(Binding(self.unit.text(node.child_by_field_name("name")),
-                                             owner if not collection else None, False, node, node, node.start_byte))
-                if not owner or collection:
+                if not self.index_loop_binding(node):
                     self.diagnostic("TRIGGER_LOOP_TYPE_UNRESOLVED", "Loop item type is not a proven single-record object.", node, "unresolved")
             elif node.type == "formal_parameter" and node.parent is not None and node.parent.type == "catch_clause":
                 self.bindings.append(Binding(self.unit.text(node.child_by_field_name("name")), None, False,
@@ -291,6 +288,10 @@ class _TriggerExtractor(_MethodExtractor):
         receiver = node.child_by_field_name("object")
         name = self.unit.text(node.child_by_field_name("name"))
         arguments = _significant(node.child_by_field_name("arguments"))
+        if self._managed_invocation(node):
+            for argument in arguments:
+                self.visit(argument)
+            return
         if (receiver is not None and receiver.type == "identifier"
                 and self.unit.text(receiver).casefold() == "database"):
             super().invocation(node)
@@ -319,8 +320,6 @@ class _TriggerExtractor(_MethodExtractor):
                                                 "class": cid, "parser": PARSER_VERSION})
                 if not static:
                     self._constructed_virtual_dispatch(cid, method, node)
-            elif self._managed_invocation(node):
-                pass
             else:
                 self.diagnostic("TRIGGER_CALL_UNRESOLVED", "Call target requires unavailable, ambiguous or inherited dispatch analysis.",
                                 node, "ambiguous" if len(candidates) > 1 else "unresolved")

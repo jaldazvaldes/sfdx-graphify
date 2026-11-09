@@ -127,8 +127,10 @@ def test_unknown_scoped_class_and_indexed_collection_do_not_become_record_fields
 
 def test_loop_aliases_do_not_reuse_an_outer_variable_type():
     store, _ = analyze("Account row = new Account(); for(Contact row : [SELECT Id FROM Contact]) { row.LastName='X'; update row; }")
-    assert field_relations(store) == {("Contact.Id", "reads", None)}
-    assert {"APEX_LOOP_ALIAS_UNSUPPORTED", "APEX_RECORD_TYPE_UNRESOLVED", "APEX_DML_TYPE_UNRESOLVED"} <= codes(store)
+    assert field_relations(store) == {("Contact.Id", "reads", None), ("Contact.LastName", "writes", "memory")}
+    assert not {"APEX_LOOP_ALIAS_UNSUPPORTED", "APEX_RECORD_TYPE_UNRESOLVED", "APEX_DML_TYPE_UNRESOLVED"} & codes(store)
+    assert any(r["relation"] == "writes" and r["target"] == "sf:object:contact"
+               and r["qualifiers"].get("effect") == "database" for r in store.relationships.values())
 
 
 def test_unique_static_helper_is_linked_and_its_effects_keep_method_source():

@@ -434,13 +434,27 @@ class _MethodExtractor:
                     if declaration.type == "variable_declarator":
                         self.bindings.append(Binding(self.unit.text(declaration.child_by_field_name("name")), owner, collection,
                                                      scope or body, declaration, declaration.end_byte))
-            elif node.type == "enhanced_for_statement" or (node.type == "formal_parameter" and node.parent is not None and node.parent.type == "catch_clause"):
+            elif node.type == "enhanced_for_statement":
+                if not self.index_loop_binding(node):
+                    self.diagnostic("APEX_LOOP_ALIAS_UNSUPPORTED", "Loop item declaration does not establish a supported single-record type; collection inference is outside coverage.", node)
+            elif node.type == "formal_parameter" and node.parent is not None and node.parent.type == "catch_clause":
                 name = node.child_by_field_name("name")
                 if name is not None:
-                    scope = node if node.type == "enhanced_for_statement" else node.parent
-                    self.bindings.append(Binding(self.unit.text(name), None, False, scope or body, node, node.start_byte))
-                if node.type == "enhanced_for_statement":
-                    self.diagnostic("APEX_LOOP_ALIAS_UNSUPPORTED", "Loop item alias typing and collection propagation are outside this release.", node)
+                    self.bindings.append(Binding(self.unit.text(name), None, False, node.parent, node, node.start_byte))
+
+    def index_loop_binding(self, node):
+        """Use the explicit element type only inside the loop body.
+
+        The iterable is evaluated in the outer scope. Its origin is not inferred;
+        unsupported element declarations still shadow any outer record alias.
+        """
+        name, body = node.child_by_field_name("name"), node.child_by_field_name("body")
+        if name is None or body is None:
+            return False
+        owner, collection = self.record_type(node.child_by_field_name("type"))
+        proven_owner = owner if not collection else None
+        self.bindings.append(Binding(self.unit.text(name), proven_owner, False, body, node, body.start_byte))
+        return proven_owner is not None
 
     def binding(self, name, node, *, report=True):
         ancestors = []
@@ -653,6 +667,13 @@ class _MethodExtractor:
         object_name, name = self.unit.text(object_node), self.unit.text(name_node)
         args_node = node.child_by_field_name("arguments")
         args = _significant(args_node)
+        # A corroborated namespace.Class receiver is a type qualifier, not a
+        # record field access. Resolve it before visiting arbitrary receivers;
+        # argument expressions still carry their own dependencies/diagnostics.
+        if self._managed_invocation(node):
+            for arg in args:
+                self.visit(arg)
+            return
         if object_node is not None and object_node.type != "identifier":
             self.visit(object_node)
         is_database = (object_name.casefold() == "database" and object_node is not None
@@ -700,8 +721,6 @@ class _MethodExtractor:
                 self.store.relation(self.method.id, candidates[0].id, "calls", self.unit.location(node),
                                     "apex.cross_class_static_call", resolution={"basis": "unique_local_static_method"},
                                     qualifiers={"invocation": "static_method"})
-            elif self._managed_invocation(node):
-                pass
             elif self._instance_invocation(node):
                 pass
             else:
