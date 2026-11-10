@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.6 (unreleased)
+sfdx-graphify 0.5.7 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -143,6 +143,21 @@ Zero results and zero file diagnostics do not prove that no unknown
 consumer exists elsewhere. Unqualified exact field names resolve only if unique;
 otherwise the query lists qualified candidates. Locally excluded inactive names
 report their exclusion status when recorded by the snapshot.
+
+For fields present in the graph, refs also returns literal_blind_spots from snapshots that include a
+literal index. The build scans selected unsupported text metadata, including
+layouts, FlexiPages, quick actions, permissions, report definitions, approvals,
+Visualforce, Aura, and email templates. It scans up to 2 MiB per file and
+64 MiB total, reports skipped files, and keeps up to three example paths per
+name. The index records field names, counts and relative paths.
+
+The qualified count matches a complete Object.Field token case-insensitively.
+The field-name count covers the standalone name and matching suffixes in other
+dotted tokens after recognized qualified field names are counted separately.
+These weaker matches can refer to a different object or to unrelated text.
+Both counts are review hints outside the extracted dependency graph. Older
+snapshots report the index as unavailable. A zero count covers the scanned
+files and literal matching rules.
 
 The optional --expect-snapshot rejects a mismatched initial snapshot. Once
 started, the session stays pinned even if a build replaces CURRENT.json. Restart
@@ -359,9 +374,14 @@ The Validation rules checkbox filters all rules in the orbital graph; canonical
 queries and exports retain the same exact rule and field identities.
 Metadata contract: https://developer.salesforce.com/docs/platform/api-metadata/references/meta-types/metadata-validationrule.html
 
-Complete formula evaluation, calculated field formulas, Flow loop aliases,
-layouts and permissions remain outside this release. Inherited Graphify Apex extraction
-does not silently expand this coverage contract.
+Custom field formulas and roll-up summary definitions add dependency evidence
+from their CustomField XML. Formula reads use the bounded Salesforce formula
+resolver. Roll-up reads identify the declared child join and aggregate fields.
+Roll-up filters identify field operands. Evidence links back to the XML.
+Metadata contract: https://developer.salesforce.com/docs/platform/api-metadata/references/meta-types/metadata-customfield.html
+
+Formula evaluation and Flow loop aliases remain outside the extraction scope.
+Literal mentions in selected unsupported metadata help direct follow-up review.
 
 SOURCE SELECTION AND STORAGE
 

@@ -28,6 +28,7 @@ LIMITATIONS = [
     "Candidate static calls through an external caller hierarchy are explicitly marked; verify the missing base before treating dispatch as resolved.",
     "Flow, trigger, validation rule and workflow rule activation metadata describe local XML, not deployed or active org behavior.",
     "Workflow reads cover bounded criterion and field update expressions. Cross-object updates remain diagnostic; expressions, action values and execution order are not evaluated.",
+    "Literal metadata mentions are review hints and do not establish dependency edges.",
     "Referenced-only targets have not been validated against a complete Salesforce schema.",
 ]
 
@@ -130,7 +131,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         "observed_api_versions": versions,
         "untested_api_versions": [v for v in versions if v not in TESTED_API_VERSIONS],
         "supported_metadata": ["Flow (bounded typed references, decisions and formula dependencies)", "CustomObject (inventory)",
-                               "CustomField (inventory and lookup targets)",
+                               "CustomField (inventory, lookups, and bounded formula and roll-up dependencies)",
                                "RecordType (local evidence for a SOQL or Flow relationship)",
                                "ValidationRule (local activation, bounded formula references and error display fields)",
                                "ApexTrigger (events, literal handlers and bounded record references)",
@@ -162,6 +163,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         "activity_policy": activity_policy,
         "inputs": scan.inputs, "coverage": coverage,
     }
+    from .blind_spots import build_literal_index
+    manifest["literal_blind_spots"] = build_literal_index(scan, facts["components"])
     bundle = {"manifest": manifest, "facts": facts, "diagnostics": diagnostics}
     manifest["snapshot_id"] = stable_id("snapshot", bundle)
     validate_bundle(bundle)

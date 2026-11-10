@@ -205,6 +205,19 @@ def _text(result: dict) -> str:
         lines.append(context["interpretation"])
         if context["omitted_count"]:
             lines.append(context["full_details"])
+    if "literal_blind_spots" in result:
+        mentions = result["literal_blind_spots"]
+        if mentions["state"] == "indexed":
+            lines.append(f"Literal search in selected unsupported metadata: {mentions['scanned_file_count']} files scanned, "
+                         f"{mentions['skipped_file_count']} skipped.")
+            for key, label in (("qualified", "qualified"), ("field_name", "field name")):
+                match = mentions[key]
+                lines.append(f"  {match['literal']} ({label}): {match['occurrence_count']} matches "
+                             f"in {match['file_count']} files.")
+                lines.extend(f"    {path}" for path in match["example_paths"])
+            lines.append(mentions["interpretation"])
+        else:
+            lines.append(f"Literal search unavailable: {mentions['reason']}")
     lines.extend(result.get("limitations", []))
     if result.get("error"):
         lines.append(f"Error: {result['error']}")

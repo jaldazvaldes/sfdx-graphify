@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 SCHEMA_VERSION = 8
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
-EXTRACTOR_VERSION = "0.5.6"
+EXTRACTOR_VERSION = "0.5.7"
 UPSTREAM_REVISION = "6c8002eca4acad58db6160eabcb466e61fc35afb"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
@@ -391,6 +391,9 @@ def validate_bundle(bundle):
             _relative_path(path)
             if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
                 raise DataError("Invalid input digest.")
+        if "literal_blind_spots" in manifest:
+            from .blind_spots import validate_literal_index
+            validate_literal_index(manifest["literal_blind_spots"], manifest["inputs"])
         identity_manifest = {key: value for key, value in manifest.items() if key != "snapshot_id"}
         expected_id = stable_id("snapshot", {"manifest": identity_manifest,
                                              "facts": facts, "diagnostics": diagnostics})

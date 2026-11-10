@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
+from .field_dependencies import FIELD_DEPENDENCY_TAGS, extract_field_dependencies
 from .schema import API_NAME, DataError, FactStore, canonical_json
 from .xml_source import Document
 
@@ -134,6 +135,8 @@ _OBJECT_DESCRIPTIVE = {
 
 
 def extract_inventory(documents: list[Document], store: FactStore):
+    field_expressions = []
+    lookup_targets: dict[str, set[str]] = {}
     for document in documents:
         kind, name = identity(document)
         if kind in {"flow", "validationrule", "recordtype"}:
@@ -144,15 +147,21 @@ def extract_inventory(documents: list[Document], store: FactStore):
             continue
         if kind == "field":
             owner = name.split(".")[0]
+            if (root.value("type").casefold() == "summary"
+                    or any(child.tag in FIELD_DEPENDENCY_TAGS for child in root.children)):
+                field_expressions.append((document, source, owner))
             owner_id = store.resolve_component("object", owner, document.location(root))
             if owner_id:
                 store.relation(owner_id, source, "contains", document.location(root), "metadata.field_owner")
             for reference in root.all("referenceTo"):
+                lookup_targets.setdefault(source, set()).add(reference.text.casefold())
                 target = store.resolve_component("object", reference.text, document.location(reference))
                 if target:
                     store.relation(source, target, "references", document.location(reference),
                                    "metadata.lookup_target", qualifiers={"context": "lookup_declaration"})
         for child in root.children:
+            if kind == "field" and child.tag in FIELD_DEPENDENCY_TAGS:
+                continue
             if child.tag in {"formula", "defaultValue", "defaultValueFormula"}:
                 # Salesforce defaultValue may be a formula; never scan it as dotted text.
                 store.diagnostic("unsupported_field_expression", "Field expressions are not analyzed.",
@@ -166,3 +175,6 @@ def extract_inventory(documents: list[Document], store: FactStore):
             elif kind == "field" and child.tag == "valueSet":
                 store.diagnostic("unsupported_value_set", "Value set dependencies are not analyzed.",
                                  document.location(child), construct=child.tag)
+    # Cross-object formulas need all lookup declarations, including later packages.
+    for document, source, owner in field_expressions:
+        extract_field_dependencies(document, store, source, owner, lookup_targets)

@@ -282,8 +282,12 @@ def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None 
 def refs(bundle: dict, name: str, *, relation: str | None = None,
          limit: int = 1000, source=None, exclude_tests: bool = False, diagnostics: str = "summary") -> dict:
     """List incoming relationships, retaining all occurrences per result."""
-    return _references(bundle, name, "target", relation=relation, limit=limit, source=source,
-                       exclude_tests=exclude_tests, diagnostics=diagnostics)
+    result = _references(bundle, name, "target", relation=relation, limit=limit, source=source,
+                         exclude_tests=exclude_tests, diagnostics=diagnostics)
+    if result["component"]["kind"] == "field":
+        from .blind_spots import field_mentions
+        result["literal_blind_spots"] = field_mentions(bundle["manifest"], result["component"]["api_name"])
+    return result
 
 
 def deps(bundle: dict, name: str, *, relation: str | None = None,

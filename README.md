@@ -6,13 +6,13 @@ This independent fork builds on Graphify. The Salesforce workflow uses the `sfdx
 
 ## 1. Install the tool
 
-**0.5.6.** Once the GitHub Release is available, run this PowerShell command from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
+**0.5.7.** Once the GitHub Release is available, run this PowerShell command from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
 
 ```powershell
-uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.6/sfdx_graphify-0.5.6-py3-none-any.whl'
+uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.7/sfdx_graphify-0.5.7-py3-none-any.whl'
 ```
 
-After installation succeeds, `sfdx-graphify --version` should print `sfdx-graphify 0.5.6`.
+After installation succeeds, `sfdx-graphify --version` should print `sfdx-graphify 0.5.7`.
 
 <details>
 <summary>PowerShell setup without a command on PATH</summary>
@@ -27,17 +27,17 @@ $cli = Join-Path (uv tool dir --bin) 'sfdx-graphify.exe'
 **Without `uv`.** With Python 3.10+ installed, use a dedicated virtual environment.
 
 ```powershell
-$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.5.6'
+$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.5.7'
 python -m venv $venv
 if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
 $python = Join-Path $venv 'Scripts\python.exe'
 $cli = Join-Path $venv 'Scripts\sfdx-graphify.exe'
-& $python -m pip install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.6/sfdx_graphify-0.5.6-py3-none-any.whl'
+& $python -m pip install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.7/sfdx_graphify-0.5.7-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Wheel installation failed.' }
 & $cli --version
 ```
 
-If you have the local candidate wheel, run the install command from the folder containing it and use `'.\sfdx_graphify-0.5.6-py3-none-any.whl'` in place of the URL. The [Salesforce guide](docs/salesforce.txt) covers building the wheel from this repository.
+If you have the local candidate wheel, run the install command from the folder containing it and use `'.\sfdx_graphify-0.5.7-py3-none-any.whl'` in place of the URL. The [Salesforce guide](docs/salesforce.txt) covers building the wheel from this repository.
 
 </details>
 
@@ -70,7 +70,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Snapshot build failed.' }
 
 ## 2. Register the Claude Code skill
 
-With 0.5.6 installed, run this once for your user profile.
+With 0.5.7 installed, run this once for your user profile.
 
 ```powershell
 sfdx-graphify install --platform claude
