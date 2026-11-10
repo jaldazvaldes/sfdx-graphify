@@ -231,7 +231,7 @@ def test_http_boundaries_reject_unsafe_or_ambiguous_requests(service, alteration
     b"{",
     b"\xff",
     b'{"command":"status","command":"components"}',
-    b"[" * (sys.getrecursionlimit() + 100) + b"0" + b"]" * (sys.getrecursionlimit() + 100),
+    b"[" * 200 + b"0" + b"]" * 200,
     br'{"command":"status","id":"\ud800"}',
     br'{"command":"refs","name":"\udfff"}',
     br'{"command":"status","\ud800":1}',
@@ -242,8 +242,10 @@ def test_invalid_json_is_rejected_without_desynchronizing_next_request(service, 
     status, _, invalid = raw_request(server, body=body)
     assert status == 400 and invalid["id"] is None and invalid["exit_code"] == 2
     assert invalid["result"]["error"].startswith("Invalid JSON request:")
-    status, _, after = raw_request(server, body=br'{"command":"status","id":"\ud83d\ude80"}')
-    assert status == 200 and after["id"] == "\N{ROCKET}" and after["exit_code"] == 0
+    request_id = "\N{ROCKET}" + r'\"' + "[{" * 200
+    following = json.dumps({"command": "status", "id": request_id}).encode("utf-8")
+    status, _, after = raw_request(server, body=following)
+    assert status == 200 and after["id"] == request_id and after["exit_code"] == 0
 
 
 def test_expected_id_guard_reads_only_current_before_failure(published, monkeypatch):

@@ -20,6 +20,8 @@ _OPTIONS = {
     "explain": frozenset({"name"}),
 }
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
+_JSON_NESTING_LIMIT = 128
+_JSON_TOKENS = re.compile(r'["{}\[\]]|\\.', re.DOTALL)
 
 
 def _unique_keys(pairs):
@@ -60,7 +62,22 @@ def _validate(request: object) -> tuple[str, dict]:
 
 
 def parse_request(text: str) -> object:
-    """Decode JSON with duplicate-key and Unicode checks for the request envelope."""
+    """Decode JSON with bounded nesting, duplicate-key and Unicode checks."""
+    depth = 0
+    in_string = False
+    # Match escaped pairs together so quoted brackets and escaped quotes never
+    # affect the depth. json.loads still validates the complete JSON grammar.
+    for match in _JSON_TOKENS.finditer(text):
+        token = match[0]
+        if token == '"':
+            in_string = not in_string
+        elif not in_string:
+            if token in ("[", "{"):
+                depth += 1
+                if depth > _JSON_NESTING_LIMIT:
+                    raise ValueError("JSON nesting is too deep.")
+            elif token in ("]", "}"):
+                depth -= 1
     try:
         request = json.loads(text, object_pairs_hook=_unique_keys)
     except RecursionError as exc:
