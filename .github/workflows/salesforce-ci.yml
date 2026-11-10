@@ -24,9 +24,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v8.1.0
         with:
           python-version: ${{ matrix.python }}
+      - name: Check extractor version and release tag policy
+        run: uv run --no-project --python ${{ matrix.python }} python scripts/check_salesforce_version.py
       - uses: actions/setup-node@v6
         with:
           node-version: "22"

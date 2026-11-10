@@ -63,13 +63,19 @@ def extract(engine, owner, path, *metadata):
         ("orderitem.orderid", "order"), ("order.accountid", "account"),
     )),
     ("OrderItem", "Product2.Name", "product2.name", (("orderitem.product2id", "product2"),)),
+    ("OrderItem", "PricebookEntry.Product2.Name", "product2.name", (
+        ("orderitem.pricebookentryid", "pricebookentry"), ("pricebookentry.product2id", "product2"),
+    )),
+    ("PricebookEntry", "Product2.Name", "product2.name", (("pricebookentry.product2id", "product2"),)),
     ("CampaignMember", "Campaign.Name", "campaign.name", (("campaignmember.campaignid", "campaign"),)),
     ("CampaignMember", "Contact.LastName", "contact.lastname", (("campaignmember.contactid", "contact"),)),
+    ("CampaignMember", "Lead.Email", "lead.email", (("campaignmember.leadid", "lead"),)),
     ("CampaignMember", "RecordType.Name", "recordtype.name", (("campaignmember.recordtypeid", "recordtype"),)),
     ("Asset", "CreatedBy.Name", "user.name", (("asset.createdbyid", "user"),)),
     ("Asset", "RecordType.Name", "recordtype.name", (("asset.recordtypeid", "recordtype"),)),
     ("Task", "CreatedBy.Email", "user.email", (("task.createdbyid", "user"),)),
     ("Task", "RecordType.Name", "recordtype.name", (("task.recordtypeid", "recordtype"),)),
+    ("Event", "Account.Name", "account.name", (("event.accountid", "account"),)),
     ("Event", "CreatedBy.Email", "user.email", (("event.createdbyid", "user"),)),
     ("User", "CreatedBy.Email", "user.email", (("user.createdbyid", "user"),)),
 ])
@@ -102,6 +108,7 @@ def test_documented_paths_preserve_terminal_field_and_each_hop(engine, owner, pa
     ("Order", "Contact.Name"), ("Case", "Owner.Name"), ("Task", "Who.Name"),
     ("Task", "What.Name"), ("Sample__c", "RecordType.Name"), ("Sample__c", "CreatedBy.Name"),
     ("ContentDocumentLink", "CreatedBy.Name"), ("User", "RecordType.Name"),
+    ("Event", "Who.Name"), ("Event", "What.Name"), ("CampaignMember", "LeadOrContact.Name"),
 ])
 def test_unknown_parent_paths_have_diagnostics_without_partial_field_facts(engine, owner, path):
     store, edges, _, _ = extract(engine, owner, path)
@@ -135,6 +142,40 @@ def test_custom_object_with_declared_lookup_can_use_a_known_standard_parent(engi
     terminal = next(edge for edge in edges if edge["target"] == "sf:field:profile.name")
     proof, = [store.evidence[eid] for eid in terminal["evidence_ids"]]
     assert [step["basis"] for step in proof["resolution"]["steps"]] == ["declared_lookup", "standard_schema"]
+
+
+@pytest.mark.parametrize("engine", ["soql", "flow"])
+@pytest.mark.parametrize("owner", ["Event", "Task"])
+def test_activity_metadata_resolves_the_typed_custom_lookup_without_changing_its_owner(engine, owner):
+    path = "objects/Activity/fields/Reviewer__c.field-meta.xml"
+    xml = "<CustomField><type>Lookup</type><referenceTo>Contact</referenceTo></CustomField>"
+    store, edges, _, _ = extract(engine, owner, "Reviewer__r.Account.Name", (path, xml))
+    lookup = f"sf:field:{owner.casefold()}.reviewer__c"
+    assert {edge["target"] for edge in edges} == {lookup, "sf:field:contact.accountid", "sf:field:account.name"}
+    terminal = next(edge for edge in edges if edge["target"] == "sf:field:account.name")
+    evidence, = [store.evidence[eid] for eid in terminal["evidence_ids"]]
+    inherited, standard = evidence["resolution"]["steps"]
+    assert inherited["field"] == lookup
+    assert inherited["target"] == "sf:object:contact"
+    assert inherited["basis"] == "declared_lookup"
+    assert inherited["schema_source"]["path"] == path
+    assert inherited["schema_source"]["content_hash"] == hashlib.sha256(xml.encode()).hexdigest()
+    assert standard["field"] == "sf:field:contact.accountid"
+
+
+@pytest.mark.parametrize("engine", ["soql", "flow"])
+@pytest.mark.parametrize("other", [
+    ("objects/Event/fields/Reviewer__c.field-meta.xml", "<CustomField><type>Text</type></CustomField>"),
+    ("other/objects/Activity/fields/Reviewer__c.field-meta.xml",
+     "<CustomField><type>Lookup</type><referenceTo>Account</referenceTo></CustomField>"),
+])
+def test_activity_metadata_does_not_replace_owner_specific_or_ambiguous_field_definitions(engine, other):
+    activity = ("objects/Activity/fields/Reviewer__c.field-meta.xml",
+                "<CustomField><type>Lookup</type><referenceTo>Contact</referenceTo></CustomField>")
+    store, edges, _, _ = extract(engine, "Event", "Reviewer__r.LastName", activity, other)
+    assert not edges
+    code = "APEX_SOQL_FIELD_PATH_UNSUPPORTED" if engine == "soql" else "FLOW_RELATIONSHIP_PATH_UNSUPPORTED"
+    assert any(row["code"] == code for row in store.diagnostics)
 
 
 def record_type(owner="Sample__c", body="<active>false</active>"):

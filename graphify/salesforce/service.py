@@ -26,7 +26,8 @@ LIMITATIONS = [
     "Formula references and declared parent relationship paths have bounded support; formula evaluation, arbitrary aliases, layouts and permissions remain outside coverage.",
     "Apex analysis is bounded and static; dynamic queries, unknown types and runtime data flow remain unresolved.",
     "Candidate static calls through an external caller hierarchy are explicitly marked; verify the missing base before treating dispatch as resolved.",
-    "Flow, trigger and validation rule activation metadata describe local XML, not deployed or active org behavior.",
+    "Flow, trigger, validation rule and workflow rule activation metadata describe local XML, not deployed or active org behavior.",
+    "Workflow field update evidence covers literal same-object targets. Rule criteria, action values and execution order are outside coverage.",
     "Referenced-only targets have not been validated against a complete Salesforce schema.",
 ]
 
@@ -88,7 +89,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     trigger_index = index_triggers(triggers, trigger_metadata, apex_index, store)
     excluded = inactive_components(store.components.values(), include_inactive=include_inactive)
     extract_inventory(documents, store)
-    extract_workflow(workflows, store)
+    extract_workflow(workflows, store, excluded=excluded)
     extract_apex(apex_index, store)
     extract_triggers(trigger_index, apex_index, store, excluded=set(excluded))
     extract_lwc(lightning, apex_index, store)
@@ -135,7 +136,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                                "ApexTrigger (events, literal handlers and bounded record references)",
                                "ApexClass/ApexMethod (bounded AST, invocable methods and static SOQL/DML)",
                                "LightningComponentBundle (literal Apex imports, imperative and wire calls)",
-                               "Workflow (outbound message definitions and sent fields)"],
+                               "Workflow (outbound message definitions and declared workflow rule field updates)"],
         "flow_status_counts": dict(sorted(Counter(
             c.get("local_status") or "Unknown" for c in facts["components"] if c["kind"] == "flow"
         ).items())),
@@ -144,6 +145,9 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         ).items())),
         "validation_rule_status_counts": dict(sorted(Counter(
             c.get("local_status") or "Unknown" for c in facts["components"] if c["kind"] == "validationrule"
+        ).items())),
+        "workflow_rule_status_counts": dict(sorted(Counter(
+            c.get("local_status") or "Unknown" for c in facts["components"] if c["kind"] == "workflowrule"
         ).items())),
         "test_classification": dict(sorted(Counter(
             f"{c['kind']}:{'test' if c.get('is_test') is True else 'production' if c.get('is_test') is False else 'unknown'}"

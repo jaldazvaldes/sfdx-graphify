@@ -9,7 +9,8 @@ from .schema import FactStore
 
 _INACTIVE_STATUSES = {"flow": frozenset({"Draft", "InvalidDraft", "Obsolete"}),
                       "apextrigger": frozenset({"Inactive", "Deleted"}),
-                      "validationrule": frozenset({"Inactive"})}
+                      "validationrule": frozenset({"Inactive"}),
+                      "workflowrule": frozenset({"Inactive"})}
 _LOCATION_KEYS = ("path", "locator", "line", "column", "end_line", "end_column", "content_hash")
 
 
@@ -62,7 +63,8 @@ def remove_inactive(store: FactStore, excluded: dict, *, include_inactive: bool 
                      for eid in relationship["evidence_ids"]}
     store.evidence = {eid: occurrence for eid, occurrence in store.evidence.items()
                       if eid in used_evidence}
-    skipped_paths = {definition["path"] for component in excluded.values()
+    # A Workflow file is shared by multiple rules and other actions.
+    skipped_paths = {definition["path"] for component in excluded.values() if component["kind"] != "workflowrule"
                      for definition in component["definitions"]}
     return {
         "mode": "include_inactive" if include_inactive else "exclude_explicitly_inactive",

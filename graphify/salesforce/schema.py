@@ -8,13 +8,14 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-SCHEMA_VERSION = 7
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
-EXTRACTOR_VERSION = "0.5.4"
+SCHEMA_VERSION = 8
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
+EXTRACTOR_VERSION = "0.5.5"
 UPSTREAM_REVISION = "6c8002eca4acad58db6160eabcb466e61fc35afb"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
-KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc", "outboundmessage", "validationrule"})
+KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc",
+                   "outboundmessage", "validationrule", "workflowrule"})
 API_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DISPATCH_CANDIDATE_INVOCATIONS = {"conditional_virtual_dispatch": "constructed_virtual_dispatch",
                                    "fflib_event_dispatch": "fflib_event_dispatch"}
@@ -96,6 +97,12 @@ def _method_types_valid(text: str) -> bool:
 def component_id(kind: str, api_name: str) -> str:
     if kind not in KINDS:
         raise DataError(f"Unsupported component kind: {kind}")
+    if kind == "workflowrule":
+        # Legacy rule fullName values can contain spaces and punctuation.
+        owner, _, name = api_name.partition(".")
+        if not API_NAME.fullmatch(owner) or not name.isprintable() or name != name.strip():
+            raise DataError(f"Invalid {kind} API name: {api_name}")
+        return f"sf:{kind}:" + quote(api_name.casefold(), safe="._")
     qualified, separator, signature = api_name.partition("(") if kind == "apexmethod" else (api_name, "", "")
     parts = qualified.split(".")
     expected = {2, 3} if kind == "apexmethod" else {1, 2} if kind == "apexclass" else {2} if kind in {"field", "outboundmessage", "validationrule"} else {1}
@@ -129,6 +136,7 @@ class FactStore:
         qualified_parts = api_name.partition("(")[0].split(".")
         namespace = (qualified_parts[0] if (kind == "apexclass" and len(qualified_parts) == 2)
                      or (kind == "apexmethod" and len(qualified_parts) == 3)
+                     else _namespace(qualified_parts[0]) if kind == "workflowrule"
                      else _namespace(api_name.partition("(")[0]))
         current = self.components.setdefault(cid, {
             "id": cid, "kind": kind, "api_name": api_name,
@@ -269,6 +277,8 @@ def validate_bundle(bundle):
                 raise DataError("Lightning components and outbound messages require snapshot schema version 4.")
             if manifest["schema_version"] < 5 and component["kind"] == "validationrule":
                 raise DataError("Validation rules require snapshot schema version 5.")
+            if manifest["schema_version"] < 8 and component["kind"] == "workflowrule":
+                raise DataError("Workflow rules require snapshot schema version 8.")
             if manifest["schema_version"] < 4 and component["kind"] == "apexmethod" and "(" in component["api_name"]:
                 raise DataError("Apex method signatures require snapshot schema version 4.")
             if "is_test" in component and component["is_test"] is not None and type(component["is_test"]) is not bool:
@@ -332,6 +342,13 @@ def validate_bundle(bundle):
                 if occurrence["relationship_id"] != rid or occurrence["source_component"] != source:
                     raise DataError("Evidence points to the wrong relationship.")
                 validate_location(occurrence)
+                if occurrence["rule"] == "workflow.rule_field_update":
+                    field_definition = occurrence["resolution"]["field_definition"]
+                    validate_location(field_definition)
+                    if (relation != "writes" or components[source]["kind"] != "workflowrule"
+                            or components[target]["kind"] != "field"
+                            or field_definition["path"] != occurrence["path"]):
+                        raise DataError("Invalid Workflow field update evidence.")
                 if dispatch_reason:
                     resolution = occurrence["resolution"]
                     if resolution.get("conditional") is not True or resolution.get("hook") not in components[target]["definitions"]:

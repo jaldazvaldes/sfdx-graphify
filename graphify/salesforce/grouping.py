@@ -9,16 +9,17 @@ from .schema import DataError, component_id
 
 
 _PARENT_KINDS = {"field": "object", "outboundmessage": "object",
-                 "validationrule": "object", "apexmethod": "apexclass"}
+                 "validationrule": "object", "workflowrule": "object", "apexmethod": "apexclass"}
 _TYPE_NAMES = {"object": "Object", "field": "Field", "apexclass": "Apex class",
                "apexmethod": "Apex method", "apextrigger": "Trigger", "flow": "Flow",
                "lwc": "Lightning component", "outboundmessage": "Outbound message",
-               "validationrule": "Validation rule"}
+               "validationrule": "Validation rule", "workflowrule": "Workflow rule"}
 _TYPE_GROUPS = {"flow": "Flows", "apextrigger": "Triggers", "lwc": "Lightning components",
                 "field": "Fields without an unambiguous owner",
                 "apexmethod": "Apex methods without an unambiguous owner",
                 "outboundmessage": "Outbound messages without an unambiguous owner",
-                "validationrule": "Validation rules without an unambiguous owner"}
+                "validationrule": "Validation rules without an unambiguous owner",
+                "workflowrule": "Workflow rules without an unambiguous owner"}
 
 
 def _name(graph, node):
@@ -57,7 +58,8 @@ def _owners(graph):
         qualified = _name(graph, node).split("(", 1)[0]
         if "." not in qualified:
             continue
-        parent_name = qualified.rsplit(".", 1)[0]
+        parent_name = (qualified.split(".", 1)[0] if data.get("kind") == "workflowrule"
+                       else qualified.rsplit(".", 1)[0])
         try:
             parent = component_id(expected, parent_name)
         except DataError:

@@ -39,15 +39,19 @@ _RECORD_TYPE_OWNERS = (
 SOURCE_STANDARD_PARENTS = {
     ("campaignmember", "campaign"): ("CampaignId", "Campaign"),
     ("campaignmember", "contact"): ("ContactId", "Contact"),
+    ("campaignmember", "lead"): ("LeadId", "Lead"),
     ("case", "account"): ("AccountId", "Account"),
     ("case", "contact"): ("ContactId", "Contact"),
+    ("event", "account"): ("AccountId", "Account"),
     ("opportunity", "account"): ("AccountId", "Account"),
     ("opportunity", "contact"): ("ContactId", "Contact"),
     ("order", "account"): ("AccountId", "Account"),
     ("order", "billtocontact"): ("BillToContactId", "Contact"),
     ("order", "shiptocontact"): ("ShipToContactId", "Contact"),
     ("orderitem", "order"): ("OrderId", "Order"),
+    ("orderitem", "pricebookentry"): ("PricebookEntryId", "PricebookEntry"),
     ("orderitem", "product2"): ("Product2Id", "Product2"),
+    ("pricebookentry", "product2"): ("Product2Id", "Product2"),
     ("user", "profile"): ("ProfileId", "Profile"),
     **{(owner, "recordtype"): ("RecordTypeId", "RecordType") for owner in _RECORD_TYPE_OWNERS},
     **{(owner, "createdby"): ("CreatedById", "User") for owner in _CREATED_BY_OWNERS},
@@ -57,7 +61,7 @@ SOURCE_STANDARD_PARENTS = {
 def resolve_source_field_path(store, owner: str, path: str) -> dict | None:
     """Resolve paths in static SOQL and typed Flow expressions."""
     return resolve_field_path(store, owner, path, standard_parents=SOURCE_STANDARD_PARENTS,
-                              use_local_system_fields=True)
+                              use_source_metadata=True)
 
 
 def _local_system_parent(store, owner, parent, component):
@@ -75,9 +79,22 @@ def _local_system_parent(store, owner, parent, component):
     return None, None
 
 
+def _activity_lookup(store, owner, field_name):
+    """Task and Event expose custom lookup fields defined on Activity."""
+    if owner not in {"task", "event"}:
+        return None
+    activity = store.components.get(component_id("object", "Activity"))
+    if activity and activity["definition_status"] == "ambiguous":
+        return None
+    field = store.components.get(component_id("field", f"Activity.{field_name}"))
+    if field and field["definition_status"] == "defined" and field.get("data_type") == "Lookup":
+        return field
+    return None
+
+
 def resolve_field_path(store, owner: str, path: str, *,
                        standard_parents: dict[tuple[str, str], tuple[str, str]] | None = None,
-                       use_local_system_fields: bool = False) -> dict | None:
+                       use_source_metadata: bool = False) -> dict | None:
     """Return the exact terminal field and schema hops, or None with no mutation.
 
     Consumers can opt into additional documented parent pairs. The default
@@ -109,7 +126,7 @@ def resolve_field_path(store, owner: str, path: str, *,
         pair = (current.casefold(), parent.casefold())
         standard = (standard_parents or {}).get(pair) or _STANDARD_PARENTS.get(pair)
         schema_source = None
-        if standard is None and use_local_system_fields:
+        if standard is None and use_source_metadata:
             standard, schema_source = _local_system_parent(store, *pair, store.components.get(object_id))
         # Account.ParentId can be represented by Hierarchy metadata. This is a
         # single verified self-reference, not a general alias for Lookup.
@@ -122,6 +139,13 @@ def resolve_field_path(store, owner: str, path: str, *,
                 and declaration.get("data_type") not in compatible_types):
             return None
         matches = lookup_targets.get(field_id, set())
+        activity_source = None
+        if (use_source_metadata and custom and not matches
+                and (declaration is None or declaration["definition_status"] == "referenced_only")):
+            activity_field = _activity_lookup(store, pair[0], field_name)
+            if activity_field is not None:
+                matches = lookup_targets.get(activity_field["id"], set())
+                activity_source = activity_field["definitions"][0]
         if len(matches) > 1:
             return None
         if matches:
@@ -131,7 +155,10 @@ def resolve_field_path(store, owner: str, path: str, *,
             if ((standard_parents is not None or hierarchy) and standard
                     and target["id"] != component_id("object", standard[1])):
                 return None
-            steps.append({"field": field_id, "target": target["id"], "basis": "declared_lookup"})
+            step = {"field": field_id, "target": target["id"], "basis": "declared_lookup"}
+            if activity_source is not None:
+                step["schema_source"] = activity_source
+            steps.append(step)
             current = target["api_name"]
         else:
             # Standard-field customization XML may declare Lookup and a filter

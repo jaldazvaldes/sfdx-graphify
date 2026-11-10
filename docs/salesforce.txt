@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.4
+sfdx-graphify 0.5.5 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -15,6 +15,11 @@ This command installs the tagged release.
 The Salesforce CLI reports its own version via sfdx-graphify --version. The
 inherited graphifyy package keeps its upstream version. The sfdx-prefixed Git
 tag identifies a fork release.
+Increase the extractor version for every change to input selection, parsing,
+facts, or evidence. Release tags are immutable: publish a new version and tag
+when extraction changes, and preserve the original snapshot for comparison.
+A snapshot that predates its claimed release should be marked obsolete and
+replaced rather than relabeled.
 Use a fresh environment when changing fork releases. To replace a wheel in an
 existing isolated environment with the same dependencies, run
 python -m pip install --force-reinstall --no-deps <wheel> and verify the CLI
@@ -39,6 +44,11 @@ The installed command is sfdx-graphify. JSON is the default; --format text gives
 readable results. Use --source and --require-current on a query when freshness
 must be verified. Queries without source access report unknown freshness. Name
 ambiguity is an error with candidates, including duplicate local definitions.
+
+For SDD, build from a clean checkout of the intended source branch, omit
+--include-untracked, and place the snapshot outside that checkout. Record the
+source branch, full commit SHA, extractor revision and version, and snapshot ID
+together. Check the branch, HEAD and clean status before and after building.
 
 REPEATED AGENT QUERIES
 
@@ -147,12 +157,12 @@ metadata and remain ambiguous. A local Active value is not deployed-org evidence
 
 New builds exclude uniquely defined Flows whose local status is Obsolete, Draft
 or InvalidDraft, Apex triggers whose companion metadata says Inactive or
-Deleted, and validation rules with active=false. Missing, unrecognized and
+Deleted, and validation and Workflow rules with active=false. Missing, unrecognized and
 ambiguous status stays in scope.
 This policy removes the inactive component and its dependency evidence from canonical
 facts, queries, exports and the viewer. Declared object/field definitions stay;
 components are never considered inactive merely because they have no callers.
-Flow, Apex trigger and validation rule activation status are currently indexed. Other component types need
+Flow, Apex trigger, validation rule and Workflow rule activation status are indexed. Other component types need
 their own metadata-specific activation semantics when their extractors support it.
 Use build --include-inactive to include all local states for historical analysis.
 activity_policy in the manifest, coverage and query envelopes records the mode
@@ -200,12 +210,14 @@ the full path, lookup and target for each hop. The terminal dependency keeps its
 original relation and evidence.
 SOQL and Flow resolve explicit standard parent pairs in the tested API 64.0
 vocabulary. Case and Opportunity have Account and Contact paths. Order has
-Account, BillToContact and ShipToContact paths. OrderItem has Order and
-Product2 paths. CampaignMember has Campaign and Contact paths. User.Profile
+Account, BillToContact and ShipToContact paths. OrderItem has Order, Product2
+and PricebookEntry paths. PricebookEntry has a Product2 path. CampaignMember
+has Campaign, Contact and Lead paths. Event has an Account path. User.Profile
 uses ProfileId. CreatedBy and RecordType use documented standard object pairs.
 Local ordinary custom object metadata supports CreatedBy. Selected decomposed
 recordTypes metadata can establish RecordType on additional objects and its
-source is included in the evidence. RecordType availability depends on org
+source is included in the evidence. Event and Task may use a unique local
+Activity custom lookup as schema evidence. RecordType availability depends on org
 configuration. Contradictory local metadata blocks a standard fallback. A
 compound path such as CreatedBy.Profile.Name retains both lookup reads and the
 terminal field.
@@ -267,8 +279,12 @@ hashed and included in bundle provenance, including helpers.
 Workflow outbound message definitions include object ownership and declared
 payload fields. Literal Flow outboundMessage actions link to those definitions,
 or to referenced-only targets when unavailable. Endpoint URLs, session settings
-and integration user values are not exported. Other Workflow actions/rules remain
-diagnostic. Process Builder trigger objects are indexed only from unique explicit
+and integration user values are not exported. Workflow rule writes link literal
+immediate and time-dependent FieldUpdate actions to direct fields on the same
+object. Evidence records the local rule action and its matching update
+definition. It does not establish that the rule ran or what value it wrote.
+Other Workflow actions and unsupported targets remain diagnostic.
+Process Builder trigger objects are indexed only from unique explicit
 ObjectType metadata; no org activation or execution is inferred.
 
 ValidationRule definitions in decomposed objects/<Object>/validationRules files

@@ -20,8 +20,8 @@ EDGE_LIMIT = 200
 SEARCH_LIMIT = 25
 EVIDENCE_LIMIT = 100
 MODES = frozenset({"impact", "automation", "schema"})
-AUTOMATION_KINDS = frozenset({"flow", "apexclass", "apexmethod", "apextrigger", "lwc", "outboundmessage",
-                              "validationrule"})
+_RULE_KINDS = frozenset({"validationrule", "workflowrule"})
+AUTOMATION_KINDS = frozenset({"flow", "apexclass", "apexmethod", "apextrigger", "lwc", "outboundmessage"}) | _RULE_KINDS
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; "
        "connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; "
        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
@@ -78,7 +78,7 @@ class SnapshotView:
                 self.methods[item["source"]][item["target"]] = rid
             if (item["relation"] == "contains"
                     and self.components[item["source"]]["kind"] == "object"
-                    and self.components[item["target"]]["kind"] == "validationrule"):
+                    and self.components[item["target"]]["kind"] in _RULE_KINDS):
                 self.rule_members[item["source"]][item["target"]] = rid
                 self.rule_owners[item["target"]][item["source"]] = rid
             if before is None:
@@ -181,7 +181,7 @@ class SnapshotView:
             for key in ("trigger_object", "trigger_events", "local_status", "api_version"):
                 if key in item:
                     result[key] = item[key]
-        if item["kind"] in {"flow", "validationrule"}:
+        if item["kind"] == "flow" or item["kind"] in _RULE_KINDS:
             result["local_status"] = _flow_status(item)
             if cid in self.before_components:
                 result["before_local_status"] = _flow_status(self.before_components[cid])
@@ -218,7 +218,7 @@ class SnapshotView:
         if kind == "contains":
             return (mode == "automation"
                     and self.components[relation["source"]]["kind"] == "object"
-                    and self.components[relation["target"]]["kind"] == "validationrule")
+                    and self.components[relation["target"]]["kind"] in _RULE_KINDS)
         if mode == "automation":
             return any(self.components[relation[key]]["kind"] in AUTOMATION_KINDS
                        for key in ("source", "target"))
