@@ -1,20 +1,19 @@
 ---
 name: sfdx-graphify
-description: Inspect local Salesforce DX dependency evidence for metadata, Apex, and Flows. Use for Salesforce references, impact analysis, or source evidence in specifications.
+description: Query Salesforce DX dependencies in metadata, Apex, and Flows, open the full graph in a local browser, or build a snapshot. Use for references, impact analysis, and evidence for specifications.
 ---
 
 # Salesforce dependency evidence
 
-Use the installed `sfdx-graphify` CLI for local Salesforce metadata. Run `sfdx-graphify guide` for the command contract. If the CLI is missing, report the prerequisite before trying to install anything.
+Use the installed `sfdx-graphify` CLI for Salesforce. Use the executable path the user gave you or the one that worked in this conversation. Run `sfdx-graphify --version` if the installation is uncertain and `sfdx-graphify guide` when you need more command details. Report a missing CLI as a prerequisite. Ask the user for permission before installing, updating an installation, or deleting files.
 
-Work from the Salesforce project containing `sfdx-project.json`. Start with the snapshot the user provides. If the task calls for a new build, choose an output directory outside the Salesforce project and tool repository. Build from the requested source revision and record any local changes or nondefault selection flags. Use `--include-untracked` or `--include-inactive` only when those inputs belong in the requested analysis.
+Use the Salesforce project folder containing `sfdx-project.json` as the working directory when building or using the project's default snapshot. Reuse the snapshot the user supplied or the one already selected in this conversation by passing `--snapshot "<path>"`. Otherwise use the project's saved snapshot with versions that support it. Version 0.5.5 requires the explicit snapshot path for queries and the viewer.
 
-```sh
-sfdx-graphify build "<project-root>" --out "<snapshot-directory>"
-sfdx-graphify status --snapshot "<snapshot-directory>" --source "<project-root>" --require-current
-```
+- **Answer a dependency question.** Run the relevant query against the saved snapshot. Use `refs` for incoming references, `deps` for outgoing dependencies, `impact` for incoming paths, `components` to disambiguate a name, and `explain` for the evidence behind a relationship ID. Pass `--expect-snapshot "<snapshot-id>"` on related queries to pin the generation. Check source freshness explicitly when the task requires it.
+- **Open the whole graph.** Run `sfdx-graphify serve --port 0` as a background task, adding the same `--snapshot` argument when using an explicit path. Wait for the command to print `Local Salesforce viewer:` and open the printed URL in the local browser. Its root shows the complete map. If browser access is unavailable, give the user that URL and keep the viewer running. Reuse a known running viewer for the same snapshot.
+- **Build or update a snapshot.** Run `sfdx-graphify build .` when the user requests a build. If a query needs a snapshot that has yet to be built, ask whether to build it. Record the path from the build's output and reuse it in the same conversation. Report the CLI error if the build fails. Use Git only to inspect the source revision and state. Build from the requested revision and record any local changes. Use `--include-untracked` or `--include-inactive` only when those inputs belong in the requested analysis.
 
-Use `components` to locate an ambiguous name, `refs` for incoming references, `deps` for outgoing dependencies, `impact` for bounded incoming paths, and `explain` for the evidence behind a relationship ID. Pass `--snapshot "<snapshot-directory>" --expect-snapshot "<snapshot-id>"` on related queries to pin the generation.
+For example, `sfdx-graphify refs Account.Description --format text` shows incoming references. To check whether a snapshot matches a working copy, run `sfdx-graphify status --source . --require-current` from that copy, adding `--snapshot` when using an explicit path.
 
 Inspect coverage, relevant diagnostics, truncation and candidate calls. Verify consequential edges against the cited Apex or XML. Use source file and line or XML locator in citations, with the relationship ID when it helps reproduce the query. A missing edge leaves the dependency unknown. Local metadata provides static evidence and leaves deployed org behavior unverified.
 

@@ -73,7 +73,25 @@ def test_existing_custom_skill_is_preserved(installation_roots, capsys):
     assert cli.main(["install", "--project", "--platform", "codex"]) == 1
     assert target.read_bytes() == b"My customized skill\n"
     assert list(target.parent.iterdir()) == [target]
-    assert str(target) in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert str(target) in error
+    assert "--replace" in error
+
+
+def test_replaces_existing_skill_on_request(installation_roots):
+    home, _ = installation_roots
+    skills = home / ".claude" / "skills"
+    target = skills / "sfdx-graphify" / "SKILL.md"
+    sibling = skills / "graphify" / "SKILL.md"
+    for path in (target, sibling):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"Previously installed skill\n")
+
+    assert cli.main(["install", "--platform", "claude", "--replace"]) == 0
+    bundled = files("graphify.salesforce").joinpath("skills").joinpath("sfdx-graphify").joinpath("SKILL.md").read_bytes()
+    assert target.read_bytes() == bundled
+    assert sibling.read_bytes() == b"Previously installed skill\n"
+    assert list(target.parent.iterdir()) == [target]
 
 
 @pytest.mark.parametrize("identical", [False, True])
@@ -116,4 +134,5 @@ def test_install_does_not_follow_link_into_existing_graphify_skill(installation_
     else:
         link.symlink_to(graphify, target_is_directory=True)
     assert cli.main(["install", "--project"]) == 1
+    assert cli.main(["install", "--project", "--replace"]) == 1
     assert existing.read_bytes() == b"Existing Graphify skill\n"

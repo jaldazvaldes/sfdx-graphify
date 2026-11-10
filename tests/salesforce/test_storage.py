@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from graphify.salesforce.discovery import discover
+from graphify.salesforce.discovery import _git, discover
 from graphify.salesforce.schema import DataError, FactStore, SCHEMA_VERSION, stable_id
 from graphify.salesforce.snapshot import default_output, load, publish, source_root, validate_output
 
@@ -60,6 +60,26 @@ def bundle(scan):
              "facts": facts.finish(), "diagnostics": scan.diagnostics}
     value["manifest"]["snapshot_id"] = stable_id("snapshot", value)
     return value
+
+
+@pytest.mark.parametrize(("verb", "override", "seconds"), [
+    ("diff", None, 300),
+    ("rev-parse", None, 60),
+    ("diff", "180", 180),
+])
+def test_git_timeout_names_command_and_honors_override(tmp_path, monkeypatch, verb, override, seconds):
+    monkeypatch.delenv("SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS", raising=False)
+    if override is not None:
+        monkeypatch.setenv("SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS", override)
+
+    def timeout(command, **kwargs):
+        assert kwargs["timeout"] == seconds
+        assert command[-3:] == ["-c", "core.splitIndex=false", verb]
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    with pytest.raises(DataError, match=f"git {verb} timed out after {seconds} seconds"):
+        _git(tmp_path, [verb], options=["-c", "core.splitIndex=false"])
 
 
 def test_filesystem_scope_and_unsupported_coverage(tmp_path):

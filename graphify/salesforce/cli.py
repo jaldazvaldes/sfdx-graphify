@@ -11,7 +11,8 @@ from . import query
 
 
 GUIDANCE = """Use sfdx-graphify to locate Salesforce dependency evidence.
-Build with: sfdx-graphify build <project-root>
+From the folder containing sfdx-project.json, run sfdx-graphify build . to save a private snapshot for that checkout.
+Local queries and the viewer use that snapshot automatically from the same project root. Pass --snapshot for a custom build location.
 New builds exclude explicitly inactive local Flows (Obsolete, Draft, InvalidDraft), Apex triggers (Inactive, Deleted), and validation and Workflow rules (active=false).
 Use build --include-inactive for historical analysis. Unknown/ambiguous status is retained.
 Check activity_policy in query results: older snapshots can include every local status.
@@ -20,17 +21,17 @@ refs, deps and impact include diagnostic_context: complete counts by code/file a
 Use --diagnostics full for every diagnostic in consulted files; JSONL/HTTP requests use diagnostics: "full".
 omitted_count reports records omitted from the response; no diagnostics are removed from the snapshot.
 Zero results or zero local diagnostics do not establish complete coverage of unknown consumers.
-Find exact references with: sfdx-graphify refs Account.Name --snapshot <directory> --format json
-Inspect what a Flow uses with: sfdx-graphify deps Sample_Flow --snapshot <directory> --format json
-Inspect validation rule inputs with: sfdx-graphify deps sf:validationrule:account.require_phone --snapshot <directory> --format json
-Follow a specific relationship with: sfdx-graphify explain <relationship-id> --snapshot <directory>
-Check freshness with: sfdx-graphify status --snapshot <directory> --source <project-root>
+Find exact references with: sfdx-graphify refs Account.Name --format json
+Inspect what a Flow uses with: sfdx-graphify deps Sample_Flow --format json
+Inspect validation rule inputs with: sfdx-graphify deps sf:validationrule:account.require_phone --format json
+Follow a specific relationship with: sfdx-graphify explain <relationship-id>
+Check freshness with: sfdx-graphify status --source . --require-current
 For repeated queries: sfdx-graphify session --snapshot <directory> [--expect-snapshot <snapshot-id>]
 Send one UTF-8 JSON object per line, e.g. {"command":"refs","name":"Account.Name","limit":20}.
 Each response wraps the unchanged query result with id and exit_code. Close stdin to stop.
 The session verifies and loads once, pins that snapshot, and never silently switches generations.
-Open a private local viewer: sfdx-graphify serve --snapshot <directory>
-Inspect a focused graph: sfdx-graphify view Account.Name --snapshot <directory> --mode impact
+Open a private local viewer: sfdx-graphify serve
+Inspect a focused graph: sfdx-graphify view Account.Name --mode impact
 Use status --source for explicit full verification at the start or when sources change.
 Ordinary queries and sessions do not rescan source and report unknown freshness.
 Artifact limit: 512 MiB by default; configure SFDX_GRAPHIFY_MAX_ARTIFACT_MIB. No records are dropped.
@@ -71,8 +72,9 @@ def parser() -> argparse.ArgumentParser:
     install = commands.add_parser("install", help="Copy the Salesforce skill for an assistant.")
     install.add_argument("--platform", choices=("claude", "codex"), default="claude")
     install.add_argument("--project", action="store_true", help="Install in the current project directory.")
+    install.add_argument("--replace", action="store_true", help="Replace a different skill at the selected path.")
     serve = commands.add_parser("serve", help="Serve the offline viewer on localhost only.")
-    serve.add_argument("--snapshot", required=True, type=Path)
+    serve.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
     serve.add_argument("--before", type=Path, help="Optional earlier local snapshot for comparison.")
     serve.add_argument("--port", type=int, default=8767)
 
@@ -83,8 +85,8 @@ def parser() -> argparse.ArgumentParser:
         if name == "components":
             command.add_argument("name", nargs="?", default="")
             command.add_argument("--kind")
-        location = command.add_mutually_exclusive_group(required=True)
-        location.add_argument("--snapshot", type=Path)
+        location = command.add_mutually_exclusive_group()
+        location.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
         location.add_argument("--server", help="Query the persistent localhost service without loading snapshot files.")
         command.add_argument("--expect-snapshot")
         command.add_argument("--source", type=Path)
@@ -111,7 +113,7 @@ def parser() -> argparse.ArgumentParser:
 
     view = commands.add_parser("view", help="Return a bounded graph focused on a component.")
     view.add_argument("name")
-    view.add_argument("--snapshot", required=True, type=Path)
+    view.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
     view.add_argument("--expect-snapshot")
     view.add_argument("--before", type=Path)
     view.add_argument("--mode", choices=("impact", "automation", "schema"), default="impact")
@@ -119,6 +121,20 @@ def parser() -> argparse.ArgumentParser:
     view.add_argument("--status", default="all", help="Filter by status declared in local Flow XML.")
     view.add_argument("--format", choices=("json", "text"), default="json")
     return result
+
+
+def _project_snapshot() -> Path:
+    from .snapshot import default_output, source_root
+
+    root = Path.cwd()
+    if not (root / "sfdx-project.json").is_file():
+        raise DataError("Open the project folder containing sfdx-project.json or pass --snapshot.")
+    snapshot = default_output(root)
+    if not (snapshot / "CURRENT.json").is_file():
+        raise DataError("No saved snapshot for this project. Run sfdx-graphify build . or pass --snapshot.")
+    if source_root(snapshot) != root.resolve():
+        raise DataError("The saved snapshot does not belong to this checkout. Run sfdx-graphify build . or pass --snapshot.")
+    return snapshot
 
 
 def _text(result: dict) -> str:
@@ -213,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         from .skill_install import install_skill
         try:
-            target = install_skill(args.platform, project=args.project)
+            target = install_skill(args.platform, project=args.project, replace=args.replace)
         except (DataError, OSError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -245,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         try:
             from .viewer import serve
-            serve(args.snapshot, port=args.port, before=args.before)
+            serve(args.snapshot or _project_snapshot(), port=args.port, before=args.before)
             return 0
         except KeyboardInterrupt:
             return 0
@@ -277,7 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from .snapshot import load
             expected = getattr(args, "expect_snapshot", None)
-            bundle = load(args.snapshot, expect_snapshot=expected) if expected is not None else load(args.snapshot)
+            snapshot_dir = args.snapshot or _project_snapshot()
+            bundle = load(snapshot_dir, expect_snapshot=expected) if expected is not None else load(snapshot_dir)
             if args.command == "view":
                 from .viewer import build_view
                 component = query.resolve_component(bundle, args.name)
@@ -287,13 +304,13 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "export":
                 from .graphify_adapter import export_graphify
                 from .snapshot import source_root, validate_output
-                original_root = source_root(args.snapshot)
+                original_root = source_root(snapshot_dir)
                 if original_root is not None:
                     validate_output(args.out, source_root=original_root)
                 if original_root is None and args.source is None:
                     raise DataError("Specify --source when the snapshot has no local source mapping.")
                 path = export_graphify(bundle, args.out, source_root=args.source or original_root,
-                                       snapshot_dir=args.snapshot)
+                                       snapshot_dir=snapshot_dir)
                 result = query.envelope(bundle, [], source=args.source)
                 result["output"] = str(path)
             else:

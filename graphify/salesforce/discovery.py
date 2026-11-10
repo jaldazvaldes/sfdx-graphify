@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, overload
@@ -29,6 +30,7 @@ _SUPPORTED = (".flow-meta.xml", ".object-meta.xml", ".field-meta.xml", ".validat
               ".recordtype-meta.xml", ".workflow-meta.xml",
               ".cls", ".trigger", ".trigger-meta.xml")
 _MAX_FILE_BYTES = 32 * 1024 * 1024
+_GIT_TIMEOUT_ENV = "SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS"
 
 
 def lwc_bundle(relative: str) -> tuple[str, str] | None:
@@ -115,33 +117,48 @@ def _capture(path: Path, *, keep_bytes: bool, git_algorithm: str | None = None) 
 
 @overload
 def _git(root: Path, args: list[str], *, optional: Literal[False] = False,
-         input_data: bytes | None = None, env: dict[str, str] | None = None) -> bytes: ...
+         input_data: bytes | None = None, env: dict[str, str] | None = None,
+         options: Sequence[str] = ()) -> bytes: ...
 
 
 @overload
 def _git(root: Path, args: list[str], *, optional: Literal[True],
-         input_data: bytes | None = None, env: dict[str, str] | None = None) -> bytes | None: ...
+         input_data: bytes | None = None, env: dict[str, str] | None = None,
+         options: Sequence[str] = ()) -> bytes | None: ...
 
 
 def _git(root: Path, args: list[str], *, optional: bool = False,
-         input_data: bytes | None = None, env: dict[str, str] | None = None) -> bytes | None:
+         input_data: bytes | None = None, env: dict[str, str] | None = None,
+         options: Sequence[str] = ()) -> bytes | None:
+    command = args[0]
+    operation = f"git {command}"
+    default_timeout = "300" if command == "diff" else "60"
+    try:
+        timeout = int(os.environ.get(_GIT_TIMEOUT_ENV, default_timeout))
+        if not 1 <= timeout <= 3600:
+            raise ValueError
+    except ValueError:
+        raise DataError(f"{_GIT_TIMEOUT_ENV} must be an integer from 1 to 3600.") from None
     try:
         result = subprocess.run(
-            ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(root), *args],
+            ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(root), *options, *args],
             capture_output=True, check=False, input=input_data, env=env,
-            shell=False, timeout=60,
+            shell=False, timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except FileNotFoundError:
         if optional:
             return None
-        raise DataError("Git became unavailable while reading the source") from None
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DataError("Cannot inspect Git source state") from exc
+        raise DataError(f"Git became unavailable while running {operation}") from None
+    except subprocess.TimeoutExpired as exc:
+        raise DataError(f"{operation} timed out after {timeout} seconds. "
+                        f"Set {_GIT_TIMEOUT_ENV} to allow more time.") from exc
+    except OSError as exc:
+        raise DataError(f"Cannot run {operation}: {exc.strerror or type(exc).__name__}") from exc
     if result.returncode:
         if optional:
             return None
-        raise DataError(f"Cannot inspect Git source state ({args[0]})")
+        raise DataError(f"{operation} failed with exit code {result.returncode}")
     return result.stdout
 
 
@@ -183,18 +200,18 @@ def _normalized_changes(root: Path, revision: str, package_dirs: list[str],
         # the source repository's post-index-change hook.
         settings.extend(["-c", "core.hooksPath=" + str(hooks)])
         environment = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
-        _git(root, [*settings, "read-tree", revision], env=environment)
-        head_attributes = _git(root, [*settings, *attribute_args], env=environment)
+        _git(root, ["read-tree", revision], env=environment, options=settings)
+        head_attributes = _git(root, attribute_args, env=environment, options=settings)
         attribute_paths = {entry.split(b"\t", 1)[1]
                            for entry in head_attributes.split(b"\0") if entry}
         if attribute_paths or source_attributes:
             removals = b"".join(b"0 " + b"0" * len(revision) + b"\t" + path + b"\0"
                                 for path in sorted(attribute_paths))
-            _git(git_root, [*settings, "update-index", "-z", "--index-info"],
-                 env=environment, input_data=removals + source_attributes)
-        output = _git(root, [*settings, "diff", revision, "--numstat", "-z", "--relative",
+            _git(git_root, ["update-index", "-z", "--index-info"],
+                 env=environment, input_data=removals + source_attributes, options=settings)
+        output = _git(root, ["diff", revision, "--numstat", "-z", "--relative",
                              "--no-renames", "--no-ext-diff", "--no-textconv", "--", *pathspecs],
-                      env=environment)
+                      env=environment, options=settings)
     changed = {entry.split(b"\t", 2)[2].decode("utf-8")
                for entry in output.split(b"\0") if entry}
     return changed, filtered

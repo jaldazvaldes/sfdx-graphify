@@ -50,6 +50,39 @@ def project(tmp_path, name="source"):
     return root
 
 
+def test_cli_uses_the_saved_snapshot_for_the_current_project(tmp_path, monkeypatch, capsys):
+    from graphify.salesforce import cli, viewer
+
+    cache = tmp_path / "private-cache"
+    monkeypatch.setenv("LOCALAPPDATA", str(cache))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    root = project(tmp_path)
+    monkeypatch.chdir(root)
+    assert cli.main(["refs", "Account.Description"]) == 1
+    assert "Run sfdx-graphify build ." in json.loads(capsys.readouterr().out)["error"]
+
+    assert cli.main(["build", "."]) == 0
+    built = json.loads(capsys.readouterr().out)
+    output = Path(built["output"])
+    assert output.is_relative_to(cache)
+    assert cli.main(["refs", "Account.Description"]) == 0
+    refs = json.loads(capsys.readouterr().out)
+    assert refs["snapshot_id"] == built["snapshot_id"]
+    assert refs["results"]
+    assert refs["freshness"]["state"] == "unknown"
+
+    def check_serve(snapshot_dir, *, port, before):
+        assert snapshot_dir == output
+
+    monkeypatch.setattr(viewer, "serve", check_serve)
+    assert cli.main(["serve"]) == 0
+
+    monkeypatch.chdir(project(tmp_path, "other-checkout"))
+    assert cli.main(["refs", "Account.Description"]) == 1
+    assert "No saved snapshot" in json.loads(capsys.readouterr().out)["error"]
+    assert cli.main(["refs", "Account.Description", "--snapshot", str(output)]) == 0
+
+
 def test_full_build_query_deletion_and_stale_source(tmp_path):
     from graphify.salesforce.service import build_project
     from graphify.salesforce import query, snapshot

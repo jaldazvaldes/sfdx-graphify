@@ -2,26 +2,120 @@
 
 Map dependencies in a local Salesforce DX project. Inspect which Flows and Apex code use a field, follow a dependency back to its source evidence, or explore the snapshot in a local browser. The Salesforce commands work entirely from local metadata.
 
-This independent fork builds on Graphify. Install the standalone wheel and register the assistant skill with:
+This independent fork builds on Graphify. The Salesforce workflow uses the `sfdx-graphify` command.
 
-```sh
-uv tool install <path-to-sfdx_graphify-wheel>
+## 1. Install the tool
+
+**0.5.6.** Once the GitHub Release is available, run this PowerShell command from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
+
+```powershell
+uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.6/sfdx_graphify-0.5.6-py3-none-any.whl'
+```
+
+After installation succeeds, `sfdx-graphify --version` should print `sfdx-graphify 0.5.6`.
+
+<details>
+<summary>PowerShell setup without a command on PATH</summary>
+
+If `uv` reports that its tools are outside `PATH`, run `uv tool update-shell` once and reopen PowerShell or Claude Code. To use the current shell immediately, use the full executable path and replace `sfdx-graphify` in the commands below with `& $cli`.
+
+```powershell
+$cli = Join-Path (uv tool dir --bin) 'sfdx-graphify.exe'
+& $cli --version
+```
+
+**Without `uv`.** With Python 3.10+ installed, use a dedicated virtual environment.
+
+```powershell
+$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.5.6'
+python -m venv $venv
+if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
+$python = Join-Path $venv 'Scripts\python.exe'
+$cli = Join-Path $venv 'Scripts\sfdx-graphify.exe'
+& $python -m pip install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.6/sfdx_graphify-0.5.6-py3-none-any.whl'
+if ($LASTEXITCODE -ne 0) { throw 'Wheel installation failed.' }
+& $cli --version
+```
+
+If you have the local candidate wheel, run the install command from the folder containing it and use `'.\sfdx_graphify-0.5.6-py3-none-any.whl'` in place of the URL. The [Salesforce guide](docs/salesforce.txt) covers building the wheel from this repository.
+
+</details>
+
+<details>
+<summary>Install the published 0.5.5 release</summary>
+
+Run this from any directory with Python 3.10+ and Git installed.
+
+```powershell
+$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.5.5'
+python -m venv $venv
+if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
+$python = Join-Path $venv 'Scripts\python.exe'
+$cli = Join-Path $venv 'Scripts\sfdx-graphify.exe'
+& $python -m pip install 'git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.5'
+if ($LASTEXITCODE -ne 0) { throw 'Installation failed.' }
+& $cli --version
+```
+
+Open the folder containing your Salesforce project's `sfdx-project.json`, choose an output path outside that checkout, and use that path for queries.
+
+```powershell
+$snapshot = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\snapshots\MySalesforceProject'
+& $cli build . --out $snapshot
+if ($LASTEXITCODE -ne 0) { throw 'Snapshot build failed.' }
+& $cli refs Account.Description --snapshot $snapshot --format text
+```
+
+</details>
+
+## 2. Register the Claude Code skill
+
+With 0.5.6 installed, run this once for your user profile.
+
+```powershell
 sfdx-graphify install --platform claude
 ```
 
-Use `--platform codex` for Codex and add `--project` to register the skill only in the current project. The [Salesforce guide](docs/salesforce.txt) describes how to build the wheel from this checkout.
+If an older copy is already there, review the path printed by the installer and run `sfdx-graphify install --platform claude --replace` to overwrite that copy with the bundled version. Use `--platform codex` for Codex. For project-only registration, add `--project` and run the command from the Salesforce project root.
 
-To try the fictional project from the checkout in an isolated Python 3.10+ environment:
+Open Claude Code in the Salesforce project root and invoke `/sfdx-graphify`. For Codex, use `$sfdx-graphify`. If the assistant needs the executable path, give it the path printed by `$cli` once.
 
-```sh
-python -m pip install .
-sfdx-graphify build examples/salesforce --out ../sfdx-demo-snapshot
-sfdx-graphify refs Account.Description --snapshot ../sfdx-demo-snapshot --format text
-sfdx-graphify impact Account.Description --snapshot ../sfdx-demo-snapshot --depth 3 --format text
-sfdx-graphify serve --snapshot ../sfdx-demo-snapshot
+## 3. Build and query the Salesforce snapshot
+
+Open your terminal or Claude Code in **the Salesforce project root**, the folder containing `sfdx-project.json`. Build once from that folder.
+
+```powershell
+sfdx-graphify build .
 ```
 
-Open the loopback address printed by `serve`. The example shows the field's direct references, an incoming trigger path and a call that requires checking a missing ancestor. In Git projects the default scope is tracked files. Add `--include-untracked` when you want eligible local additions in the snapshot.
+After the build succeeds, ask Claude `/sfdx-graphify Which flows or Apex classes read Account.Description?` or `/sfdx-graphify Open the full graph`. From the same folder, the terminal and browser workflows use the saved snapshot automatically.
+
+```powershell
+sfdx-graphify refs Account.Description --format text
+sfdx-graphify serve
+```
+
+The cache is private and specific to the checkout path. Rebuild when you want to incorporate changes or a new branch in that checkout. If you built with a custom `--out`, pass that directory as `--snapshot`.
+
+On a Git checkout, the default build reads the current working-tree bytes of tracked Salesforce files. To build a baseline for a specification, use a clean checkout of the intended branch and record `git branch --show-current` and `git rev-parse HEAD`. Use `sfdx-graphify status --source . --require-current` when you need to verify that the snapshot still matches the source.
+
+### Existing Graphify installations
+
+Generic Graphify and the Salesforce CLI can coexist in separate Python environments. Use `sfdx-graphify` and `/sfdx-graphify` for this workflow.
+
+If you choose to remove the generic integration, run the command that matches the scope you want from the relevant repository root.
+
+| What to remove | Command |
+| --- | --- |
+| Generic Claude integration in this project | `graphify claude uninstall --project` |
+| Generic Git hooks and merge driver | `graphify hook uninstall` |
+| All detected generic integrations | `graphify uninstall` |
+
+Keep or archive any `graphify-out/` you want to reuse. `graphify uninstall --purge` also deletes that project's generic graph output. To remove the generic CLI package itself, use the package manager that installed `graphifyy`, for example `uv tool uninstall graphifyy`.
+
+## Try the fictional project
+
+From this tool checkout, `examples/salesforce` is itself a Salesforce project root. With the CLI already installed, try `sfdx-graphify build examples/salesforce --out ../sfdx-demo-snapshot` followed by `sfdx-graphify refs Account.Description --snapshot ../sfdx-demo-snapshot --format text`.
 
 The [Salesforce guide](docs/salesforce.txt) covers release installation, supported metadata, candidates, diagnostics and freshness. The [synthetic project](examples/salesforce) is suitable for examples and CI. The [Salesforce benchmarks](BENCHMARKS.md#local-salesforce-benchmark) document how to reproduce measurements.
 

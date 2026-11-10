@@ -10,8 +10,9 @@ The standalone wheel installs with uv in its own Python 3.10+ environment:
   sfdx-graphify install --platform claude
 
 Use --platform codex for Codex or --project to register the skill in the
-current project. Invoke it with /sfdx-graphify in Claude Code or $sfdx-graphify
-in Codex. This registers the bundled skill without building a snapshot.
+current project. Add --replace to overwrite a different skill at the selected
+path after reviewing that file. Invoke it with /sfdx-graphify in Claude Code
+or $sfdx-graphify in Codex. Skill registration does not build a snapshot.
 From the fork checkout, build the standalone wheel with:
 
   uv run --no-project --with build python scripts/build_salesforce_wheel.py --out-dir dist
@@ -58,10 +59,27 @@ readable results. Use --source and --require-current on a query when freshness
 must be verified. Queries without source access report unknown freshness. Name
 ambiguity is an error with candidates, including duplicate local definitions.
 
+From the folder containing sfdx-project.json, build once and query or open the
+viewer from that folder. The default private cache belongs to the checkout path.
+
+  sfdx-graphify build .
+  sfdx-graphify refs Account.Name --format text
+  sfdx-graphify serve
+
+Use --snapshot for an output directory selected with build --out. Rebuild when
+you want the saved snapshot to reflect another branch or newer working files.
+
 For SDD, build from a clean checkout of the intended source branch, omit
 --include-untracked, and place the snapshot outside that checkout. Record the
 source branch, full commit SHA, extractor revision and version, and snapshot ID
 together. Check the branch, HEAD and clean status before and after building.
+
+The Git comparison of working files against HEAD allows 300 seconds per
+invocation. Other Git commands allow 60 seconds. To override these limits,
+set SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS in the shell that runs the CLI. In
+PowerShell, for example, use:
+
+  $env:SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS = '600'
 
 REPEATED AGENT QUERIES
 
