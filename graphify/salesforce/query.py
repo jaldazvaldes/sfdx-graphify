@@ -5,7 +5,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
-from .schema import DISPATCH_EVIDENCE_SITES, SCHEMA_VERSION, DataError, relationship_resolution
+from .schema import DISPATCH_EVIDENCE_SITES, SCHEMA_VERSION, DataError, relationship_resolution, shared_activity_field
 
 
 class QueryError(DataError):
@@ -103,6 +103,10 @@ def resolve_component(bundle: dict, name: str) -> dict:
         raise QueryError(f"Ambiguous component: {name}", 3,
                          sorted(matches, key=lambda item: item["id"]))
     if not matches:
+        owner, _, field = needle.removeprefix("sf:field:").partition(".")
+        activity = shared_activity_field(components, owner, field)
+        if activity is not None:
+            return activity
         excluded = bundle["manifest"].get("activity_policy", {}).get("excluded_components", [])
         omitted = [item for item in excluded if name.casefold() in
                    {item["id"].casefold(), item["api_name"].casefold()}]

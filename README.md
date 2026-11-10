@@ -2,7 +2,16 @@
 
 Map dependencies in a local Salesforce DX project. Inspect which Flows and Apex code use a field, follow a dependency back to its source evidence, or explore the snapshot in a local browser. The Salesforce commands work entirely from local metadata.
 
-This independent fork builds on Graphify. To try the fictional project, run these commands from the checkout in an isolated Python 3.10+ environment.
+This independent fork builds on Graphify. Install the standalone wheel and register the assistant skill with:
+
+```sh
+uv tool install <path-to-sfdx_graphify-wheel>
+sfdx-graphify install --platform claude
+```
+
+Use `--platform codex` for Codex and add `--project` to register the skill only in the current project. The [Salesforce guide](docs/salesforce.txt) describes how to build the wheel from this checkout.
+
+To try the fictional project from the checkout in an isolated Python 3.10+ environment:
 
 ```sh
 python -m pip install .

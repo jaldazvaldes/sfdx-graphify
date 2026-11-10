@@ -9,17 +9,44 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from .schema import API_NAME
+
 _NAME = r"\$?[A-Za-z_][A-Za-z0-9_]*"
 _IDENTIFIER = re.compile(_NAME)
 _PATH = re.compile(_NAME + r"(?:\." + _NAME + r")*")
 _NUMBER = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 _NON_REFERENCES = frozenset({"true", "false", "null", "not"})
+_GLOBAL_OBJECTS = {"$user": "User", "$profile": "Profile", "$organization": "Organization", "$userrole": "UserRole"}
+# Computed context properties are not SObject fields despite their global prefix.
+_GLOBAL_NON_FIELDS = {("$user", "uitheme"), ("$user", "uithemedisplayed"), ("$profile", "licensetype")}
 
 
 @dataclass(frozen=True)
 class FormulaReference:
     text: str
     offset: int
+
+
+def formula_field_context(reference, owner, *, record_basis):
+    """Bind a literal field path to its typed record or supported formula global."""
+    parts = reference.split(".")
+    if not reference.startswith("$"):
+        return owner, reference, {"basis": record_basis, "object": owner}
+    global_name = parts[0].casefold()
+    if not all(API_NAME.fullmatch(part) for part in parts[1:]):
+        return None
+    if global_name in _GLOBAL_OBJECTS and len(parts) == 2:
+        if (global_name, parts[1].casefold()) in _GLOBAL_NON_FIELDS:
+            return None
+        target = _GLOBAL_OBJECTS[global_name]
+        return target, parts[1], {"basis": "explicit_global_object", "symbol": parts[0], "object": target}
+    if global_name == "$setup" and len(parts) == 3:
+        return parts[1], parts[2], {"basis": "explicit_setup_reference", "object": parts[1]}
+    if global_name == "$custommetadata" and len(parts) == 4:
+        return parts[1], parts[3], {"basis": "explicit_custom_metadata_reference", "object": parts[1], "record": parts[2]}
+    if global_name == "$objecttype" and len(parts) == 4 and parts[2].casefold() == "fields":
+        return parts[1], parts[3], {"basis": "explicit_object_type_field", "object": parts[1]}
+    return None
 
 
 def _quoted_end(expression, start):

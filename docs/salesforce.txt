@@ -1,20 +1,33 @@
-sfdx-graphify 0.5.5
+sfdx-graphify 0.5.6 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
 endorsed by Graphify Labs or Salesforce. Preserve LICENSE, LICENSE-MIT and NOTICE.
 
-Use an isolated Python 3.10+ environment. Install from the fork checkout.
+The standalone wheel installs with uv in its own Python 3.10+ environment:
+
+  uv tool install <path-to-sfdx_graphify-wheel>
+  sfdx-graphify install --platform claude
+
+Use --platform codex for Codex or --project to register the skill in the
+current project. Invoke it with /sfdx-graphify in Claude Code or $sfdx-graphify
+in Codex. This registers the bundled skill without building a snapshot.
+From the fork checkout, build the standalone wheel with:
+
+  uv run --no-project --with build python scripts/build_salesforce_wheel.py --out-dir dist
+
+The original fork installation is also available in an isolated environment:
 
   python -m pip install .
 
-This command installs the tagged release.
+This command installs the last published tag.
 
   python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.5"
 
 The Salesforce CLI reports its own version via sfdx-graphify --version. The
 inherited graphifyy package keeps its upstream version. The sfdx-prefixed Git
-tag identifies a fork release.
+tag identifies a fork release. The standalone wheel uses the extractor version
+and exposes only the sfdx-graphify command.
 Increase the extractor version for every change to input selection, parsing,
 facts, or evidence. Release tags are immutable: publish a new version and tag
 when extraction changes, and preserve the original snapshot for comparison.
@@ -213,11 +226,16 @@ vocabulary. Case and Opportunity have Account and Contact paths. Order has
 Account, BillToContact and ShipToContact paths. OrderItem has Order, Product2
 and PricebookEntry paths. PricebookEntry has a Product2 path. CampaignMember
 has Campaign, Contact and Lead paths. Event has an Account path. User.Profile
-uses ProfileId. CreatedBy and RecordType use documented standard object pairs.
+uses ProfileId and User.UserRole uses UserRoleId. EmailMessage.Parent goes
+through ParentId to Case. CreatedBy and RecordType use documented standard
+object pairs.
 Local ordinary custom object metadata supports CreatedBy. Selected decomposed
 recordTypes metadata can establish RecordType on additional objects and its
 source is included in the evidence. Event and Task may use a unique local
-Activity custom lookup as schema evidence. RecordType availability depends on org
+Activity custom lookup as schema evidence. Shared custom fields declared only
+on Activity use their Activity field identity. Task and Event names can query
+the shared field when there is no conflicting child declaration.
+RecordType availability depends on org
 configuration. Contradictory local metadata blocks a standard fallback. A
 compound path such as CreatedBy.Profile.Name retains both lookup reads and the
 terminal field.
@@ -282,7 +300,10 @@ or to referenced-only targets when unavailable. Endpoint URLs, session settings
 and integration user values are not exported. Workflow rule writes link literal
 immediate and time-dependent FieldUpdate actions to direct fields on the same
 object. Evidence records the local rule action and its matching update
-definition. It does not establish that the rule ran or what value it wrote.
+definition. Literal criterion fields and supported references in rule and
+field update formulas create reads. A field update with targetObject produces
+a diagnostic until its destination can be verified. The extracted edges describe
+metadata references and intended writes.
 Other Workflow actions and unsupported targets remain diagnostic.
 Process Builder trigger objects are indexed only from unique explicit
 ObjectType metadata; no org activation or execution is inferred.

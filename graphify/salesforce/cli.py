@@ -12,7 +12,7 @@ from . import query
 
 GUIDANCE = """Use sfdx-graphify to locate Salesforce dependency evidence.
 Build with: sfdx-graphify build <project-root>
-New builds exclude explicitly inactive local Flows (Obsolete, Draft, InvalidDraft), Apex triggers (Inactive, Deleted), and validation rules (active=false).
+New builds exclude explicitly inactive local Flows (Obsolete, Draft, InvalidDraft), Apex triggers (Inactive, Deleted), and validation and Workflow rules (active=false).
 Use build --include-inactive for historical analysis. Unknown/ambiguous status is retained.
 Check activity_policy in query results: older snapshots can include every local status.
 Inspect coverage and diagnostics before relying on results.
@@ -68,6 +68,9 @@ def parser() -> argparse.ArgumentParser:
                        help="Include explicitly inactive local components for historical analysis.")
     build.add_argument("--format", choices=("json", "text"), default="json")
     commands.add_parser("guide", help="Print agent usage guidance without writing files.")
+    install = commands.add_parser("install", help="Copy the Salesforce skill for an assistant.")
+    install.add_argument("--platform", choices=("claude", "codex"), default="claude")
+    install.add_argument("--project", action="store_true", help="Install in the current project directory.")
     serve = commands.add_parser("serve", help="Serve the offline viewer on localhost only.")
     serve.add_argument("--snapshot", required=True, type=Path)
     serve.add_argument("--before", type=Path, help="Optional earlier local snapshot for comparison.")
@@ -206,6 +209,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "guide":
         print(GUIDANCE, end="")
+        return 0
+    if args.command == "install":
+        from .skill_install import install_skill
+        try:
+            target = install_skill(args.platform, project=args.project)
+        except (DataError, OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Salesforce skill ready at {target}")
         return 0
     if args.command == "query-server":
         from .query_server import serve_queries

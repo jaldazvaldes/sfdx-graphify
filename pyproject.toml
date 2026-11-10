@@ -185,7 +185,7 @@ packages = ["graphify", "graphify.extractors", "graphify.exporters", "graphify.s
 include-package-data = false
 
 [tool.setuptools.package-data]
-"graphify.salesforce" = ["viewer_static/*.html", "viewer_static/*.css", "viewer_static/*.js", "viewer_static/*.txt"]
+"graphify.salesforce" = ["viewer_static/*.html", "viewer_static/*.css", "viewer_static/*.js", "viewer_static/*.txt", "skills/sfdx-graphify/SKILL.md"]
 # The skill bodies ship as graphify/skill*.md (the SKILL.md a host installs is
 # copied from one of these). The progressive-disclosure references sidecar ships
 # under graphify/skills/<host>/references/, and the always-on injection blocks

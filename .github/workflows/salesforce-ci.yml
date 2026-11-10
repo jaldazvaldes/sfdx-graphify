@@ -39,7 +39,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $dist = Join-Path $env:RUNNER_TEMP sfdx-wheel
           $venv = Join-Path $env:RUNNER_TEMP sfdx-venv
-          uv build --wheel --out-dir $dist
+          uv run --no-project --with 'build>=1.5.0' --python '${{ matrix.python }}' python scripts/build_salesforce_wheel.py --out-dir $dist
           $wheels = @(Get-ChildItem -LiteralPath $dist -Filter '*.whl' -File)
           if ($wheels.Count -ne 1) { throw 'Expected one Salesforce fork wheel.' }
           uv venv --python '${{ matrix.python }}' $venv
@@ -62,3 +62,10 @@ jobs:
           $python = Join-Path $venv ($IsWindows ? 'Scripts/python.exe' : 'bin/python')
           uv pip install --python $python 'pytest>=9.0.3'
           & $python -m pytest tests/salesforce -q --tb=short
+      - name: Archive the tested Salesforce wheel
+        if: github.ref_type == 'tag' && matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfdx-graphify-wheel
+          path: ${{ runner.temp }}/sfdx-wheel/*.whl
+          if-no-files-found: error

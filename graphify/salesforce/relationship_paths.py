@@ -5,7 +5,7 @@ Polymorphic relationships and child subqueries are not selected by name.
 """
 from __future__ import annotations
 
-from .schema import API_NAME, component_id
+from .schema import API_NAME, component_id, shared_activity_field
 
 
 # Standard, non-polymorphic parent relationships. Owner, Who and What are
@@ -42,6 +42,7 @@ SOURCE_STANDARD_PARENTS = {
     ("campaignmember", "lead"): ("LeadId", "Lead"),
     ("case", "account"): ("AccountId", "Account"),
     ("case", "contact"): ("ContactId", "Contact"),
+    ("emailmessage", "parent"): ("ParentId", "Case"),
     ("event", "account"): ("AccountId", "Account"),
     ("opportunity", "account"): ("AccountId", "Account"),
     ("opportunity", "contact"): ("ContactId", "Contact"),
@@ -53,6 +54,7 @@ SOURCE_STANDARD_PARENTS = {
     ("orderitem", "product2"): ("Product2Id", "Product2"),
     ("pricebookentry", "product2"): ("Product2Id", "Product2"),
     ("user", "profile"): ("ProfileId", "Profile"),
+    ("user", "userrole"): ("UserRoleId", "UserRole"),
     **{(owner, "recordtype"): ("RecordTypeId", "RecordType") for owner in _RECORD_TYPE_OWNERS},
     **{(owner, "createdby"): ("CreatedById", "User") for owner in _CREATED_BY_OWNERS},
 }
@@ -77,19 +79,6 @@ def _local_system_parent(store, owner, parent, component):
         if definition is not None:
             return ("CreatedById", "User"), definition
     return None, None
-
-
-def _activity_lookup(store, owner, field_name):
-    """Task and Event expose custom lookup fields defined on Activity."""
-    if owner not in {"task", "event"}:
-        return None
-    activity = store.components.get(component_id("object", "Activity"))
-    if activity and activity["definition_status"] == "ambiguous":
-        return None
-    field = store.components.get(component_id("field", f"Activity.{field_name}"))
-    if field and field["definition_status"] == "defined" and field.get("data_type") == "Lookup":
-        return field
-    return None
 
 
 def resolve_field_path(store, owner: str, path: str, *,
@@ -140,11 +129,11 @@ def resolve_field_path(store, owner: str, path: str, *,
             return None
         matches = lookup_targets.get(field_id, set())
         activity_source = None
-        if (use_source_metadata and custom and not matches
-                and (declaration is None or declaration["definition_status"] == "referenced_only")):
-            activity_field = _activity_lookup(store, pair[0], field_name)
-            if activity_field is not None:
-                matches = lookup_targets.get(activity_field["id"], set())
+        if use_source_metadata and custom and not matches:
+            activity_field = shared_activity_field(store.components, current, field_name)
+            if activity_field is not None and activity_field["data_type"] == "Lookup":
+                field_id = activity_field["id"]
+                matches = lookup_targets.get(field_id, set())
                 activity_source = activity_field["definitions"][0]
         if len(matches) > 1:
             return None
@@ -158,6 +147,7 @@ def resolve_field_path(store, owner: str, path: str, *,
             step = {"field": field_id, "target": target["id"], "basis": "declared_lookup"}
             if activity_source is not None:
                 step["schema_source"] = activity_source
+                step["source_owner"] = current
             steps.append(step)
             current = target["api_name"]
         else:

@@ -6,14 +6,11 @@ remain diagnostics instead of being interpreted as fields of the rule's object.
 """
 from __future__ import annotations
 
-from .formula_refs import formula_references
+from .formula_refs import formula_field_context, formula_references
 from .relationship_paths import add_navigation_reads, resolve_field_path
 from .schema import API_NAME, component_id
 
 _DESCRIPTIVE = {"fullName", "active", "description", "errorConditionFormula", "errorDisplayField", "errorMessage"}
-_GLOBAL_OBJECTS = {"$user": "User", "$profile": "Profile", "$organization": "Organization", "$userrole": "UserRole"}
-# Computed context properties are not SObject fields despite their global prefix.
-_GLOBAL_NON_FIELDS = {("$user", "uitheme"), ("$user", "uithemedisplayed"), ("$profile", "licensetype")}
 # Explicit non-polymorphic relationships, opt-in only for validation formulas.
 # Salesforce Object Reference: standard-objects/object-{order,orderitem,
 # campaignmember,case,opportunity}.html under:
@@ -41,28 +38,6 @@ def definition_metadata(document, store):
                          document.location(node), state="ambiguous" if len(statuses) > 1 else "unresolved",
                          candidates=[item.text for item in statuses])
     return {"local_status": "Unknown"}
-
-
-def _field_context(reference, owner):
-    """Return a typed object and field path, without guessing from token spelling."""
-    parts = reference.split(".")
-    if not reference.startswith("$"):
-        return owner, reference, {"basis": "validation_rule_object", "object": owner}
-    global_name = parts[0].casefold()
-    if not all(API_NAME.fullmatch(part) for part in parts[1:]):
-        return None
-    if global_name in _GLOBAL_OBJECTS and len(parts) == 2:
-        if (global_name, parts[1].casefold()) in _GLOBAL_NON_FIELDS:
-            return None
-        target = _GLOBAL_OBJECTS[global_name]
-        return target, parts[1], {"basis": "explicit_global_object", "symbol": parts[0], "object": target}
-    if global_name == "$setup" and len(parts) == 3:
-        return parts[1], parts[2], {"basis": "explicit_setup_reference", "object": parts[1]}
-    if global_name == "$custommetadata" and len(parts) == 4:
-        return parts[1], parts[3], {"basis": "explicit_custom_metadata_reference", "object": parts[1], "record": parts[2]}
-    if global_name == "$objecttype" and len(parts) == 4 and parts[2].casefold() == "fields":
-        return parts[1], parts[3], {"basis": "explicit_object_type_field", "object": parts[1]}
-    return None
 
 
 def _resolve_formula_field(store, owner, field_path):
@@ -121,7 +96,7 @@ def _formula(document, node, store, source, owner):
                          location, issue=issue)
     for number, reference in enumerate(references, 1):
         occurrence = {**location, "locator": f"{node.locator}/reference[{number}]"}
-        context = _field_context(reference.text, owner)
+        context = formula_field_context(reference.text, owner, record_basis="validation_rule_object")
         if context is None:
             store.diagnostic("VALIDATION_RULE_GLOBAL_UNSUPPORTED", "This global formula reference has no supported typed field target.",
                              occurrence, reference=reference.text)

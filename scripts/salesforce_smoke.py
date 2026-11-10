@@ -68,6 +68,11 @@ def main() -> None:
     cli = parser.parse_args().cli.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="sfdx-graphify-smoke-") as temporary:
         directory = Path(temporary)
+        for platform, config_dir in (("claude", ".claude"), ("codex", ".agents")):
+            subprocess.run([str(cli), "install", "--platform", platform, "--project"],
+                           cwd=directory, check=True, timeout=30)
+            skill = directory / config_dir / "skills" / "sfdx-graphify" / "SKILL.md"
+            assert "name: sfdx-graphify" in skill.read_text(encoding="utf-8"), skill
         example = directory / "example"
         shutil.copytree(EXAMPLE, example)
         snapshot = str(directory / "snapshot")
@@ -86,8 +91,11 @@ def main() -> None:
                    and row["resolution"]["status"] == "candidate"
                    and row["resolution"]["missing_ancestors"] == ["SampleExternalBase"]
                    for row in impact["results"]), impact
+        projected = directory / "projection"
+        query(cli, directory, "export", "graphify", *snapshot_args, "--out", str(projected))
+        assert (projected / "graph.json").is_file()
         check_viewer(cli, directory, snapshot_args, build["snapshot_id"])
-    print("Salesforce wheel smoke passed: build, refs, deps, explain, candidate impact and viewer.")
+    print("Salesforce wheel smoke passed: install, build, refs, deps, explain, candidate impact, export and viewer.")
 
 
 if __name__ == "__main__":

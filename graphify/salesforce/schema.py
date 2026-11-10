@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 SCHEMA_VERSION = 8
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
-EXTRACTOR_VERSION = "0.5.5"
+EXTRACTOR_VERSION = "0.5.6"
 UPSTREAM_REVISION = "6c8002eca4acad58db6160eabcb466e61fc35afb"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
@@ -120,6 +120,22 @@ def _namespace(api_name: str) -> str | None:
     return None
 
 
+def shared_activity_field(components: dict[str, dict], owner: str, name: str) -> dict | None:
+    """Resolve a typed Task/Event field to its authoritative Activity definition."""
+    if owner.casefold() not in {"task", "event"} or not API_NAME.fullmatch(name) or not name.casefold().endswith("__c"):
+        return None
+    if any(components.get(component_id("object", object_name), {}).get("definition_status") == "ambiguous"
+           for object_name in (owner, "Activity")):
+        return None
+    child = components.get(component_id("field", f"{owner}.{name}"))
+    if child and child["definition_status"] != "referenced_only":
+        return None
+    activity = components.get(component_id("field", f"Activity.{name}"))
+    if activity and activity["definition_status"] == "defined" and activity.get("data_type"):
+        return activity
+    return None
+
+
 class FactStore:
     """Aggregate semantic relationships while preserving each source occurrence."""
 
@@ -185,6 +201,9 @@ class FactStore:
             return None
         if self.resolve_component("object", owner, location) is None:
             return None
+        activity = shared_activity_field(self.components, owner, name)
+        if activity is not None:
+            return activity["id"]
         return self.resolve_component("field", f"{owner}.{name}", location)
 
     def relation(self, source, target, relation, location, rule, resolution=None, qualifiers=None):

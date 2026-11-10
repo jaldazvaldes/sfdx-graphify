@@ -27,7 +27,7 @@ LIMITATIONS = [
     "Apex analysis is bounded and static; dynamic queries, unknown types and runtime data flow remain unresolved.",
     "Candidate static calls through an external caller hierarchy are explicitly marked; verify the missing base before treating dispatch as resolved.",
     "Flow, trigger, validation rule and workflow rule activation metadata describe local XML, not deployed or active org behavior.",
-    "Workflow field update evidence covers literal same-object targets. Rule criteria, action values and execution order are outside coverage.",
+    "Workflow reads cover bounded criterion and field update expressions. Cross-object updates remain diagnostic; expressions, action values and execution order are not evaluated.",
     "Referenced-only targets have not been validated against a complete Salesforce schema.",
 ]
 
@@ -136,7 +136,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                                "ApexTrigger (events, literal handlers and bounded record references)",
                                "ApexClass/ApexMethod (bounded AST, invocable methods and static SOQL/DML)",
                                "LightningComponentBundle (literal Apex imports, imperative and wire calls)",
-                               "Workflow (outbound message definitions and declared workflow rule field updates)"],
+                               "Workflow (outbound messages, bounded rule criteria and declared same-object field updates)"],
         "flow_status_counts": dict(sorted(Counter(
             c.get("local_status") or "Unknown" for c in facts["components"] if c["kind"] == "flow"
         ).items())),

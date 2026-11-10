@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from graphify.salesforce import query
 from graphify.salesforce.apex import extract_apex, index_apex
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.inventory import extract_inventory, index_definitions
@@ -18,10 +19,14 @@ def extract(engine, owner, path, *metadata):
     documents = [parse_xml(name, text.encode()) for name, text in metadata]
     index_definitions(documents, store)
     extract_inventory(documents, store)
-    if engine == "soql":
+    if engine in {"apex", "soql"}:
         source = "classes/ParentProbe.cls"
-        code = ("public class ParentProbe {\n    public void inspectRecords() {\n"
-                f"        List<{owner}> records = [SELECT {path} FROM {owner}];\n    }}\n}}")
+        if engine == "apex":
+            code = (f"public class ParentProbe {{ public void inspectRecords({owner} record) {{ "
+                    f"String observed = record.{path}; }} }}")
+        else:
+            code = ("public class ParentProbe {\n    public void inspectRecords() {\n"
+                    f"        List<{owner}> records = [SELECT {path} FROM {owner}];\n    }}\n}}")
         extract_apex(index_apex({source: code.encode()}, store), store)
         component = "sf:apexmethod:parentprobe.inspectrecords"
     else:
@@ -43,6 +48,9 @@ def extract(engine, owner, path, *metadata):
 @pytest.mark.parametrize("owner,path,target,hops", [
     ("Case", "Account.Name", "account.name", (("case.accountid", "account"),)),
     ("Case", "Contact.LastName", "contact.lastname", (("case.contactid", "contact"),)),
+    ("EmailMessage", "Parent.Contact.LastName", "contact.lastname", (
+        ("emailmessage.parentid", "case"), ("case.contactid", "contact"),
+    )),
     ("Opportunity", "Account.Name", "account.name", (("opportunity.accountid", "account"),)),
     ("Opportunity", "Contact.Account.Name", "account.name", (
         ("opportunity.contactid", "contact"), ("contact.accountid", "account"),
@@ -56,6 +64,7 @@ def extract(engine, owner, path, *metadata):
         ("order.createdbyid", "user"), ("user.profileid", "profile"),
     )),
     ("User", "Profile.Name", "profile.name", (("user.profileid", "profile"),)),
+    ("User", "UserRole.Name", "userrole.name", (("user.userroleid", "userrole"),)),
     ("Case", "RecordType.DeveloperName", "recordtype.developername", (("case.recordtypeid", "recordtype"),)),
     ("Lead", "CreatedBy.Email", "user.email", (("lead.createdbyid", "user"),)),
     ("Contact", "RecordType.Name", "recordtype.name", (("contact.recordtypeid", "recordtype"),)),
@@ -109,6 +118,7 @@ def test_documented_paths_preserve_terminal_field_and_each_hop(engine, owner, pa
     ("Task", "What.Name"), ("Sample__c", "RecordType.Name"), ("Sample__c", "CreatedBy.Name"),
     ("ContentDocumentLink", "CreatedBy.Name"), ("User", "RecordType.Name"),
     ("Event", "Who.Name"), ("Event", "What.Name"), ("CampaignMember", "LeadOrContact.Name"),
+    ("EmailMessage", "RelatedTo.Name"), ("EmailMessage", "From.Name"),
 ])
 def test_unknown_parent_paths_have_diagnostics_without_partial_field_facts(engine, owner, path):
     store, edges, _, _ = extract(engine, owner, path)
@@ -146,18 +156,20 @@ def test_custom_object_with_declared_lookup_can_use_a_known_standard_parent(engi
 
 @pytest.mark.parametrize("engine", ["soql", "flow"])
 @pytest.mark.parametrize("owner", ["Event", "Task"])
-def test_activity_metadata_resolves_the_typed_custom_lookup_without_changing_its_owner(engine, owner):
+def test_activity_metadata_keeps_the_lookup_endpoint_canonical_and_the_source_owner(engine, owner):
     path = "objects/Activity/fields/Reviewer__c.field-meta.xml"
     xml = "<CustomField><type>Lookup</type><referenceTo>Contact</referenceTo></CustomField>"
     store, edges, _, _ = extract(engine, owner, "Reviewer__r.Account.Name", (path, xml))
-    lookup = f"sf:field:{owner.casefold()}.reviewer__c"
+    lookup = "sf:field:activity.reviewer__c"
     assert {edge["target"] for edge in edges} == {lookup, "sf:field:contact.accountid", "sf:field:account.name"}
+    assert f"sf:field:{owner.casefold()}.reviewer__c" not in store.components
     terminal = next(edge for edge in edges if edge["target"] == "sf:field:account.name")
     evidence, = [store.evidence[eid] for eid in terminal["evidence_ids"]]
     inherited, standard = evidence["resolution"]["steps"]
     assert inherited["field"] == lookup
     assert inherited["target"] == "sf:object:contact"
     assert inherited["basis"] == "declared_lookup"
+    assert inherited["source_owner"] == owner
     assert inherited["schema_source"]["path"] == path
     assert inherited["schema_source"]["content_hash"] == hashlib.sha256(xml.encode()).hexdigest()
     assert standard["field"] == "sf:field:contact.accountid"
@@ -176,6 +188,40 @@ def test_activity_metadata_does_not_replace_owner_specific_or_ambiguous_field_de
     assert not edges
     code = "APEX_SOQL_FIELD_PATH_UNSUPPORTED" if engine == "soql" else "FLOW_RELATIONSHIP_PATH_UNSUPPORTED"
     assert any(row["code"] == code for row in store.diagnostics)
+
+
+@pytest.mark.parametrize("engine", ["apex", "soql", "flow"])
+@pytest.mark.parametrize("owner", ["Event", "Task"])
+def test_direct_activity_field_aliases_share_evidence_across_refs_and_impact(engine, owner):
+    metadata = ("objects/Activity/fields/Details__c.field-meta.xml", "<CustomField><type>Text</type></CustomField>")
+    store, edges, source, code = extract(engine, owner, "Details__c", metadata)
+    edge, = edges
+    assert edge["target"] == "sf:field:activity.details__c"
+    occurrence, = [store.evidence[eid] for eid in edge["evidence_ids"]]
+    assert occurrence["path"] == source
+    assert occurrence["content_hash"] == hashlib.sha256(code.encode()).hexdigest()
+    assert occurrence["resolution"]["object"] == owner
+    assert f"sf:field:{owner.casefold()}.details__c" not in store.components
+
+    bundle = {"manifest": {"snapshot_id": "synthetic"}, "facts": store.finish(), "diagnostics": []}
+    for name in ("Activity.Details__c", "Event.Details__c", "sf:field:task.details__c"):
+        assert query.resolve_component(bundle, name)["id"] == edge["target"]
+        assert [row["id"] for row in query.refs(bundle, name)["results"] if row["relation"] != "contains"] == [edge["id"]]
+        assert [row["id"] for row in query.impact(bundle, name, depth=1)["results"]] == [edge["id"]]
+
+
+def test_concrete_or_legacy_exact_child_field_wins_over_activity_alias():
+    activity = ("objects/Activity/fields/Details__c.field-meta.xml", "<CustomField><type>Text</type></CustomField>")
+    event = ("objects/Event/fields/Details__c.field-meta.xml", "<CustomField><type>Text</type></CustomField>")
+    store, edges, _, _ = extract("soql", "Event", "Details__c", activity, event)
+    assert {edge["target"] for edge in edges} == {"sf:field:event.details__c"}
+    legacy_task = store.ensure_component("field", "Task.Details__c")
+    bundle = {"manifest": {"snapshot_id": "synthetic", "schema_version": 8},
+              "facts": store.finish(), "diagnostics": []}
+    assert query.resolve_component(bundle, "Event.Details__c")["id"] == "sf:field:event.details__c"
+    assert query.resolve_component(bundle, "Task.Details__c")["id"] == legacy_task
+    assert query.resolve_component(bundle, legacy_task)["id"] == legacy_task
+    assert query.resolve_component(bundle, "Activity.Details__c")["id"] == "sf:field:activity.details__c"
 
 
 def record_type(owner="Sample__c", body="<active>false</active>"):
