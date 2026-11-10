@@ -8,14 +8,15 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-SCHEMA_VERSION = 8
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
-EXTRACTOR_VERSION = "0.5.8"
+SCHEMA_VERSION = 9
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
+EXTRACTOR_VERSION = "0.5.9"
 UPSTREAM_REVISION = "5eedffa87476a063a05bed96f17275ed63f05c1a"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
+_SCHEMA_9_KINDS = frozenset({"approvalprocess", "aura", "visualforcepage", "visualforcecomponent"})
 KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc",
-                   "outboundmessage", "validationrule", "workflowrule"})
+                   "outboundmessage", "validationrule", "workflowrule"}) | _SCHEMA_9_KINDS
 API_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DISPATCH_CANDIDATE_INVOCATIONS = {"conditional_virtual_dispatch": "constructed_virtual_dispatch",
                                    "fflib_event_dispatch": "fflib_event_dispatch"}
@@ -105,7 +106,7 @@ def component_id(kind: str, api_name: str) -> str:
         return f"sf:{kind}:" + quote(api_name.casefold(), safe="._")
     qualified, separator, signature = api_name.partition("(") if kind == "apexmethod" else (api_name, "", "")
     parts = qualified.split(".")
-    expected = {2, 3} if kind == "apexmethod" else {1, 2} if kind == "apexclass" else {2} if kind in {"field", "outboundmessage", "validationrule"} else {1}
+    expected = {2, 3} if kind == "apexmethod" else {1, 2} if kind == "apexclass" else {2} if kind in {"field", "outboundmessage", "validationrule", "approvalprocess"} else {1}
     signature_valid = not separator or (signature.endswith(")") and _method_types_valid(signature[:-1]))
     if len(parts) not in expected or not all(API_NAME.fullmatch(p) for p in parts) or not signature_valid:
         raise DataError(f"Invalid {kind} API name: {api_name}")
@@ -296,6 +297,8 @@ def validate_bundle(bundle):
                 raise DataError("Lightning components and outbound messages require snapshot schema version 4.")
             if manifest["schema_version"] < 5 and component["kind"] == "validationrule":
                 raise DataError("Validation rules require snapshot schema version 5.")
+            if manifest["schema_version"] < 9 and component["kind"] in _SCHEMA_9_KINDS:
+                raise DataError("Approval processes, Aura and Visualforce require snapshot schema version 9.")
             if manifest["schema_version"] < 8 and component["kind"] == "workflowrule":
                 raise DataError("Workflow rules require snapshot schema version 8.")
             if manifest["schema_version"] < 4 and component["kind"] == "apexmethod" and "(" in component["api_name"]:
@@ -368,6 +371,14 @@ def validate_bundle(bundle):
                             or components[target]["kind"] != "field"
                             or field_definition["path"] != occurrence["path"]):
                         raise DataError("Invalid Workflow field update evidence.")
+                if occurrence["rule"] == "approval.field_update":
+                    field_definition = occurrence["resolution"]["field_definition"]
+                    validate_location(field_definition)
+                    if (relation != "writes" or components[source]["kind"] != "approvalprocess"
+                            or components[target]["kind"] != "field"
+                            or not occurrence["path"].casefold().endswith(".approvalprocess-meta.xml")
+                            or not field_definition["path"].casefold().endswith(".workflow-meta.xml")):
+                        raise DataError("Invalid approval process field update evidence.")
                 if dispatch_reason:
                     resolution = occurrence["resolution"]
                     if resolution.get("conditional") is not True or resolution.get("hook") not in components[target]["definitions"]:

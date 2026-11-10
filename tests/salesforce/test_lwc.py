@@ -186,3 +186,22 @@ def test_end_to_end_impact_includes_lwc_and_hashes_helper_modules(tmp_path):
     result = query.impact(bundle, "SampleController.load", exclude_tests=True)
     assert any(row["source"] == "sf:lwc:sample" and row["relation"] == "calls" for row in result["results"])
     assert bundle["manifest"]["inputs"][PATH] == hashlib.sha256((root / PATH).read_bytes()).hexdigest()
+
+def test_schema_imports_reference_fields_and_verified_lookup_hops():
+    store = extract("""import name from '@salesforce/schema/Account.Name';
+import account from '@salesforce/schema/Account';
+import parentName from '@salesforce/schema/Contact.Account.Name';
+import unresolved from '@salesforce/schema/Contact.Owner.Name';
+import { invalid } from '@salesforce/schema/Account.Name';
+""")
+    refs = edges(store, "references")
+    assert {row["target"] for row in refs} == {
+        "sf:field:account.name", "sf:object:account", "sf:field:contact.accountid",
+    }
+    assert {store.evidence[item]["rule"] for row in refs for item in row["evidence_ids"]} == {
+        "lwc.schema_import", "lwc.schema_import_navigation",
+    }
+    assert not edges(store, "calls")
+    assert {row["code"] for row in store.diagnostics} >= {
+        "LWC_SCHEMA_TARGET_UNRESOLVED", "LWC_SCHEMA_IMPORT_SHAPE_UNSUPPORTED",
+    }

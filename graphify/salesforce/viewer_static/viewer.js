@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const colors = {reads:'#2563b7',writes:'#a85a16',filters:'#7b48b6',calls:'#087d78',references:'#68768a',contains:'#84939d'};
-const kindNames = {object:'Object',field:'Field',flow:'Flow',apexclass:'Apex class',apexmethod:'Apex method',apextrigger:'Trigger',lwc:'Lightning component',outboundmessage:'Outbound message',validationrule:'Validation rule',workflowrule:'Workflow rule'};
+const kindNames = {object:'Object',field:'Field',flow:'Flow',apexclass:'Apex class',apexmethod:'Apex method',apextrigger:'Trigger',lwc:'Lightning component',outboundmessage:'Outbound message',validationrule:'Validation rule',workflowrule:'Workflow rule',approvalprocess:'Approval process',aura:'Aura component',visualforcepage:'Visualforce page',visualforcecomponent:'Visualforce component'};
 const state = {meta:null,focus:null,mode:'impact',depth:1,status:'all',history:[],view:null,edge:null,evidenceSnapshot:'after',evidenceOffset:0,request:0,searchRequest:0,diagnosticsRequest:0,evidenceRequest:0};
 const positions = new Map();
 let searchTimer;

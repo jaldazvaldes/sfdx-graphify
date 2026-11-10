@@ -148,7 +148,8 @@ def extract_inventory(documents: list[Document], store: FactStore):
         if kind == "field":
             owner = name.split(".")[0]
             if (root.value("type").casefold() == "summary"
-                    or any(child.tag in FIELD_DEPENDENCY_TAGS for child in root.children)):
+                    or any(child.tag in FIELD_DEPENDENCY_TAGS for child in root.children)
+                    or any(value_set.all("controllingField") for value_set in root.all("valueSet"))):
                 field_expressions.append((document, source, owner))
             owner_id = store.resolve_component("object", owner, document.location(root))
             if owner_id:

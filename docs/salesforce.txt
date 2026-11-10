@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.8 (unreleased)
+sfdx-graphify 0.5.9 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -54,8 +54,9 @@ The module form works without installing the console script:
   python -m graphify.salesforce serve --snapshot <external-directory> --port 8767
   python -m graphify.salesforce serve --snapshot <external-directory> --before <earlier-directory>
 
-The installed command is sfdx-graphify. JSON is the default; --format text gives
-readable results. Use --source and --require-current on a query when freshness
+The installed command is sfdx-graphify. JSON is the default and keeps full
+coverage details. Query output with --format text shows a short coverage summary.
+Add --full-coverage to include the complete coverage object in text output. Use --source and --require-current on a query when freshness
 must be verified. Queries without source access report unknown freshness. Name
 ambiguity is an error with candidates, including duplicate local definitions.
 
@@ -144,12 +145,14 @@ consumer exists elsewhere. Unqualified exact field names resolve only if unique;
 otherwise the query lists qualified candidates. Locally excluded inactive names
 report their exclusion status when recorded by the snapshot.
 
-For fields present in the graph, refs also returns literal_blind_spots from snapshots that include a
-literal index. The build scans selected unsupported text metadata, including
-layouts, FlexiPages, quick actions, permissions, report definitions, approvals,
-Visualforce, Aura, and email templates. It scans up to 2 MiB per file and
-64 MiB total, reports skipped files, and keeps up to three example paths per
-name. The index records field names, counts and relative paths.
+For fields and Apex methods present in the graph, refs also returns
+literal_blind_spots from snapshots that include the corresponding index. Field
+scans cover layouts, FlexiPages, quick actions, permissions, reports, approvals,
+email templates, list views, custom metadata records, web links, sharing rules,
+field sets, and selected Aura, Visualforce and LWC sources. Method scans cover
+those interface sources and count Class.Method and method-name matches.
+Overloads share their literal hints. Scans use up to 8 MiB per file and 64 MiB
+total, report skipped files, and keep up to three example paths per name.
 
 The qualified count matches a complete Object.Field token case-insensitively.
 The field-name count covers the standalone name and matching suffixes in other
@@ -208,7 +211,7 @@ ambiguous status stays in scope.
 This policy removes the inactive component and its dependency evidence from canonical
 facts, queries, exports and the viewer. Declared object/field definitions stay;
 components are never considered inactive merely because they have no callers.
-Flow, Apex trigger, validation rule and Workflow rule activation status are indexed. Other component types need
+Flow, Apex trigger, validation rule, Workflow rule and approval process activation status are indexed. Other component types need
 their own metadata-specific activation semantics when their extractors support it.
 Use build --include-inactive to include all local states for historical analysis.
 activity_policy in the manifest, coverage and query envelopes records the mode
@@ -247,7 +250,10 @@ supports direct reads, memory assignments and explicit DML in its body. The
 element binding never leaks into the iterable expression or outside the loop.
 This uses the declared element type, not inference from a collection or a
 method's return value. Unknown, primitive and collection-valued element types
-remain outside coverage. Assigning a field is not proof of a database write.
+remain outside coverage. Typed local lists and one-dimensional arrays support
+index access. Typed local lists and maps also support get when their value type
+identifies a record. The extractor records field reads and memory assignments
+through these accesses, including their collection declaration.
 Parent paths in static SOQL resolve through declared lookup targets and a small
 explicit standard-schema vocabulary. For both classes and triggers, fully
 resolved paths produce reads for each traversed lookup with context
@@ -323,9 +329,12 @@ are visible in diagnostics and coverage.
 
 Literal LWC Apex imports establish references; direct imperative uses and imported
 wire adapters establish separate static call candidates. Local bindings and
-shadowing are checked with the pinned JavaScript AST. Dynamic imports, indirect
-aliases, Aura and template behavior remain outside coverage. Source modules are
-hashed and included in bundle provenance, including helpers.
+shadowing are checked with the pinned JavaScript AST. Literal @salesforce/schema
+imports create object and field references, including resolved lookup hops.
+Aura tracks verified enqueues of literal controller actions to unique local
+@AuraEnabled methods. Visualforce tracks supported literal action bindings and
+remote action calls to unique local Apex targets. Dynamic bindings and ambiguous
+targets remain diagnostic. Source modules and markup are hashed for provenance.
 
 Workflow outbound message definitions include object ownership and declared
 payload fields. Literal Flow outboundMessage actions link to those definitions,
@@ -337,7 +346,10 @@ definition. Literal criterion fields and supported references in rule and
 field update formulas create reads. A field update with targetObject produces
 a diagnostic until its destination can be verified. The extracted edges describe
 metadata references and intended writes.
-Other Workflow actions and unsupported targets remain diagnostic.
+Other Workflow actions and unsupported targets remain diagnostic. Approval
+processes contribute criterion and displayed-field reads, plus writes for
+FieldUpdate actions with matching local Workflow definitions. Evidence links to
+both definitions. The same inactive-component policy applies to approval processes.
 Process Builder trigger objects are indexed only from unique explicit
 ObjectType metadata; no org activation or execution is inferred.
 
@@ -377,11 +389,13 @@ Metadata contract: https://developer.salesforce.com/docs/platform/api-metadata/r
 Custom field formulas and roll-up summary definitions add dependency evidence
 from their CustomField XML. Formula reads use the bounded Salesforce formula
 resolver. Roll-up reads identify the declared child join and aggregate fields.
-Roll-up filters identify field operands. Evidence links back to the XML.
+Roll-up filters identify field operands. Lookup filters contribute reads for
+resolved operands, and dependent picklists reference their controlling field.
+Evidence links back to the XML.
 Metadata contract: https://developer.salesforce.com/docs/platform/api-metadata/references/meta-types/metadata-customfield.html
 
 Formula evaluation and Flow loop aliases remain outside the extraction scope.
-Literal mentions in selected unsupported metadata help direct follow-up review.
+Literal mentions in selected metadata and interface sources help direct follow-up review.
 
 SOURCE SELECTION AND STORAGE
 

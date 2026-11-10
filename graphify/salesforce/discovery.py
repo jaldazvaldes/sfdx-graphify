@@ -27,7 +27,7 @@ EXCLUDED_DIRS = frozenset({
 })
 _CONFIG_FILES = ("sfdx-project.json", ".forceignore", ".gitignore")
 _SUPPORTED = (".flow-meta.xml", ".object-meta.xml", ".field-meta.xml", ".validationrule-meta.xml",
-              ".recordtype-meta.xml", ".workflow-meta.xml",
+              ".recordtype-meta.xml", ".workflow-meta.xml", ".approvalprocess-meta.xml",
               ".cls", ".trigger", ".trigger-meta.xml")
 _MAX_FILE_BYTES = 32 * 1024 * 1024
 _GIT_TIMEOUT_ENV = "SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS"
@@ -44,7 +44,10 @@ def lwc_bundle(relative: str) -> tuple[str, str] | None:
 
 
 def supported_source(relative: str) -> bool:
-    return relative.lower().endswith(_SUPPORTED) or lwc_bundle(relative) is not None
+    if relative.lower().endswith(_SUPPORTED) or lwc_bundle(relative) is not None:
+        return True
+    from .ui_apex import ui_source
+    return ui_source(relative)
 
 
 def _linked(path: Path) -> bool:

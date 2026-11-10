@@ -20,8 +20,9 @@ EDGE_LIMIT = 200
 SEARCH_LIMIT = 25
 EVIDENCE_LIMIT = 100
 MODES = frozenset({"impact", "automation", "schema"})
-_RULE_KINDS = frozenset({"validationrule", "workflowrule"})
-AUTOMATION_KINDS = frozenset({"flow", "apexclass", "apexmethod", "apextrigger", "lwc", "outboundmessage"}) | _RULE_KINDS
+_RULE_KINDS = frozenset({"validationrule", "workflowrule", "approvalprocess"})
+AUTOMATION_KINDS = frozenset({"flow", "apexclass", "apexmethod", "apextrigger", "lwc", "outboundmessage",
+                              "aura", "visualforcepage", "visualforcecomponent"}) | _RULE_KINDS
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; "
        "connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; "
        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")

@@ -76,6 +76,13 @@ def _significant(node):
     return [child for child in node.named_children if child.type not in _COMMENTS] if node is not None else []
 
 
+def _without_parentheses(node):
+    while node is not None and node.type == "parenthesized_expression":
+        children = _significant(node)
+        node = children[0] if len(children) == 1 else None
+    return node
+
+
 def _text(data, node):
     return data[node.start_byte:node.end_byte].decode("utf-8") if node is not None else ""
 
@@ -539,6 +546,64 @@ class _MethodExtractor:
                                 resolution=resolution or {"basis": "apex_ast", "parser": PARSER_VERSION, "object": owner},
                                 qualifiers=qualifiers)
 
+    def _indexed_record(self, expression):
+        """Resolve one element access on a lexically declared List or Map."""
+        expression = _without_parentheses(expression)
+        if expression is None:
+            return None
+        if expression.type == "array_access":
+            receiver = expression.child_by_field_name("array")
+            selector = expression.child_by_field_name("index")
+            access = "index"
+        elif (expression.type == "method_invocation"
+                and self.unit.text(expression.child_by_field_name("name")).casefold() == "get"):
+            receiver = expression.child_by_field_name("object")
+            arguments = _significant(expression.child_by_field_name("arguments"))
+            selector = arguments[0] if len(arguments) == 1 else None
+            access = "get"
+        else:
+            return None
+        receiver = _without_parentheses(receiver)
+        if receiver is None or receiver.type != "identifier" or selector is None:
+            return None
+        binding = self.binding(self.unit.text(receiver), receiver, report=False)
+        if binding is None:
+            return None
+        declaration = binding.node
+        if declaration.type == "variable_declarator":
+            declaration = declaration.parent
+        if declaration is None or declaration.type not in {"formal_parameter", "local_variable_declaration"}:
+            return None
+        declared_type = declaration.child_by_field_name("type")
+        if declared_type is None:
+            return None
+        if declared_type.type == "array_type":
+            dimensions = declared_type.child_by_field_name("dimensions")
+            if dimensions is None or sum(child.type == "[" for child in dimensions.children) != 1:
+                return None
+            family = "list"
+            element = declared_type.child_by_field_name("element")
+        elif declared_type.type == "generic_type":
+            parts = _significant(declared_type)
+            if len(parts) != 2 or parts[1].type != "type_arguments":
+                return None
+            family = self.unit.text(parts[0]).casefold()
+            arguments = _significant(parts[1])
+            if family == "list" and len(arguments) == 1:
+                element = arguments[0]
+            elif family == "map" and access == "get" and len(arguments) == 2:
+                element = arguments[1]
+            else:
+                return None
+            if family in self.index.apex_types or family in self.unit.declared_types:
+                return None
+        else:
+            return None
+        owner, collection = self.record_type(element)
+        if not owner or collection:
+            return None
+        return owner, binding, f"{family}_{access}", selector
+
     def field_access(self, node, relation="reads", *, operation="field_access"):
         resource, field_node = node.child_by_field_name("object"), node.child_by_field_name("field")
         if field_node is not None and self.unit.text(field_node).casefold() == "class":
@@ -551,6 +616,17 @@ class _MethodExtractor:
                     self.store.relation(self.method.id, target, "references", self.unit.location(node),
                                         "apex.class_literal", qualifiers={"context": "class_literal"},
                                         resolution={"basis": "literal_class_token", "parser": PARSER_VERSION})
+                return
+        if resource is not None and resource.type != "identifier" and field_node is not None:
+            indexed = self._indexed_record(resource)
+            if indexed is not None and field_node.type == "identifier" and self.unit.text(field_node).casefold() != "class":
+                owner, binding, access, selector = indexed
+                declaration = self.unit.location(binding.node)
+                self.edge(owner, self.unit.text(field_node), relation, node, "apex.indexed_field",
+                          {"operation": operation, "effect": "memory"},
+                          {"basis": "lexical_collection_element_type", "object": owner, "accessor": access,
+                           "declaration": {key: declaration[key] for key in ("path", "locator")}})
+                self.visit(selector)
                 return
         if resource is None or resource.type != "identifier" or field_node is None:
             self.diagnostic("APEX_FIELD_PATH_UNSUPPORTED", "Only one direct field on a typed local record is supported; paths and indexed collections are not truncated.", node)

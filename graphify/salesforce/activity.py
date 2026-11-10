@@ -10,7 +10,8 @@ from .schema import FactStore
 _INACTIVE_STATUSES = {"flow": frozenset({"Draft", "InvalidDraft", "Obsolete"}),
                       "apextrigger": frozenset({"Inactive", "Deleted"}),
                       "validationrule": frozenset({"Inactive"}),
-                      "workflowrule": frozenset({"Inactive"})}
+                      "workflowrule": frozenset({"Inactive"}),
+                      "approvalprocess": frozenset({"Inactive"})}
 _LOCATION_KEYS = ("path", "locator", "line", "column", "end_line", "end_column", "content_hash")
 
 

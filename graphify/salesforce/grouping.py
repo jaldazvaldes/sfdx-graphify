@@ -9,17 +9,23 @@ from .schema import DataError, component_id
 
 
 _PARENT_KINDS = {"field": "object", "outboundmessage": "object",
-                 "validationrule": "object", "workflowrule": "object", "apexmethod": "apexclass"}
+                 "validationrule": "object", "workflowrule": "object",
+                 "approvalprocess": "object", "apexmethod": "apexclass"}
 _TYPE_NAMES = {"object": "Object", "field": "Field", "apexclass": "Apex class",
                "apexmethod": "Apex method", "apextrigger": "Trigger", "flow": "Flow",
                "lwc": "Lightning component", "outboundmessage": "Outbound message",
-               "validationrule": "Validation rule", "workflowrule": "Workflow rule"}
+               "validationrule": "Validation rule", "workflowrule": "Workflow rule",
+               "approvalprocess": "Approval process", "aura": "Aura component",
+               "visualforcepage": "Visualforce page", "visualforcecomponent": "Visualforce component"}
 _TYPE_GROUPS = {"flow": "Flows", "apextrigger": "Triggers", "lwc": "Lightning components",
                 "field": "Fields without an unambiguous owner",
                 "apexmethod": "Apex methods without an unambiguous owner",
                 "outboundmessage": "Outbound messages without an unambiguous owner",
                 "validationrule": "Validation rules without an unambiguous owner",
-                "workflowrule": "Workflow rules without an unambiguous owner"}
+                "workflowrule": "Workflow rules without an unambiguous owner",
+                "approvalprocess": "Approval processes without an unambiguous owner",
+                "aura": "Aura components", "visualforcepage": "Visualforce pages",
+                "visualforcecomponent": "Visualforce components"}
 
 
 def _name(graph, node):

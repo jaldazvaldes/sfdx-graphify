@@ -4,7 +4,9 @@ const TYPE_LABELS = new Map([
   ['apexclass', 'Apex classes'], ['apexmethod', 'Apex methods'], ['apextrigger', 'Triggers'],
   ['lwc', 'Lightning components'], ['outboundmessage', 'Outbound messages'],
   ['validationrule', 'Validation rules'],
-  ['workflowrule', 'Workflow rules'],
+  ['workflowrule', 'Workflow rules'], ['approvalprocess', 'Approval processes'],
+  ['aura', 'Aura components'], ['visualforcepage', 'Visualforce pages'],
+  ['visualforcecomponent', 'Visualforce components'],
 ]);
 const hiddenTypes = new Set();
 let showTests = true;

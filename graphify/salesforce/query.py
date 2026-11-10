@@ -284,9 +284,10 @@ def refs(bundle: dict, name: str, *, relation: str | None = None,
     """List incoming relationships, retaining all occurrences per result."""
     result = _references(bundle, name, "target", relation=relation, limit=limit, source=source,
                          exclude_tests=exclude_tests, diagnostics=diagnostics)
-    if result["component"]["kind"] == "field":
-        from .blind_spots import field_mentions
-        result["literal_blind_spots"] = field_mentions(bundle["manifest"], result["component"]["api_name"])
+    component = result["component"]
+    if component["kind"] in {"field", "apexmethod"}:
+        from .blind_spots import literal_mentions
+        result["literal_blind_spots"] = literal_mentions(bundle["manifest"], component)
     return result
 
 

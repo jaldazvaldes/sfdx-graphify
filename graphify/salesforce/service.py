@@ -12,6 +12,8 @@ from .apex import index_apex, extract_apex, resolve_invocable_calls
 from .triggers import index_triggers, extract_triggers
 from .lwc import extract_lwc
 from .workflow import index_workflow, extract_workflow
+from .approval import index_approval_processes, extract_approval_processes
+from .ui_apex import ui_source, extract_ui_apex
 from .validation_rules import extract_validation_rule
 from .inventory import extract_inventory, index_definitions, identity
 from .schema import (EXTRACTOR_VERSION, SCHEMA_VERSION, TESTED_API_VERSIONS,
@@ -60,9 +62,20 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         entry.pop("id", None)
         store.diagnostic(**entry)
     documents, apex, triggers, trigger_metadata, lightning, workflows = [], {}, {}, [], {}, []
+    approvals, ui = [], {}
     for path, data in sorted(scan.files.items()):
         if lwc_bundle(path):
             lightning[path] = data
+        elif ui_source(path):
+            ui[path] = data
+        elif path.casefold().endswith(".approvalprocess-meta.xml"):
+            try:
+                approval = parse_xml(path, data)
+            except ValueError as exc:
+                store.diagnostic("APPROVAL_METADATA_UNRESOLVED", str(exc),
+                                 {"path": path, "content_hash": scan.inputs[path]}, state="unresolved")
+            else:
+                approvals.append(approval)
         elif path.endswith(".workflow-meta.xml"):
             workflows.append(parse_xml(path, data))
         elif path.endswith(".cls"):
@@ -86,14 +99,17 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
             documents.append(parse_xml(path, data))
     index_definitions(documents, store)
     index_workflow(workflows, store)
+    index_approval_processes(approvals, store)
     apex_index = index_apex(apex, store)
     trigger_index = index_triggers(triggers, trigger_metadata, apex_index, store)
     excluded = inactive_components(store.components.values(), include_inactive=include_inactive)
     extract_inventory(documents, store)
     extract_workflow(workflows, store, excluded=excluded)
+    extract_approval_processes(approvals, workflows, store, excluded=excluded)
     extract_apex(apex_index, store)
     extract_triggers(trigger_index, apex_index, store, excluded=set(excluded))
     extract_lwc(lightning, apex_index, store)
+    extract_ui_apex(ui, apex_index, store)
     for document in documents:
         if document.root.tag in {"Flow", "ValidationRule"}:
             if component_id(*identity(document)) in excluded:
@@ -131,12 +147,14 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         "observed_api_versions": versions,
         "untested_api_versions": [v for v in versions if v not in TESTED_API_VERSIONS],
         "supported_metadata": ["Flow (bounded typed references, decisions and formula dependencies)", "CustomObject (inventory)",
-                               "CustomField (inventory, lookups, and bounded formula and roll-up dependencies)",
+                               "CustomField (inventory, lookup filters, controlling fields, formulas and roll-ups)",
                                "RecordType (local evidence for a SOQL or Flow relationship)",
                                "ValidationRule (local activation, bounded formula references and error display fields)",
                                "ApexTrigger (events, literal handlers and bounded record references)",
                                "ApexClass/ApexMethod (bounded AST, invocable methods and static SOQL/DML)",
-                               "LightningComponentBundle (literal Apex imports, imperative and wire calls)",
+                               "LightningComponentBundle (literal field and Apex imports, imperative and wire calls)",
+                               "Aura and Visualforce (bounded static Apex actions)",
+                               "ApprovalProcess (bounded criteria, displayed fields and field updates)",
                                "Workflow (outbound messages, bounded rule criteria and declared same-object field updates)"],
         "flow_status_counts": dict(sorted(Counter(
             c.get("local_status") or "Unknown" for c in facts["components"] if c["kind"] == "flow"

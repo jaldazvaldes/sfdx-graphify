@@ -7,7 +7,7 @@ import json
 import pytest
 
 from graphify.salesforce import query
-from graphify.salesforce.schema import DataError, FactStore, stable_id, validate_bundle
+from graphify.salesforce.schema import SCHEMA_VERSION, DataError, FactStore, stable_id, validate_bundle
 from graphify.salesforce.service import build_project
 from graphify.salesforce.snapshot import load
 from graphify.salesforce.viewer import SnapshotView
@@ -62,7 +62,7 @@ def test_active_workflow_field_updates_survive_query_snapshot_and_view(tmp_path)
     output = tmp_path / "snapshot"
     bundle = build_project(source, out=output)
     assert load(output) == bundle
-    assert bundle["manifest"]["schema_version"] == 8
+    assert bundle["manifest"]["schema_version"] == SCHEMA_VERSION
     assert bundle["manifest"]["activity_policy"]["excluded_counts"] == {"workflowrule": 1}
     assert bundle["manifest"]["coverage"]["analyzed_files"] == 1
     assert bundle["manifest"]["coverage"]["workflow_rule_status_counts"] == {"Active": 1, "Unknown": 1}

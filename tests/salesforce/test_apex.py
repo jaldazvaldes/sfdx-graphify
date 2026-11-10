@@ -122,8 +122,64 @@ def test_direct_record_fields_obey_lexical_scope_and_same_named_fields():
     assert len(edge["evidence_ids"]) == 2
 
 
-def test_unknown_scoped_class_and_indexed_collection_do_not_become_record_fields():
-    store, _ = analyze("Account row = new Account(); String text = 'A'; text.Name = 'B'; rows[0].Name = 'C'; row.Owner.Name = 'D';")
+def test_typed_collection_elements_keep_reads_and_writes_with_declaration_evidence():
+    store, _ = analyze("""
+      Map<Id, /* record type */ Account> byId;
+      Lead[] leads;
+      rows[0].LastName = (byId)?.get(key)?.Name;
+      byId.get(rows[0].AccountId).NumberOfEmployees += 1;
+      String details = rows.get(0).Description;
+      String phone = (leads[0]).Phone;
+    """, declaration="public static void run(List<Contact> rows, Id key)", annotation="")
+    assert field_relations(store) == {
+        ("Contact.LastName", "writes", "memory"),
+        ("Account.Name", "reads", "memory"),
+        ("Contact.AccountId", "reads", "memory"),
+        ("Account.NumberOfEmployees", "reads", "memory"),
+        ("Account.NumberOfEmployees", "writes", "memory"),
+        ("Contact.Description", "reads", "memory"),
+        ("Lead.Phone", "reads", "memory"),
+    }
+    indexed = [item for item in store.evidence.values() if item["rule"] == "apex.indexed_field"]
+    assert len(indexed) == 7
+    assert {item["resolution"]["accessor"] for item in indexed} == {"list_index", "list_get", "map_get"}
+    assert all(item["resolution"]["basis"] == "lexical_collection_element_type" for item in indexed)
+    assert any("/formal_parameter" in item["resolution"]["declaration"]["locator"] for item in indexed)
+    assert any("/variable_declarator" in item["resolution"]["declaration"]["locator"] for item in indexed)
+    assert not store.diagnostics
+
+
+def test_indexed_selector_calls_survive_without_guessing_a_nested_field_path():
+    store, _ = analyze("Integer count = rows[choose()].NumberOfEmployees++; String name = rows[choose()].Owner.Name;",
+                       extra="private static Integer choose() { return 0; }")
+    assert field_relations(store) == {
+        ("Account.NumberOfEmployees", "reads", "memory"),
+        ("Account.NumberOfEmployees", "writes", "memory"),
+    }
+    assert any(r["relation"] == "calls" and r["target"] == "sf:apexmethod:sampleaction.choose"
+               for r in store.relationships.values())
+    assert "APEX_FIELD_PATH_UNSUPPORTED" in codes(store)
+
+
+def test_unsupported_indexed_resources_do_not_become_record_fields():
+    store, _ = analyze("""
+      Account row;
+      String text;
+      text.Name = 'A';
+      rows[0].Name = 'B';
+      row.Owner.Name = 'C';
+      Map<Id, SObject> generic;
+      generic.get(key).Name = 'D';
+      Map<Id, List<Account>> nested;
+      nested.get(key).Name = 'E';
+      Set<Account> unordered;
+      unordered[0].Name = 'F';
+      Map<Id, Account> byId;
+      byId[key].Name = 'G';
+      byId.get(key, key).Name = 'H';
+      Account[][] arrays;
+      arrays[0].Name = 'I';
+    """, declaration="public static void run(List<SObject> rows, Id key)", annotation="")
     assert not field_relations(store)
     assert {"APEX_FIELD_PATH_UNSUPPORTED", "APEX_RECORD_TYPE_UNRESOLVED"} <= codes(store)
 

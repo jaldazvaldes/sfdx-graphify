@@ -65,3 +65,42 @@ def test_literal_mentions_are_scoped_and_distinguished_from_dependencies(tmp_pat
     sample[0] = "force-app/layouts/Absent.layout-meta.xml"
     with pytest.raises(DataError, match="Invalid literal metadata match summary"):
         validate_bundle(invalid)
+
+
+def test_literal_mentions_cover_additional_metadata_and_methods(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "sfdx-project.json").write_text(
+        '{"packageDirectories":[{"path":"force-app","default":true}]}', encoding="utf-8")
+
+    def put(relative, text):
+        path = source / "force-app" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    put("objects/Account/fields/Code__c.field-meta.xml",
+        "<CustomField><fullName>Code__c</fullName><type>Text</type></CustomField>")
+    put("classes/DemoController.cls", "public class DemoController { public static void save() {} }")
+    for name in ("objects/Account/listViews/Sample.listView-meta.xml",
+                 "customMetadata/Setting.Example.md-meta.xml", "objects/Account/webLinks/Help.webLink-meta.xml",
+                 "sharingRules/Account.sharingRules-meta.xml", "objects/Account/fieldSets/Sample.fieldSet-meta.xml"):
+        put(name, "<Metadata>Account.Code__c DemoController.save</Metadata>")
+    put("lwc/card/card.html", '<template data-field="Account.Code__c" data-action="DemoController.save">{save}</template>')
+    put("lwc/card/card.js", "import CODE from '@salesforce/schema/Account.Code__c';")
+
+    bundle = build_project(source, out=tmp_path / "snapshot")
+    field = query.refs(bundle, "Account.Code__c")
+    assert field["literal_blind_spots"]["qualified"]["file_count"] == 7
+    assert field["literal_blind_spots"]["scanned_file_count"] == 7
+
+    method = query.refs(bundle, "DemoController.save")
+    hints = method["literal_blind_spots"]
+    assert hints["scanned_file_count"] == 2
+    assert hints["qualified"]["occurrence_count"] == 1
+    assert hints["method_name"]["example_paths"] == ["force-app/lwc/card/card.html"]
+    assert {row["relation"] for row in method["results"]} == {"contains"}
+    assert "method name" in cli._text(method)
+
+    legacy = deepcopy(bundle)
+    del legacy["manifest"]["literal_blind_spots"]["methods"]
+    assert query.refs(legacy, "DemoController.save")["literal_blind_spots"]["state"] == "unavailable"

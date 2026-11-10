@@ -91,6 +91,8 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--expect-snapshot")
         command.add_argument("--source", type=Path)
         command.add_argument("--format", choices=("json", "text"), default="json")
+        command.add_argument("--full-coverage", action="store_true",
+                             help="Include full snapshot coverage in text output.")
         command.add_argument("--require-current", action="store_true")
         if name in ("refs", "deps", "impact", "components"):
             command.add_argument("--limit", type=int, default=1000)
@@ -137,13 +139,18 @@ def _project_snapshot() -> Path:
     return snapshot
 
 
-def _text(result: dict) -> str:
+def _text(result: dict, *, full_coverage: bool = False) -> str:
     lines = [f"Snapshot: {result.get('snapshot_id', 'unavailable')}"]
     if "freshness" in result:
         freshness = result["freshness"]
         lines.append(f"Freshness: {freshness.get('state') if isinstance(freshness, dict) else freshness}")
-    if "coverage" in result:
-        lines.append("Coverage: " + json.dumps(result["coverage"], ensure_ascii=False, sort_keys=True))
+    coverage = result.get("coverage")
+    if coverage:
+        if full_coverage:
+            lines.append("Coverage: " + json.dumps(coverage, ensure_ascii=False, sort_keys=True))
+        else:
+            lines.append(f"Coverage: {coverage.get('status', 'unknown')}, "
+                         f"{coverage.get('analyzed_files', 'unknown')} files analyzed")
     if "output" in result:
         lines.append(f"Output: {result['output']}")
     if "focus" in result:
@@ -208,9 +215,12 @@ def _text(result: dict) -> str:
     if "literal_blind_spots" in result:
         mentions = result["literal_blind_spots"]
         if mentions["state"] == "indexed":
-            lines.append(f"Literal search in selected unsupported metadata: {mentions['scanned_file_count']} files scanned, "
+            lines.append(f"Literal search in selected metadata: {mentions['scanned_file_count']} files scanned, "
                          f"{mentions['skipped_file_count']} skipped.")
-            for key, label in (("qualified", "qualified"), ("field_name", "field name")):
+            for key, label in (("qualified", "qualified"), ("field_name", "field name"),
+                               ("method_name", "method name")):
+                if key not in mentions:
+                    continue
                 match = mentions[key]
                 lines.append(f"  {match['literal']} ({label}): {match['occurrence_count']} matches "
                              f"in {match['file_count']} files.")
@@ -354,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                   "error": f"Required local dependency is unavailable: {exc}"}
         code = 1
     print(json.dumps(result, ensure_ascii=False, sort_keys=True) if output_format == "json"
-          else _text(result))
+          else _text(result, full_coverage=args.command == "build" or getattr(args, "full_coverage", False)))
     if code:
         print(result["error"], file=sys.stderr)
     return code

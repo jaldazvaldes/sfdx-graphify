@@ -126,15 +126,17 @@ def _relative_field(owner, path):
 
 
 def _read_reference(store, source, owner, reference, occurrence, *, rule, qualifiers, details):
-    context = formula_field_context(_relative_field(owner, reference), owner, record_basis="workflow_rule_object")
+    feature = "approval" if store.components[source]["kind"] == "approvalprocess" else "workflow"
+    basis_name = "approval_process_object" if feature == "approval" else "workflow_rule_object"
+    context = formula_field_context(_relative_field(owner, reference), owner, record_basis=basis_name)
     if context is None:
-        store.diagnostic("WORKFLOW_GLOBAL_UNSUPPORTED", "This global reference has no supported typed field target.",
+        store.diagnostic(f"{feature.upper()}_GLOBAL_UNSUPPORTED", "This global reference has no supported typed field target.",
                          occurrence)
         return
     target_owner, field_path, basis = context
     resolved = resolve_source_field_path(store, target_owner, field_path)
     if resolved is None:
-        store.diagnostic("WORKFLOW_READ_FIELD_PATH_UNRESOLVED", "The complete field path is not uniquely established.",
+        store.diagnostic(f"{feature.upper()}_READ_FIELD_PATH_UNRESOLVED", "The complete field path is not uniquely established.",
                          occurrence, state="unresolved")
         return
     target = store.field(resolved["owner"], resolved["field"], occurrence)
@@ -148,13 +150,14 @@ def _read_reference(store, source, owner, reference, occurrence, *, rule, qualif
 
 def _formula_reads(document, node, store, source, owner, *, rule, qualifiers, action_site=None):
     location = document.location(node)
+    feature = "APPROVAL" if store.components[source]["kind"] == "approvalprocess" else "WORKFLOW"
     if node.children or not node.text:
-        store.diagnostic("WORKFLOW_FORMULA_INVALID", "A nonempty scalar formula expression is required.",
+        store.diagnostic(f"{feature}_FORMULA_INVALID", "A nonempty scalar formula expression is required.",
                          location, state="unresolved")
         return
     references, issues = formula_references(node.text)
     for issue in issues:
-        store.diagnostic("WORKFLOW_FORMULA_SYNTAX_UNSUPPORTED", "Formula syntax exceeds lexical reference coverage.",
+        store.diagnostic(f"{feature}_FORMULA_SYNTAX_UNSUPPORTED", "Formula syntax exceeds lexical reference coverage.",
                          location, issue=issue)
     for number, reference in enumerate(references, 1):
         occurrence = {**location, "locator": f"{node.locator}/reference[{number}]"}
@@ -215,50 +218,55 @@ def _extract_rule_updates(document, owner, store, definitions, excluded):
                                  "Workflow rule actions other than field updates are outside coverage.",
                                  document.location(action), construct=action.tag)
                 continue
-            _extract_field_update(document, owner, store, definitions, source, local_status, action, timing)
+            extract_field_update(document, owner, store, definitions, source, local_status, action, timing)
 
 
-def _extract_field_update(document, owner, store, definitions, source, local_status, action, timing):
+def extract_field_update(document, owner, store, definitions, source, local_status, action, timing):
+    """Resolve an action to one same-object Workflow field update."""
     location = document.location(action)
+    approval = store.components[source]["kind"] == "approvalprocess"
+    feature = "APPROVAL" if approval else "WORKFLOW"
     name = _single_leaf(action, "name")
     if _single_leaf(action, "type") is None or name is None or not name.text.isprintable():
-        store.diagnostic("WORKFLOW_FIELD_UPDATE_ACTION_UNRESOLVED", "Field update action needs one literal name and type.",
+        store.diagnostic(f"{feature}_FIELD_UPDATE_ACTION_UNRESOLVED", "Field update action needs one literal name and type.",
                          location, state="unresolved")
         return
     candidates = definitions.get((owner.casefold(), name.text.casefold()), [])
-    if len(candidates) != 1 or candidates[0][0].path != document.path:
-        store.diagnostic("WORKFLOW_FIELD_UPDATE_DEFINITION_UNRESOLVED",
-                         "Field update action needs one matching definition in its Workflow file.",
+    if len(candidates) != 1 or (not approval and candidates[0][0].path != document.path):
+        message = ("Approval field update needs one matching Workflow definition on the same object."
+                   if approval else "Field update action needs one matching definition in its Workflow file.")
+        store.diagnostic(f"{feature}_FIELD_UPDATE_DEFINITION_UNRESOLVED", message,
                          location, state="ambiguous" if len(candidates) > 1 else "unresolved")
         return
-    _, definition = candidates[0]
+    definition_document, definition = candidates[0]
     target_objects = definition.all("targetObject")
     if target_objects:
         for node in target_objects:
-            store.diagnostic("WORKFLOW_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED",
+            store.diagnostic(f"{feature}_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED",
                              "Field update targetObject requires an independently resolved parent target.",
-                             document.location(node), state="unresolved")
+                             definition_document.location(node), state="unresolved")
         return
     field = _single_leaf(definition, "field")
     operation = _single_leaf(definition, "operation")
     if operation is None or operation.text not in _FIELD_UPDATE_OPERATIONS:
-        store.diagnostic("WORKFLOW_FIELD_UPDATE_OPERATION_UNSUPPORTED",
+        store.diagnostic(f"{feature}_FIELD_UPDATE_OPERATION_UNSUPPORTED",
                          "Field update definition needs one recognized operation.",
-                         document.location(definition))
+                         definition_document.location(definition))
         return
     target_name = _relative_field(owner, field.text) if field is not None else ""
     if (not API_NAME.fullmatch(target_name) or definition.all("sourceObject") or definition.all("sourceField")):
-        store.diagnostic("WORKFLOW_FIELD_UPDATE_TARGET_UNSUPPORTED",
-                         "Field update must declare one direct field on the rule's object.",
-                         document.location(field if field is not None else definition))
+        owner_description = "approval process" if approval else "rule"
+        store.diagnostic(f"{feature}_FIELD_UPDATE_TARGET_UNSUPPORTED",
+                         f"Field update must declare one direct field on the {owner_description}'s object.",
+                         definition_document.location(field if field is not None else definition))
         return
-    field_location = document.location(field)
+    field_location = definition_document.location(field)
     target = store.field(owner, target_name, field_location)
     qualifiers = {"action_kind": "FieldUpdate", "action_timing": timing,
                   "operation": operation.text, "local_status": local_status}
     if target:
         store.relation(
-            source, target, "writes", location, "workflow.rule_field_update",
+            source, target, "writes", location, "approval.field_update" if approval else "workflow.rule_field_update",
             resolution={"basis": "workflow_field_update_definition", "action": name.text,
                         "field_definition": field_location},
             qualifiers=qualifiers,
@@ -266,11 +274,13 @@ def _extract_field_update(document, owner, store, definitions, source, local_sta
     if operation.text == "Formula":
         formulas = definition.all("formula")
         if len(formulas) != 1:
-            store.diagnostic("WORKFLOW_FIELD_UPDATE_FORMULA_UNRESOLVED", "A formula field update needs one formula.",
-                             document.location(definition), state="ambiguous" if formulas else "unresolved")
+            store.diagnostic(f"{feature}_FIELD_UPDATE_FORMULA_UNRESOLVED", "A formula field update needs one formula.",
+                             definition_document.location(definition), state="ambiguous" if formulas else "unresolved")
         else:
-            _formula_reads(document, formulas[0], store, source, owner, rule="workflow.field_update_formula",
-                           qualifiers={**qualifiers, "context": "workflow_field_update_formula"}, action_site=location)
+            _formula_reads(definition_document, formulas[0], store, source, owner,
+                           rule=f"{feature.lower()}.field_update_formula",
+                           qualifiers={**qualifiers, "context": f"{feature.lower()}_field_update_formula"},
+                           action_site=location)
 
 
 def extract_workflow(documents, store, *, excluded=()):

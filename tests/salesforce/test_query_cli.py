@@ -233,3 +233,22 @@ def test_projection_rejects_junction_or_symlink_before_resolving(bundle, tmp_pat
     with pytest.raises(DataError, match="links or junctions"):
         export_graphify(bundle, link / "generated")
     assert not (target / "generated").exists()
+
+
+def test_query_text_coverage_is_compact_and_full_output_is_opt_in(bundle, monkeypatch, capsys):
+    from graphify.salesforce import snapshot
+
+    coverage = bundle["manifest"]["coverage"]
+    coverage.update(status="partial", analyzed_files=12, diagnostic_counts={"many_details": 3})
+    monkeypatch.setattr(snapshot, "load", lambda path: bundle)
+    command = ["refs", "Account.Name", "--snapshot", "unused"]
+    assert cli.main([*command, "--format", "text"]) == 0
+    output = capsys.readouterr().out
+    assert "Coverage: partial, 12 files analyzed" in output
+    assert "many_details" not in output
+
+    assert cli.main([*command, "--format", "text", "--full-coverage"]) == 0
+    assert '"many_details": 3' in capsys.readouterr().out
+
+    assert cli.main(command) == 0
+    assert json.loads(capsys.readouterr().out)["coverage"] == coverage

@@ -1,4 +1,4 @@
-"""Dependency evidence from decomposed CustomField formula and roll-up metadata."""
+"""Dependency evidence from decomposed Salesforce CustomField metadata."""
 from __future__ import annotations
 
 from .formula_refs import formula_field_context, formula_references
@@ -6,7 +6,7 @@ from .relationship_paths import add_navigation_reads, resolve_source_field_path
 from .schema import API_NAME, component_id
 
 _ROLLUP_TAGS = frozenset({"summaryForeignKey", "summaryOperation", "summarizedField", "summaryFilterItems"})
-FIELD_DEPENDENCY_TAGS = _ROLLUP_TAGS | {"formula"}
+FIELD_DEPENDENCY_TAGS = _ROLLUP_TAGS | {"formula", "lookupFilter"}
 
 
 def _formula_reads(document, node, store, source, owner):
@@ -118,6 +118,98 @@ def _rollup_reads(document, store, source, owner, lookup_targets):
                             tag="valueField", relation="filters", context="rollup_filter")
 
 
+
+def _lookup_filter_operand(owner, targets, text):
+    prefix, separator, path = text.partition(".")
+    if not separator:
+        return None
+    if prefix.casefold() in {"$source", owner.casefold()}:
+        return owner, path, {"basis": "lookup_filter_source_object", "object": owner}
+    if prefix.casefold() in targets:
+        return prefix, path, {"basis": "lookup_filter_declared_target", "object": prefix}
+    if prefix.casefold() in {"$user", "$profile", "$userrole", "$organization"}:
+        return formula_field_context(text, owner, record_basis="lookup_filter_source_object")
+    return None
+
+
+def _lookup_filter_reads(document, store, source, owner, targets, filters):
+    root = document.root
+    if len(filters) != 1:
+        store.diagnostic("LOOKUP_FILTER_AMBIGUOUS", "Expected one lookupFilter definition.",
+                         document.location(root), state="ambiguous")
+        return
+    lookup_filter = filters[0]
+    field_types = root.all("type")
+    if field_types and (len(field_types) != 1 or field_types[0].children
+                        or field_types[0].text.casefold() not in {"lookup", "masterdetail", "hierarchy"}):
+        store.diagnostic("LOOKUP_FILTER_FIELD_TYPE_UNSUPPORTED",
+                         "A lookup filter needs a compatible relationship field declaration.",
+                         document.location(lookup_filter), state="unresolved")
+        return
+    active = _single_leaf(lookup_filter.all("active"))
+    status = {"true": "Active", "false": "Inactive", "1": "Active", "0": "Inactive"}.get(
+        active.text if active is not None else "", "Unknown"
+    )
+    if status == "Unknown":
+        store.diagnostic("LOOKUP_FILTER_STATUS_UNRESOLVED", "Expected one boolean lookup filter active flag.",
+                         document.location(lookup_filter), state="unresolved")
+    qualifiers = {"context": "lookup_filter", "local_status": status}
+    for item in lookup_filter.all("filterItems"):
+        for tag in ("field", "valueField"):
+            matches = item.all(tag)
+            if tag == "valueField" and not matches:
+                continue
+            node = _single_leaf(matches)
+            location = document.location(node if node is not None else item)
+            context = _lookup_filter_operand(owner, targets, node.text) if node is not None else None
+            resolved = resolve_source_field_path(store, context[0], context[1]) if context is not None else None
+            if resolved is None or node is None or context is None:
+                store.diagnostic("LOOKUP_FILTER_FIELD_UNRESOLVED",
+                                 "Expected a literal lookup filter field on a proven source or target.",
+                                 location, state="unresolved", construct=tag)
+                continue
+            target = store.field(resolved["owner"], resolved["field"], location)
+            if target is None:
+                continue
+            resolution = {**context[2], "reference": node.text, "relationship_path": context[1],
+                          "steps": resolved["steps"], "operand": tag}
+            store.relation(source, target, "filters", location, "custom_field.lookup_filter_operand",
+                           resolution=resolution, qualifiers=qualifiers)
+            add_navigation_reads(store, source, location, resolution, rule="custom_field.lookup_filter_navigation",
+                                 qualifiers={**qualifiers, "context": "lookup_filter_navigation"})
+
+
+def _picklist_controller(document, store, source, owner):
+    root = document.root
+    sets = root.all("valueSet")
+    controllers = [node for value_set in sets for node in value_set.all("controllingField")]
+    if not controllers:
+        return
+    node = _single_leaf(controllers)
+    location = document.location(node if node is not None else root)
+    name = node.text if node is not None else ""
+    prefix, separator, field = name.partition(".")
+    if separator and prefix.casefold() == owner.casefold():
+        name = field
+    if (node is None or len(sets) != 1 or root.value("type").casefold() not in {"picklist", "multiselectpicklist"}
+            or not API_NAME.fullmatch(name)):
+        store.diagnostic("PICKLIST_CONTROLLER_UNRESOLVED",
+                         "A dependent picklist needs one literal controlling field on the same object.",
+                         location, state="unresolved")
+        return
+    target_id = component_id("field", f"{owner}.{name}")
+    declared_type = store.components.get(target_id, {}).get("data_type") or ""
+    if target_id == source or (declared_type and declared_type.casefold() not in {"checkbox", "picklist"}):
+        store.diagnostic("PICKLIST_CONTROLLER_CONFLICT", "The controlling field conflicts with its local declaration.",
+                         location, state="unresolved")
+        return
+    target = store.field(owner, name, location)
+    if target is not None:
+        store.relation(source, target, "filters", location, "custom_field.dependent_picklist_controller",
+                       resolution={"basis": "explicit_picklist_controller", "object": owner, "reference": node.text},
+                       qualifiers={"context": "dependent_picklist"})
+
+
 def extract_field_dependencies(document, store, source, owner, lookup_targets):
     root = document.root
     formulas = root.all("formula")
@@ -132,3 +224,8 @@ def extract_field_dependencies(document, store, source, owner, lookup_targets):
     elif any(child.tag in _ROLLUP_TAGS for child in root.children):
         store.diagnostic("CUSTOM_FIELD_ROLLUP_TYPE_UNRESOLVED", "Roll-up metadata needs a Summary field type.",
                          document.location(root), state="unresolved")
+
+    lookup_filters = root.all("lookupFilter")
+    if lookup_filters:
+        _lookup_filter_reads(document, store, source, owner, lookup_targets.get(source, set()), lookup_filters)
+    _picklist_controller(document, store, source, owner)

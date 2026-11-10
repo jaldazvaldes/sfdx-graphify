@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from tree_sitter import Node
 
-from .discovery import lwc_bundle
+from .relationship_paths import resolve_source_field_path
 from .schema import API_NAME, FactStore, component_id
 
 
@@ -127,18 +127,16 @@ def _target(unit, node, imported_name, apex_index, store):
                                   owner_class=class_id, is_test=None)
 
 
-def _analyze(unit, root, source, apex_index, store):
+def _scoped_nodes(unit, root, on_import=None):
     scopes = {}
     nodes = []
-    imports = []
     program = Scope(None, function=True)
 
     def bind(scope, pattern, kind="local", target=None, imported_name=None):
-        for identifier in _patterns(pattern):
-            binding = Binding(kind, identifier, target, imported_name)
-            scope.bindings[unit.text(identifier)].append(binding)
-            if kind in {"apex", "wire"}:
-                imports.append(binding)
+        bindings = [Binding(kind, identifier, target, imported_name) for identifier in _patterns(pattern)]
+        for binding in bindings:
+            scope.bindings[unit.text(binding.node)].append(binding)
+        return bindings
 
     def visit(node, scope):
         outer = scope
@@ -160,26 +158,8 @@ def _analyze(unit, root, source, apex_index, store):
                 bind(scope, node.child_by_field_name("parameter"))
         scopes[node.id] = scope
         nodes.append(node)
-        if node.type == "import_statement":
-            module = _literal(unit, node.child_by_field_name("source"))
-            clause = next((c for c in node.named_children if c.type == "import_clause"), None)
-            for child in clause.named_children if clause is not None else []:
-                if child.type == "identifier":
-                    if module and module.startswith("@salesforce/apex/"):
-                        name = module.removeprefix("@salesforce/apex/")
-                        bind(scope, child, "apex", _target(unit, node, name, apex_index, store), name)
-                    else:
-                        bind(scope, child)
-                elif child.type == "named_imports":
-                    for spec in child.named_children:
-                        name, alias = spec.child_by_field_name("name"), spec.child_by_field_name("alias")
-                        local = alias if alias is not None else name
-                        bind(scope, local, "wire" if module == "lwc" and unit.text(name) == "wire" else "local")
-                elif child.type == "namespace_import":
-                    for identifier in child.named_children:
-                        bind(scope, identifier)
-            if module and module.startswith("@salesforce/apex/") and (clause is None or not any(c.type == "identifier" for c in clause.named_children)):
-                store.diagnostic("LWC_APEX_IMPORT_SHAPE_UNSUPPORTED", "Only literal default Apex imports are analyzed.", unit.location(node))
+        if node.type == "import_statement" and on_import is not None:
+            on_import(node, scope, bind)
         elif node.type == "variable_declarator":
             destination = scope
             if node.parent is not None and node.parent.type == "variable_declaration":
@@ -205,6 +185,98 @@ def _analyze(unit, root, source, apex_index, store):
                     visit(child, scope)
 
     visit(root, program)
+    return scopes, nodes
+
+
+def _resolved(unit, scopes, node):
+    return (scopes[node.id].resolve(unit.text(node)) if node is not None
+            and node.type in {"identifier", "shorthand_property_identifier"} else None)
+
+
+def _assigned_bindings(unit, scopes, nodes):
+    for node in nodes:
+        if (node.type in {"assignment_expression", "augmented_assignment_expression", "update_expression"}
+                or (node.type == "for_in_statement" and node.child_by_field_name("kind") is None)):
+            left = node.child_by_field_name("left") or node.child_by_field_name("argument")
+            for identifier in _patterns(left):
+                binding = _resolved(unit, scopes, identifier)
+                if binding is not None:
+                    yield node, binding
+
+
+def _schema_import(unit, node, module, source, store):
+    name = module.removeprefix("@salesforce/schema/")
+    parts = name.split(".")
+    location = unit.location(node)
+    if not 1 <= len(parts) <= 5 or not all(API_NAME.fullmatch(part) for part in parts):
+        store.diagnostic("LWC_SCHEMA_TARGET_UNSUPPORTED", "The schema import must name a literal object or field path.",
+                         location, state="unresolved", target=name)
+        return
+    if len(parts) == 1:
+        target = store.resolve_component("object", name, location)
+        resolved = None
+    else:
+        resolved = resolve_source_field_path(store, parts[0], ".".join(parts[1:]))
+        if resolved is None:
+            store.diagnostic("LWC_SCHEMA_TARGET_UNRESOLVED", "The schema import's parent path could not be resolved.",
+                             location, state="unresolved", target=name)
+            return
+        target = store.field(resolved["owner"], resolved["field"], location)
+    if target is None:
+        return
+    resolution = {"basis": "literal_schema_import", "module": module}
+    if resolved is not None:
+        resolution["path"] = resolved
+    store.relation(source, target, "references", location, "lwc.schema_import", resolution,
+                   {"context": "lwc_schema_import"})
+    for number, hop in enumerate(resolved["steps"] if resolved is not None else [], 1):
+        api_name = store.components.get(hop["field"], {}).get("api_name") or hop["field"].split(":", 2)[2]
+        owner, field_name = api_name.split(".", 1)
+        navigation = {**location, "locator": f"{location['locator']}/navigation[{number}]"}
+        lookup = store.field(owner, field_name, navigation)
+        if lookup is not None:
+            store.relation(source, lookup, "references", navigation, "lwc.schema_import_navigation",
+                           {**resolution, "navigation_step": hop}, {"context": "lwc_schema_import"})
+
+
+def _analyze(unit, root, source, apex_index, store):
+    imports = []
+
+    def bind_import(node, scope, bind):
+        module = _literal(unit, node.child_by_field_name("source"))
+        clause = next((c for c in node.named_children if c.type == "import_clause"), None)
+        has_default = False
+        for child in clause.named_children if clause is not None else []:
+            if child.type == "identifier":
+                has_default = True
+                if module and module.startswith("@salesforce/apex/"):
+                    name = module.removeprefix("@salesforce/apex/")
+                    imports.extend(bind(scope, child, "apex", _target(unit, node, name, apex_index, store), name))
+                else:
+                    bind(scope, child)
+                    if module and module.startswith("@salesforce/schema/"):
+                        _schema_import(unit, node, module, source, store)
+            elif child.type == "named_imports":
+                for spec in child.named_children:
+                    name, alias = spec.child_by_field_name("name"), spec.child_by_field_name("alias")
+                    local = alias if alias is not None else name
+                    if module == "lwc" and unit.text(name) == "wire":
+                        imports.extend(bind(scope, local, "wire"))
+                    else:
+                        bind(scope, local)
+            elif child.type == "namespace_import":
+                for identifier in child.named_children:
+                    bind(scope, identifier)
+        if module and not has_default:
+            for prefix, diagnostic, message in (
+                    ("@salesforce/apex/", "LWC_APEX_IMPORT_SHAPE_UNSUPPORTED",
+                     "Only literal default Apex imports are analyzed."),
+                    ("@salesforce/schema/", "LWC_SCHEMA_IMPORT_SHAPE_UNSUPPORTED",
+                     "Only literal default schema imports are analyzed.")):
+                if module.startswith(prefix):
+                    store.diagnostic(diagnostic, message, unit.location(node))
+
+    scopes, nodes = _scoped_nodes(unit, root, bind_import)
     for binding in imports:
         if binding.kind == "apex" and binding.target:
             store.relation(source, binding.target, "references", unit.location(binding.node), "lwc.apex_import",
@@ -212,19 +284,14 @@ def _analyze(unit, root, source, apex_index, store):
                            {"context": "lwc_apex_import"})
 
     def resolved(node):
-        return (scopes[node.id].resolve(unit.text(node)) if node is not None
-                and node.type in {"identifier", "shorthand_property_identifier"} else None)
+        return _resolved(unit, scopes, node)
 
-    for node in nodes:
-        if (node.type in {"assignment_expression", "augmented_assignment_expression", "update_expression"}
-                or (node.type == "for_in_statement" and node.child_by_field_name("kind") is None)):
-            left = node.child_by_field_name("left") or node.child_by_field_name("argument")
-            for identifier in _patterns(left):
-                binding = resolved(identifier)
-                if binding is not None and binding.kind in {"apex", "wire"}:
-                    binding.mutated = True
-                    store.diagnostic("LWC_IMPORT_BINDING_MUTATED", "An imported binding is assigned; calls through it are not resolved.",
-                                     unit.location(node), state="unresolved")
+    for node, binding in _assigned_bindings(unit, scopes, nodes):
+        if binding.kind in {"apex", "wire"}:
+            binding.mutated = True
+            store.diagnostic("LWC_IMPORT_BINDING_MUTATED", "An imported binding is assigned; calls through it are not resolved.",
+                             unit.location(node), state="unresolved")
+
     recognized = {b.node.id for b in imports}
     for node in nodes:
         if node.type != "call_expression":
@@ -261,6 +328,8 @@ def extract_lwc(sources: dict[str, bytes], apex_index, store: FactStore) -> None
     if not sources:
         return
     from tree_sitter_language_pack import get_parser
+    from .discovery import lwc_bundle
+
     parser = get_parser("javascript")
     groups = defaultdict(dict)
     for path, data in sorted(sources.items()):

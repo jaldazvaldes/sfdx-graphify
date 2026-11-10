@@ -98,3 +98,55 @@ def test_unresolved_formula_paths_and_conflicting_rollup_xml_stay_diagnostic(tmp
         "CUSTOM_FIELD_ROLLUP_KEY_CONFLICT", "CUSTOM_FIELD_ROLLUP_FIELD_UNRESOLVED",
         "unsupported_field_expression",
     }
+
+
+def test_lookup_filter_uses_proven_source_target_and_global_fields(tmp_path):
+    root = _project(tmp_path)
+    lookup = _field(root, "Case", "AccountLink__c", "Lookup",
+                    "<referenceTo>Account</referenceTo><lookupFilter><active>false</active>"
+                    "<filterItems><field>Account.Parent.Name</field><operation>equals</operation>"
+                    "<valueField>$Source.PreferredName__c</valueField></filterItems>"
+                    "<filterItems><field>$User.ProfileId</field><operation>equals</operation>"
+                    "<value>IgnoredLiteral__c</value></filterItems>"
+                    "<filterItems><field>Unknown__c.Name</field><operation>equals</operation>"
+                    "<value>IgnoredLiteral__c</value></filterItems></lookupFilter>")
+    bundle = build_project(root, out=tmp_path / "snapshot")
+    results = query.deps(bundle, "Case.AccountLink__c")["results"]
+    assert {(edge["relation"], edge["target"]) for edge in results} == {
+        ("references", "sf:object:account"), ("filters", "sf:field:account.name"),
+        ("reads", "sf:field:account.parentid"), ("filters", "sf:field:case.preferredname__c"),
+        ("filters", "sf:field:user.profileid"),
+    }
+    assert all(edge["qualifiers"]["local_status"] == "Inactive"
+               for edge in results if edge["relation"] != "references")
+    source, = query.refs(bundle, "Case.PreferredName__c", relation="filters")["results"]
+    evidence, = source["evidence"]
+    assert evidence["path"] == lookup
+    assert evidence["locator"] == "/CustomField/lookupFilter/filterItems[1]/valueField"
+    assert evidence["resolution"]["basis"] == "lookup_filter_source_object"
+    assert {d["code"] for d in bundle["diagnostics"]} == {"LOOKUP_FILTER_FIELD_UNRESOLVED"}
+
+
+def test_dependent_picklist_requires_a_compatible_same_object_controller(tmp_path):
+    root = _project(tmp_path)
+    _field(root, "Account", "Enabled__c", "Checkbox")
+    dependent = _field(root, "Account", "Choice__c", "MultiselectPicklist",
+                       "<valueSet><controllingField>Enabled__c</controllingField>"
+                       "<valueSettings><controllingFieldValue>true</controllingFieldValue>"
+                       "<valueName>Option__c</valueName></valueSettings></valueSet>")
+    _field(root, "Account", "MissingController__c", "Picklist",
+           "<valueSet><controllingField>Other__c.Enabled__c</controllingField></valueSet>")
+    _field(root, "Account", "TextController__c", "Text")
+    _field(root, "Account", "WrongType__c", "Picklist",
+           "<valueSet><controllingField>TextController__c</controllingField></valueSet>")
+    bundle = build_project(root, out=tmp_path / "snapshot")
+
+    edge, = query.deps(bundle, "Account.Choice__c")["results"]
+    assert (edge["relation"], edge["target"]) == ("filters", "sf:field:account.enabled__c")
+    evidence, = edge["evidence"]
+    assert (evidence["path"], evidence["locator"]) == (dependent, "/CustomField/valueSet/controllingField")
+    assert query.deps(bundle, "Account.MissingController__c")["results"] == []
+    assert query.deps(bundle, "Account.WrongType__c")["results"] == []
+    assert {d["code"] for d in bundle["diagnostics"]} == {
+        "PICKLIST_CONTROLLER_UNRESOLVED", "PICKLIST_CONTROLLER_CONFLICT", "unsupported_value_set",
+    }
