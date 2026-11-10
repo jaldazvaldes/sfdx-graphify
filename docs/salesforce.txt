@@ -6,7 +6,7 @@ endorsed by Graphify Labs or Salesforce. Preserve LICENSE, LICENSE-MIT and NOTIC
 
 The standalone wheel installs with uv in its own Python 3.10+ environment:
 
-  uv tool install <path-to-sfdx_graphify-wheel>
+  uv tool install https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.7/sfdx_graphify-0.5.7-py3-none-any.whl
   sfdx-graphify install --platform claude
 
 Use --platform codex for Codex or --project to register the skill in the
