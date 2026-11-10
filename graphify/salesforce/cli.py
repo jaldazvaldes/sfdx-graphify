@@ -13,15 +13,16 @@ from . import query
 GUIDANCE = """Use sfdx-graphify to locate Salesforce dependency evidence.
 From the folder containing sfdx-project.json, run sfdx-graphify build . to save a private snapshot for that checkout.
 Local queries and the viewer use that snapshot automatically from the same project root. Pass --snapshot for a custom build location.
-New builds exclude explicitly inactive local Flows (Obsolete, Draft, InvalidDraft), Apex triggers (Inactive, Deleted), and validation and Workflow rules (active=false).
+New builds exclude explicitly inactive local Flows (Obsolete, Draft, InvalidDraft), Apex triggers (Inactive, Deleted), validation and Workflow rules, and approval processes (active=false).
 Use build --include-inactive for historical analysis. Unknown/ambiguous status is retained.
 Check activity_policy in query results: older snapshots can include every local status.
 Inspect coverage and diagnostics before relying on results.
+Text queries show a compact coverage summary. Use --full-coverage for detail or --format json for structured output.
 refs, deps and impact include diagnostic_context: complete counts by code/file and at most 20 focused records by default.
 Use --diagnostics full for every diagnostic in consulted files; JSONL/HTTP requests use diagnostics: "full".
 omitted_count reports records omitted from the response; no diagnostics are removed from the snapshot.
 Zero results or zero local diagnostics do not establish complete coverage of unknown consumers.
-Find exact references with: sfdx-graphify refs Account.Name --format json
+Find exact references with: sfdx-graphify refs Account.Name --format text
 Inspect what a Flow uses with: sfdx-graphify deps Sample_Flow --format json
 Inspect validation rule inputs with: sfdx-graphify deps sf:validationrule:account.require_phone --format json
 Follow a specific relationship with: sfdx-graphify explain <relationship-id>
@@ -363,8 +364,9 @@ def main(argv: list[str] | None = None) -> int:
                   "truncated": False,
                   "error": f"Required local dependency is unavailable: {exc}"}
         code = 1
+    full_coverage = args.command in {"build", "export"} or getattr(args, "full_coverage", False)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True) if output_format == "json"
-          else _text(result, full_coverage=args.command == "build" or getattr(args, "full_coverage", False)))
+          else _text(result, full_coverage=full_coverage))
     if code:
         print(result["error"], file=sys.stderr)
     return code

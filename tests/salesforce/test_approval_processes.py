@@ -79,12 +79,15 @@ def test_approval_inactive_policy_and_missing_or_cross_object_update_stay_bounde
         "<active>true</active><finalApprovalActions>"
         "<action><name>OtherObject</name><type>FieldUpdate</type></action>"
         "<action><name>CrossObject</name><type>FieldUpdate</type></action>"
+        "<action><name></name><type>FieldUpdate</type></action>"
         "<action><name>Notify</name><type>Alert</type></action></finalApprovalActions>",
     )
     _metadata(
         root, "workflows/Case.workflow-meta.xml", "Workflow",
         "<fieldUpdates><fullName>CrossObject</fullName><field>Target__c</field><operation>Literal</operation>"
-        "<targetObject>Account</targetObject></fieldUpdates>",
+        "<targetObject>Account</targetObject></fieldUpdates>"
+        "<fieldUpdates><fullName></fullName><field>BlankTarget__c</field><operation>Literal</operation>"
+        "</fieldUpdates>",
     )
     _metadata(
         root, "workflows/Account.workflow-meta.xml", "Workflow",
@@ -96,7 +99,7 @@ def test_approval_inactive_policy_and_missing_or_cross_object_update_stay_bounde
     assert query.deps(current, "sf:approvalprocess:case.review")["results"] == []
     assert {d["code"] for d in current["diagnostics"]} == {
         "APPROVAL_FIELD_UPDATE_DEFINITION_UNRESOLVED", "APPROVAL_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED",
-        "APPROVAL_ACTION_UNSUPPORTED",
+        "APPROVAL_ACTION_UNSUPPORTED", "APPROVAL_FIELD_UPDATE_ACTION_UNRESOLVED",
     }
     historical = build_project(root, out=tmp_path / "historical", include_inactive=True)
     read, = query.refs(historical, "Case.Historical__c", relation="reads")["results"]

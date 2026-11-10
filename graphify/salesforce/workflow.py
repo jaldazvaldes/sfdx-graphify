@@ -105,7 +105,7 @@ def _field_updates(workflows):
     for document, owner in workflows:
         for node in document.root.all("fieldUpdates"):
             name = _single_leaf(node, "fullName")
-            if name is not None and name.text.isprintable():
+            if name is not None and name.text and name.text.isprintable():
                 definitions[owner.casefold(), name.text.casefold()].append((document, node))
     return definitions
 
@@ -227,7 +227,7 @@ def extract_field_update(document, owner, store, definitions, source, local_stat
     approval = store.components[source]["kind"] == "approvalprocess"
     feature = "APPROVAL" if approval else "WORKFLOW"
     name = _single_leaf(action, "name")
-    if _single_leaf(action, "type") is None or name is None or not name.text.isprintable():
+    if _single_leaf(action, "type") is None or name is None or not name.text or not name.text.isprintable():
         store.diagnostic(f"{feature}_FIELD_UPDATE_ACTION_UNRESOLVED", "Field update action needs one literal name and type.",
                          location, state="unresolved")
         return

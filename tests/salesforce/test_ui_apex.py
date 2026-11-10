@@ -78,7 +78,7 @@ def test_aura_shadows_mutated_variables_overloads_and_namespaces_do_not_guess():
     overloaded = AURA_CLASS.replace(b"    public static void privateApi() {}",
                                     b"    @AuraEnabled public static void direct(Id recordId) {}")
     store = extract({AURA + ".cmp": b'<aura:component controller="AuraExample" />',
-                     AURA + "Helper.js": script}, {"AuraExample": overloaded})
+                     AURA + "Controller.js": script}, {"AuraExample": overloaded})
     # The nested function can use the outer component binding, but its direct
     # enqueue is bound to that same function, so it is valid static evidence.
     assert set(calls(store)) == {"sf:apexmethod:auraexample.load"}
@@ -127,10 +127,50 @@ def test_visualforce_controller_conflicts_and_missing_extensions_are_diagnostic(
                    for row in store.diagnostics)
 
 def test_aura_client_side_action_name_collision_is_diagnostic():
-    controller = b'({ "load": function(component) { return component.get("v.label"); } })'
+    controller = b'({ "load": function(component, event, helper) { helper.run(component); } })'
     helper = b'({ run: function(component) { $A.enqueueAction(component.get("c.load")); } })'
     store = extract({AURA + ".cmp": b'<aura:component controller="AuraExample" />',
                      AURA + "Controller.js": controller, AURA + "Helper.js": helper},
                     {"AuraExample": AURA_CLASS})
     assert not calls(store)
     assert any(row["code"] == "AURA_APEX_ACTION_AMBIGUOUS" for row in store.diagnostics)
+
+
+def test_aura_helper_needs_a_direct_controller_call_with_current_component():
+    controller = b"""({
+    run: function(component, event, helper) {
+        helper.forChild(component.find('child'));
+        { const helper = other; helper.forChild(component); }
+        { const component = other; helper.forChild(component); }
+        helper.forCurrent(component);
+    }
+})"""
+    helper = b"""({
+    forChild: function(cmp) { $A.enqueueAction(cmp.get("c.load")); },
+    forCurrent: function(cmp) { $A.enqueueAction(cmp.get("c.direct")); }
+})"""
+    store = extract({AURA + ".cmp": b'<aura:component controller="AuraExample" />',
+                     AURA + "Controller.js": controller, AURA + "Helper.js": helper},
+                    {"AuraExample": AURA_CLASS})
+    found = calls(store)
+    assert set(found) == {"sf:apexmethod:auraexample.direct"}
+    evidence = store.evidence[found["sf:apexmethod:auraexample.direct"]["evidence_ids"][0]]
+    assert evidence["path"] == AURA + "Helper.js"
+    assert evidence["resolution"]["controller_helper_call"]["path"] == AURA + "Controller.js"
+    assert evidence["resolution"]["controller_helper_call"]["line"] == 6
+    assert evidence["resolution"]["controller_helper_call"]["content_hash"] == hashlib.sha256(controller).hexdigest()
+    assert any(row["code"] == "AURA_APEX_HELPER_RECEIVER_UNRESOLVED" and row["method"] == "load"
+               for row in store.diagnostics)
+
+
+def test_visualforce_remoting_requires_an_executable_inline_script():
+    template = """<apex:page controller="PageExample">
+    <script {}>Visualforce.remoting.Manager.invokeAction('{{!$RemoteAction.PageExample.load}}', 'x', callback);</script>
+</apex:page>"""
+    for attributes in ('type="text/plain"', 'type="application/json"', 'type="text/javascript; charset=utf-8"',
+                       'language="vbscript"', 'src="/resource/real-script" type="text/javascript"'):
+        store = extract({PAGE: template.format(attributes).encode()}, {"PageExample": VF_CLASS})
+        assert not calls(store), attributes
+    for attributes in ('type=" TEXT/JAVASCRIPT "', 'type=""', 'type="module"', 'language="JavaScript"'):
+        store = extract({PAGE: template.format(attributes).encode()}, {"PageExample": VF_CLASS})
+        assert set(calls(store)) == {"sf:apexmethod:pageexample.load"}, attributes

@@ -9,8 +9,10 @@ from html.parser import HTMLParser
 from pathlib import PurePosixPath
 import re
 
+from tree_sitter import Node
+
 from .apex import _modifiers
-from .lwc import Unit, _FUNCTIONS, _assigned_bindings, _literal, _resolved, _scoped_nodes
+from .lwc import Scope, Unit, _FUNCTIONS, _assigned_bindings, _literal, _resolved, _scoped_nodes
 from .schema import API_NAME, FactStore, component_id
 
 
@@ -28,6 +30,12 @@ _VF_ACTION_TAGS = frozenset({
 })
 _VF_ACTION = re.compile(r"\{\s*!\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}")
 _VF_REMOTE = re.compile(r"\{\s*!\s*\$RemoteAction\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}")
+_JS_MIME = frozenset({
+    "application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript",
+    "text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+    "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript",
+    "text/x-ecmascript", "text/x-javascript",
+})
 
 
 def _aura_bundle(path: PurePosixPath) -> str | None:
@@ -60,6 +68,19 @@ class Tag:
         return [(value or "").strip() for key, value in self.attributes if key == name]
 
 
+def _inline_javascript(attrs):
+    attributes = {}
+    for name, value in attrs:
+        attributes.setdefault(name, value or "")
+    if "src" in attributes:
+        return False
+    if "type" in attributes:
+        kind = attributes["type"].lower()
+        return kind in {"", "module"} or kind.strip(" \t\n\r\f") in _JS_MIME
+    language = attributes.get("language", "")
+    return not language or "text/" + language.lower() in _JS_MIME
+
+
 class Markup(HTMLParser):
     """Read literal attributes in Visualforce and Aura markup with unbound prefixes."""
 
@@ -82,7 +103,7 @@ class Markup(HTMLParser):
         if tag in _VF_ACTION_TAGS and element.values("action"):
             self.actions.append(element)
         if tag == "script":
-            self.in_script = True
+            self.in_script = _inline_javascript(attrs)
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
@@ -212,20 +233,19 @@ def _unbound(scope, name):
     return True
 
 
-def _action_parameters(unit, root):
+def _aura_method_parameters(unit, root):
     body = [child for child in root.named_children if child.type != "comment"]
     if len(body) != 1 or body[0].type != "expression_statement":
-        return set(), set()
+        return {}
     expression = body[0]
     while expression.type in {"expression_statement", "parenthesized_expression"}:
         children = [child for child in expression.named_children if child.type != "comment"]
         if len(children) != 1:
-            return set(), set()
+            return {}
         expression = children[0]
     if expression.type != "object":
-        return set(), set()
-    parameters = set()
-    names = set()
+        return {}
+    methods = {}
     for entry in expression.named_children:
         if entry.type == "method_definition":
             function = entry
@@ -233,23 +253,36 @@ def _action_parameters(unit, root):
         else:
             function = entry.child_by_field_name("value")
             key = entry.child_by_field_name("key")
-        if function is None or function.type not in _FUNCTIONS:
+        if key is None or key.type not in {"identifier", "property_identifier", "string"}:
             continue
-        if key is not None and key.type in {"identifier", "property_identifier", "string"}:
-            name = _literal(unit, key) if key.type == "string" else unit.text(key)
-            if name:
-                names.add(name.casefold())
+        name = _literal(unit, key) if key.type == "string" else unit.text(key)
+        if not name:
+            continue
+        if name in methods or function is None or function.type not in _FUNCTIONS:
+            methods[name] = ()
+            continue
         params = function.child_by_field_name("parameters")
-        first = next((p for p in params.named_children if p.type != "comment"), None) if params is not None else None
-        if first is not None and first.type == "identifier":
-            parameters.add(first.id)
-    return parameters, names
+        identifiers = [p for p in params.named_children if p.type != "comment"] if params is not None else []
+        methods[name] = tuple(p.id if p.type == "identifier" else None for p in identifiers)
+    return methods
 
 
 def _enclosing_function(node):
     while node is not None and node.type not in _FUNCTIONS:
         node = node.parent
     return node.id if node is not None else None
+
+
+@dataclass
+class AuraScript:
+    unit: Unit
+    methods: dict[str, tuple[int | None, ...]]
+    scopes: dict[int, Scope]
+    calls: list[Node]
+
+    def parameter(self, node):
+        binding = _resolved(self.unit, self.scopes, node)
+        return binding.node.id if binding is not None and not binding.mutated else None
 
 
 def _aura_script(parser, path, data, store):
@@ -268,32 +301,56 @@ def _aura_script(parser, path, data, store):
         store.diagnostic("AURA_APEX_SCRIPT_UNSUPPORTED", "Aura JavaScript exceeds bounded AST coverage.", fallback)
         return
     unit = Unit(path, data, digest, [0] + [i + 1 for i, byte in enumerate(data) if byte == 10])
-    parameters, names = _action_parameters(unit, root)
-    if not parameters and b"enqueueAction" in data:
+    methods = _aura_method_parameters(unit, root)
+    if not any(params and params[0] for params in methods.values()) and b"enqueueAction" in data:
         store.diagnostic("AURA_APEX_SCRIPT_UNSUPPORTED", "Expected top-level Aura action functions with a component argument.", fallback)
-    return unit, root, parameters, names
-
-
-def _aura_actions(unit, root, parameters, client_actions, source, owners, controller, apex_index, local_classes, store):
-    if not parameters:
-        return
     scopes, nodes = _scoped_nodes(unit, root)
     for _, binding in _assigned_bindings(unit, scopes, nodes):
         binding.mutated = True
-    calls = [node for node in nodes if node.type == "call_expression"]
+    return AuraScript(unit, methods, scopes, [node for node in nodes if node.type == "call_expression"])
+
+
+def _aura_helper_receivers(controller, helper):
+    pairs = {(params[0], params[2]) for params in controller.methods.values()
+             if len(params) >= 3 and params[0] is not None and params[2] is not None}
+    verified = {}
+    for call in controller.calls:
+        function = call.child_by_field_name("function")
+        if function is None or function.type != "member_expression":
+            continue
+        name = controller.unit.text(function.child_by_field_name("property"))
+        params = helper.methods.get(name)
+        if not params or params[0] is None:
+            continue
+        args = _arguments(call)
+        receiver = function.child_by_field_name("object")
+        if args and (controller.parameter(args[0]), controller.parameter(receiver)) in pairs:
+            verified.setdefault(params[0], controller.unit.location(call))
+    return verified
+
+
+def _aura_actions(script, client_actions, source, owners, controller, apex_index, local_classes, store, *, helper_calls=None):
+    unit, scopes = script.unit, script.scopes
+    parameters = {params[0] for params in script.methods.values() if params and params[0] is not None}
     lookups = {}
-    for node in calls:
+    for node in script.calls:
         receiver = _member(unit, node, "get")
-        binding = _resolved(unit, scopes, receiver)
-        if binding is None or binding.node.id not in parameters or binding.mutated:
+        parameter = script.parameter(receiver)
+        if parameter not in parameters:
             continue
         args = _arguments(node)
         literal = _literal(unit, args[0]) if len(args) == 1 else None
         if literal and literal.startswith("c.") and API_NAME.fullmatch(literal[2:]):
-            lookups[node.id] = (node, literal[2:])
+            name = literal[2:]
+            if helper_calls is not None and parameter not in helper_calls:
+                store.diagnostic("AURA_APEX_HELPER_RECEIVER_UNRESOLVED",
+                                 "Could not trace the current Aura component to this helper argument.",
+                                 unit.location(node), state="unresolved", method=name)
+                continue
+            lookups[node.id] = (node, name, helper_calls.get(parameter) if helper_calls is not None else None)
 
     enqueued = set()
-    for queue in calls:
+    for queue in script.calls:
         receiver = _member(unit, queue, "enqueueAction")
         if (receiver is None or receiver.type != "identifier" or unit.text(receiver) != "$A"
                 or not _unbound(scopes[receiver.id], "$A")):
@@ -312,7 +369,7 @@ def _aura_actions(unit, root, parameters, client_actions, source, owners, contro
         if value is None or value.id not in lookups or _enclosing_function(value) != _enclosing_function(queue):
             continue
         enqueued.add(value.id)
-        lookup, name = lookups[value.id]
+        lookup, name, helper_call = lookups[value.id]
         location = unit.location(lookup)
         if name.casefold() in client_actions:
             store.diagnostic("AURA_APEX_ACTION_AMBIGUOUS", "A client-side action shares the literal Apex action name.",
@@ -321,11 +378,14 @@ def _aura_actions(unit, root, parameters, client_actions, source, owners, contro
         target = _target(name, owners, apex_index, local_classes, store, location,
                          channel="AURA", annotation="auraenabled")
         if target:
+            resolution = {"basis": "literal_enqueued_aura_action", "controller_declaration": controller,
+                          "enqueue": unit.location(queue)}
+            if helper_call is not None:
+                resolution["controller_helper_call"] = helper_call
             store.relation(source, target, "calls", location, "aura.apex_action",
-                           {"basis": "literal_enqueued_aura_action", "controller_declaration": controller,
-                            "enqueue": unit.location(queue)}, {"context": "aura_apex_action"})
+                           resolution, {"context": "aura_apex_action"})
     for lookup_id in lookups.keys() - enqueued:
-        lookup, name = lookups[lookup_id]
+        lookup, name, _ = lookups[lookup_id]
         store.diagnostic("AURA_APEX_ACTION_USE_UNRESOLVED", "Could not trace this literal action to an enqueue in the same function.",
                          unit.location(lookup), state="unresolved", method=name)
 
@@ -423,19 +483,23 @@ def extract_ui_apex(sources: dict[str, bytes], apex_index, store: FactStore) -> 
             continue
         owners = _controller_names(markup, definition, store) if markup is not None else []
         if owners is not None:
-            scripts = []
-            client_actions = set()
+            controllers, helpers = [], []
+            bundle_name = PurePosixPath(definition["path"]).parent.name.casefold()
             for path, data in files.items():
-                if PurePosixPath(path).suffix.casefold() == ".js":
+                filename = PurePosixPath(path).name.casefold()
+                if filename in {f"{bundle_name}controller.js", f"{bundle_name}helper.js"}:
                     parsed = _aura_script(parser, path, data, store)
                     if parsed is not None:
-                        unit, root, parameters, names = parsed
-                        scripts.append((unit, root, parameters))
-                        if path.casefold().endswith("controller.js"):
-                            client_actions.update(names)
-            for unit, root, parameters in scripts:
-                _aura_actions(unit, root, parameters, client_actions, source, owners, definition,
+                        scripts = controllers if filename == f"{bundle_name}controller.js" else helpers
+                        scripts.append(parsed)
+            client_actions = {name.casefold() for script in controllers for name in script.methods}
+            for script in controllers:
+                _aura_actions(script, client_actions, source, owners, definition,
                               apex_index, local_classes, store)
+            for script in helpers:
+                verified = _aura_helper_receivers(controllers[0], script) if len(controllers) == len(helpers) == 1 else {}
+                _aura_actions(script, client_actions, source, owners, definition,
+                              apex_index, local_classes, store, helper_calls=verified)
 
     for source, markup, definition in visualforce:
         if store.is_ambiguous(source):
