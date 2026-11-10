@@ -45,8 +45,14 @@ def _extract(domain=_DOMAIN, statement=_DISPATCH, *, extra=()):
     return _bundle(store)
 
 
-def test_external_fflib_dispatch_matches_event_hooks_and_preserves_three_hop_evidence():
-    bundle = _extract()
+@pytest.mark.parametrize("constructor_type,argument", [
+    ("Account", "items"),
+    ("Account", "(List<Account>) items"),
+    ("SObject", "(List<SObject>) items"),
+])
+def test_external_fflib_dispatch_matches_event_hooks_and_preserves_three_hop_evidence(constructor_type, argument):
+    domain = _DOMAIN.replace("List<Account> rows", f"List<{constructor_type}> rows")
+    bundle = _extract(domain.replace("new ExampleDomain(items)", f"new ExampleDomain({argument})"))
     trigger = "sf:apextrigger:sample"
     dependencies = query.deps(bundle, trigger, relation="calls")
     rows = dependencies["results"]
@@ -99,6 +105,41 @@ def test_fflib_does_not_guess_incomplete_bindings_or_default_event_handlers(old,
     assert {row["qualifiers"]["trigger_event"] for row in rows} == expected
 
 
+@pytest.mark.parametrize("argument", [
+    "(List<Contact>) items",
+    "(Set<Account>) items",
+    "(List<Account>) otherItems",
+    "(List<Account>) this.items",
+    "(List<Account>) new List<Account>()",
+    "(List<Account>) (List<SObject>) items",
+])
+def test_fflib_unrecognized_factory_cast_preserves_literal_and_reports_specific_diagnostic(argument):
+    bundle = _extract(_DOMAIN.replace("new ExampleDomain(items)", f"new ExampleDomain({argument})"))
+    trigger = "sf:apextrigger:sample"
+    dependencies = query.deps(bundle, trigger)
+    assert not any(row["relation"] == "calls" for row in dependencies["results"])
+    assert any(row["target"] == "sf:apexclass:exampledomain" and row["relation"] == "references"
+               for row in dependencies["results"])
+    diagnostic, = [item for item in dependencies["diagnostic_context"]["diagnostics"]
+                   if item["code"].startswith("TRIGGER_")]
+    assert diagnostic["code"] == "TRIGGER_FFLIB_FACTORY_UNRESOLVED"
+    assert diagnostic["state"] == "unresolved"
+    assert diagnostic["location"]["path"] == "triggers/Sample.trigger"
+    assert diagnostic["target_component"] == "sf:apexclass:exampledomain"
+
+
+@pytest.mark.parametrize("nested", [True, False])
+def test_fflib_factory_cast_does_not_infer_a_record_type_when_an_apex_type_shadows_it(nested):
+    domain = _DOMAIN.replace("List<Account> rows", "List<SObject> rows")
+    domain = domain.replace("new ExampleDomain(items)", "new ExampleDomain((List<Account>) items)")
+    if nested:
+        domain = domain.replace("public class Constructor", "public class Account {} public class Constructor")
+    extra = [] if nested else [("Account", "public class Account {}")]
+    bundle = _extract(domain, extra=extra)
+    assert query.deps(bundle, "sf:apextrigger:sample", relation="calls")["results"] == []
+    assert any(item["code"] == "TRIGGER_FFLIB_FACTORY_UNRESOLVED" for item in bundle["diagnostics"])
+
+
 def test_fflib_diagnoses_blocked_hooks_but_an_ordinary_domain_needs_no_override():
     original = _DOMAIN.replace("onAfterUpdate(Map<Id, SObject>", "onAfterUpdate(Map<Id, Account>")
     blocked = original.replace("public void onArbitraryHook()", "public override void handleAfterInsert()")
@@ -122,7 +163,9 @@ def test_fflib_contract_does_not_override_a_local_framework_implementation():
     "Object fflib_SObjectDomain = null; fflib_SObjectDomain.triggerHandler(ExampleDomain.class);",
 ])
 def test_fflib_requires_an_unshadowed_dispatcher_and_literal_argument(statement):
-    assert query.deps(_extract(statement=statement), "sf:apextrigger:sample", relation="calls")["results"] == []
+    bundle = _extract(statement=statement)
+    assert query.deps(bundle, "sf:apextrigger:sample", relation="calls")["results"] == []
+    assert not any(item["code"] == "TRIGGER_FFLIB_FACTORY_UNRESOLVED" for item in bundle["diagnostics"])
 
 
 def test_fflib_dispatch_requires_schema_seven_and_checked_nested_evidence():

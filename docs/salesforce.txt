@@ -8,9 +8,9 @@ Use an isolated Python 3.10+ environment. Install from the fork checkout.
 
   python -m pip install .
 
-This command installs the previous tagged release.
+This command installs the tagged release.
 
-  python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.2"
+  python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.4"
 
 The Salesforce CLI reports its own version via sfdx-graphify --version. The
 inherited graphifyy package keeps its upstream version. The sfdx-prefixed Git
@@ -200,11 +200,15 @@ the full path, lookup and target for each hop. The terminal dependency keeps its
 original relation and evidence.
 SOQL and Flow resolve explicit standard parent pairs in the tested API 64.0
 vocabulary. Case and Opportunity have Account and Contact paths. Order has
-Account, BillToContact and ShipToContact paths. User.Profile uses ProfileId.
-Account, Case, Contact, Lead, Opportunity and Order also have CreatedBy and
-RecordType paths. RecordType availability depends on org configuration.
-Contradictory local metadata blocks a standard fallback. A compound path such
-as CreatedBy.Profile.Name retains both lookup reads and the terminal field.
+Account, BillToContact and ShipToContact paths. OrderItem has Order and
+Product2 paths. CampaignMember has Campaign and Contact paths. User.Profile
+uses ProfileId. CreatedBy and RecordType use documented standard object pairs.
+Local ordinary custom object metadata supports CreatedBy. Selected decomposed
+recordTypes metadata can establish RecordType on additional objects and its
+source is included in the evidence. RecordType availability depends on org
+configuration. Contradictory local metadata blocks a standard fallback. A
+compound path such as CreatedBy.Profile.Name retains both lookup reads and the
+terminal field.
 Trigger declarations retain their object and event list with original source
 lines. Bounded trigger analysis covers literal static handlers, proven concrete
 construction/dispatch and typed Trigger context records. Construction references
@@ -216,10 +220,13 @@ and hashes. When a body still fails, a valid parsed header retains object/events
 The fflib_SObjectDomain.triggerHandler(Domain.class) pattern can yield candidate
 calls to the domain's overrides for the events declared on the trigger. The
 extractor verifies the literal dispatcher, the domain type and its IConstructable
-factory, and matches the override signature to the event. Evidence records the
-trigger invocation, the factory and the hook. This analysis follows the public
-fflib dispatch convention when the library source is absent. Dynamic dispatch,
-ambiguous types and event overrides outside this convention remain diagnostic.
+factory, and matches the override signature to the event. The factory can pass
+its record list directly or cast it to List<SObject> or to a list of the trigger's
+record type. An unrecognized factory on a resolved domain produces a dedicated
+diagnostic. Evidence records the trigger invocation, the factory and the hook.
+This analysis follows the public fflib dispatch convention when the library
+source is absent. Dynamic dispatch, ambiguous types and event overrides outside
+this convention remain diagnostic.
 Call edges are static candidates, not execution traces. Unknown receiver types,
 same-arity overloads, external hierarchies, query aliases, dynamic queries,
 polymorphic/unresolved paths and remaining parse failures are diagnosed rather

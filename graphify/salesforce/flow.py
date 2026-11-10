@@ -12,7 +12,7 @@ from dataclasses import replace
 from .schema import TESTED_API_VERSIONS, canonical_json
 from .symbols import API_NAME, RESOURCE_NAME, index_symbols
 from .formula_refs import formula_references
-from .relationship_paths import SOURCE_STANDARD_PARENTS, add_navigation_reads, resolve_field_path
+from .relationship_paths import add_navigation_reads, resolve_source_field_path
 
 _BASE = {"name", "label", "description", "locationX", "locationY", "connector", "faultConnector", "processMetadataValues"}
 _OP = _BASE | {"object", "filters", "filterLogic"}
@@ -110,7 +110,7 @@ class _Extractor:
             self.diagnostic("FLOW_FIELD_OWNER_UNRESOLVED", "The field's owning object is not established.", node, "unresolved")
             return
         if "." in (field or ""):
-            resolved = resolve_field_path(self.store, owner, field, standard_parents=SOURCE_STANDARD_PARENTS)
+            resolved = resolve_source_field_path(self.store, owner, field)
             if resolved is None:
                 self.diagnostic("FLOW_RELATIONSHIP_PATH_UNSUPPORTED", "The complete parent relationship path is not uniquely established.", node)
                 return

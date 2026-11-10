@@ -29,13 +29,7 @@ _FFLIB_EVENT_METHODS = {
 }
 
 
-def _list_parameter(unit, declaration):
-    """Return the name and element type of one literal List<T> parameter."""
-    parameters = _significant(declaration.child_by_field_name("parameters"))
-    if len(parameters) != 1 or parameters[0].type != "formal_parameter":
-        return None
-    parameter = parameters[0]
-    declared_type = parameter.child_by_field_name("type")
+def _list_element_type(unit, declared_type):
     if declared_type is None or declared_type.type != "generic_type":
         return None
     parts = _significant(declared_type)
@@ -44,11 +38,31 @@ def _list_parameter(unit, declaration):
     types = _significant(parts[1])
     if len(types) != 1 or types[0].type != "type_identifier":
         return None
-    return unit.text(parameter.child_by_field_name("name")).casefold(), unit.text(types[0]).casefold()
+    return unit.text(types[0]).casefold()
 
 
-def _fflib_constructor(unit, owner):
+def _list_parameter(unit, declaration):
+    """Return the name and element type of one literal List<T> parameter."""
+    parameters = _significant(declaration.child_by_field_name("parameters"))
+    if len(parameters) != 1 or parameters[0].type != "formal_parameter":
+        return None
+    parameter = parameters[0]
+    element_type = _list_element_type(unit, parameter.child_by_field_name("type"))
+    if element_type is None:
+        return None
+    return unit.text(parameter.child_by_field_name("name")).casefold(), element_type
+
+
+def _fflib_constructor(unit, owner, apex_types):
     """Prove the bounded public nested factory creates this concrete domain."""
+    platform_types = {"list", "map", "sobject", "id"}
+    if ("abstract" in _modifiers(unit.data, unit.class_node)[0] or apex_types & platform_types
+            or unit.declared_types & (platform_types | {_FFLIB, unit.name.casefold()})):
+        return None
+    owner = owner.casefold()
+    record_types = {"sobject"}
+    if owner not in apex_types and owner not in unit.declared_types:
+        record_types.add(owner)
     members = _significant(unit.class_node.child_by_field_name("body"))
     factories = [node for node in members if node.type == "class_declaration"
                  and unit.text(node.child_by_field_name("name")).casefold() == "constructor"]
@@ -90,14 +104,21 @@ def _fflib_constructor(unit, owner):
     arguments = _significant(construction.child_by_field_name("arguments"))
     parameter = _list_parameter(unit, construct)
     if (unit.text(construction.child_by_field_name("type")).casefold() != unit.name.casefold()
-            or len(arguments) != 1 or arguments[0].type != "identifier"
-            or parameter is None or unit.text(arguments[0]).casefold() != parameter[0]):
+            or len(arguments) != 1 or parameter is None):
+        return None
+    argument = arguments[0]
+    if argument.type == "cast_expression":
+        cast_type = _list_element_type(unit, argument.child_by_field_name("type"))
+        if cast_type not in record_types:
+            return None
+        argument = argument.child_by_field_name("value")
+    if argument is None or argument.type != "identifier" or unit.text(argument).casefold() != parameter[0]:
         return None
     constructors = [node for node in members if node.type == "constructor_declaration"
                     and len(_significant(node.child_by_field_name("parameters"))) == 1]
     if len(constructors) != 1 or (parameter := _list_parameter(unit, constructors[0])) is None:
         return None
-    if parameter[1] not in {owner.casefold(), "sobject"}:
+    if parameter[1] not in record_types:
         return None
     return construction, constructors[0]
 
@@ -431,19 +452,21 @@ class _TriggerExtractor(_MethodExtractor):
         if len(domains) != 1:
             return False
         domain = domains[0]
-        if ((domain.superclass_name or "").casefold() != _FFLIB
-                or "abstract" in _modifiers(domain.data, domain.class_node)[0]
-                or domain.declared_types & {_FFLIB, domain.name.casefold(), "list", "map", "sobject", "id"}):
+        if (domain.superclass_name or "").casefold() != _FFLIB:
             return False
-        binding = _fflib_constructor(domain, self.owner)
+        location = self.unit.location(node)
+        binding = _fflib_constructor(domain, self.owner, self.index.apex_types)
         if binding is None:
-            return False
+            self.store.diagnostic("TRIGGER_FFLIB_FACTORY_UNRESOLVED",
+                                  "The fflib domain's nested Constructor could not be bound to a compatible domain constructor.",
+                                  location, state="unresolved", source_component=self.method.id,
+                                  target_component=domain.class_id)
+            return True
         construct_site, constructor = binding
         methods = self.index.methods[domain_id]
         methods_by_name = {}
         for method in methods:
             methods_by_name.setdefault(method.name.casefold(), []).append(method)
-        location = self.unit.location(node)
         for event in self.store.components[self.method.id]["trigger_events"]:
             suffix, parameter_types = _FFLIB_EVENT_METHODS[event]
             if "handle" + suffix in methods_by_name:

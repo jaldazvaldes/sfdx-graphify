@@ -1,6 +1,7 @@
 """Exercise the same synthetic parent paths through SOQL and typed Flow references."""
 
 import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,7 @@ from graphify.salesforce.apex import extract_apex, index_apex
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.inventory import extract_inventory, index_definitions
 from graphify.salesforce.schema import FactStore
+from graphify.salesforce.service import build_project
 from graphify.salesforce.xml_source import parse_xml
 
 
@@ -57,6 +59,19 @@ def extract(engine, owner, path, *metadata):
     ("Case", "RecordType.DeveloperName", "recordtype.developername", (("case.recordtypeid", "recordtype"),)),
     ("Lead", "CreatedBy.Email", "user.email", (("lead.createdbyid", "user"),)),
     ("Contact", "RecordType.Name", "recordtype.name", (("contact.recordtypeid", "recordtype"),)),
+    ("OrderItem", "Order.Account.Name", "account.name", (
+        ("orderitem.orderid", "order"), ("order.accountid", "account"),
+    )),
+    ("OrderItem", "Product2.Name", "product2.name", (("orderitem.product2id", "product2"),)),
+    ("CampaignMember", "Campaign.Name", "campaign.name", (("campaignmember.campaignid", "campaign"),)),
+    ("CampaignMember", "Contact.LastName", "contact.lastname", (("campaignmember.contactid", "contact"),)),
+    ("CampaignMember", "RecordType.Name", "recordtype.name", (("campaignmember.recordtypeid", "recordtype"),)),
+    ("Asset", "CreatedBy.Name", "user.name", (("asset.createdbyid", "user"),)),
+    ("Asset", "RecordType.Name", "recordtype.name", (("asset.recordtypeid", "recordtype"),)),
+    ("Task", "CreatedBy.Email", "user.email", (("task.createdbyid", "user"),)),
+    ("Task", "RecordType.Name", "recordtype.name", (("task.recordtypeid", "recordtype"),)),
+    ("Event", "CreatedBy.Email", "user.email", (("event.createdbyid", "user"),)),
+    ("User", "CreatedBy.Email", "user.email", (("user.createdbyid", "user"),)),
 ])
 def test_documented_paths_preserve_terminal_field_and_each_hop(engine, owner, path, target, hops):
     store, edges, source, code = extract(engine, owner, path)
@@ -86,6 +101,7 @@ def test_documented_paths_preserve_terminal_field_and_each_hop(engine, owner, pa
 @pytest.mark.parametrize("owner,path", [
     ("Order", "Contact.Name"), ("Case", "Owner.Name"), ("Task", "Who.Name"),
     ("Task", "What.Name"), ("Sample__c", "RecordType.Name"), ("Sample__c", "CreatedBy.Name"),
+    ("ContentDocumentLink", "CreatedBy.Name"), ("User", "RecordType.Name"),
 ])
 def test_unknown_parent_paths_have_diagnostics_without_partial_field_facts(engine, owner, path):
     store, edges, _, _ = extract(engine, owner, path)
@@ -119,3 +135,101 @@ def test_custom_object_with_declared_lookup_can_use_a_known_standard_parent(engi
     terminal = next(edge for edge in edges if edge["target"] == "sf:field:profile.name")
     proof, = [store.evidence[eid] for eid in terminal["evidence_ids"]]
     assert [step["basis"] for step in proof["resolution"]["steps"]] == ["declared_lookup", "standard_schema"]
+
+
+def record_type(owner="Sample__c", body="<active>false</active>"):
+    return (f"objects/{owner}/recordTypes/Example.recordType-meta.xml",
+            f"<RecordType><fullName>Example</fullName>{body}</RecordType>")
+
+
+@pytest.mark.parametrize("engine", ["soql", "flow"])
+@pytest.mark.parametrize("path,lookup,target", [
+    ("RecordType.Name", "recordtypeid", "recordtype.name"),
+    ("CreatedBy.Name", "createdbyid", "user.name"),
+])
+def test_local_record_type_establishes_the_owners_standard_system_field(engine, path, lookup, target):
+    metadata_path, xml = record_type()
+    store, edges, _, _ = extract(engine, "Sample__c", path, (metadata_path, xml))
+    assert not store.diagnostics
+    assert {edge["target"] for edge in edges} == {f"sf:field:sample__c.{lookup}", f"sf:field:{target}"}
+    for edge in edges:
+        occurrence, = [store.evidence[eid] for eid in edge["evidence_ids"]]
+        step, = occurrence["resolution"]["steps"]
+        assert step["schema_source"]["path"] == metadata_path
+        assert step["schema_source"]["content_hash"] == hashlib.sha256(xml.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("engine", ["soql", "flow"])
+def test_local_custom_object_enables_created_by_without_a_record_type(engine):
+    metadata = ("objects/Sample__c/Sample__c.object-meta.xml", "<CustomObject><label>Sample</label></CustomObject>")
+    store, edges, _, _ = extract(engine, "Sample__c", "CreatedBy.Name", metadata)
+    assert {edge["target"] for edge in edges} == {"sf:field:sample__c.createdbyid", "sf:field:user.name"}
+    for edge in edges:
+        occurrence, = [store.evidence[eid] for eid in edge["evidence_ids"]]
+        assert occurrence["resolution"]["steps"][0]["schema_source"]["path"] == metadata[0]
+
+
+@pytest.mark.parametrize("engine", ["soql", "flow"])
+@pytest.mark.parametrize("owner,path,metadata", [
+    ("Sample__c", "RecordType.Name", (record_type(body="<active>unknown</active>"),)),
+    ("Sample__c", "RecordType.Name", (record_type(), ("other/" + record_type()[0], record_type()[1]))),
+    ("Sample__c", "RecordType.Name", (record_type(), (
+        "objects/Sample__c/fields/RecordTypeId.field-meta.xml",
+        "<CustomField><type>Lookup</type><referenceTo>User</referenceTo></CustomField>",
+    ))),
+    ("Sample__c", "CreatedBy.Name", (
+        ("objects/Sample__c/Sample__c.object-meta.xml",
+         "<CustomObject><customSettingsType>Hierarchy</customSettingsType></CustomObject>"),
+    )),
+    ("Sample__mdt", "RecordType.Name", (record_type("Sample__mdt"),)),
+    ("Sample__x", "RecordType.Name", (record_type("Sample__x"),)),
+    ("Sample__e", "RecordType.Name", (record_type("Sample__e"),)),
+    ("Sample__b", "RecordType.Name", (record_type("Sample__b"),)),
+])
+def test_local_metadata_cannot_override_unresolved_conflicting_or_special_objects(engine, owner, path, metadata):
+    store, edges, _, _ = extract(engine, owner, path, *metadata)
+    assert not edges
+    code = "APEX_SOQL_FIELD_PATH_UNSUPPORTED" if engine == "soql" else "FLOW_RELATIONSHIP_PATH_UNSUPPORTED"
+    assert any(row["code"] == code for row in store.diagnostics)
+
+
+@pytest.mark.parametrize("invalid_xml", [
+    "<RecordType><active>true</active>",
+    "<RecordType><fullName>Mismatch</fullName><active>true</active></RecordType>",
+    '<?xml version="1.0" encoding="unsupported-encoding"?><RecordType/>',
+    '<?xml version="1.0" encoding="utf-7"?><RecordType/>',
+])
+def test_build_selects_and_hashes_valid_record_type_after_invalid_peer(tmp_path, invalid_xml):
+    source = tmp_path / "source"
+    package = source / "force-app"
+    package.mkdir(parents=True)
+    (source / "sfdx-project.json").write_text('{"packageDirectories":[{"path":"force-app"}]}', encoding="utf-8")
+    metadata_path, xml = record_type()
+    invalid_path, _ = record_type("Unresolved__c")
+    files = {
+        metadata_path: xml,
+        invalid_path: invalid_xml,
+        "classes/ParentProbe.cls": (
+            "public class ParentProbe { public void probe() { "
+            "List<Sample__c> rows = [SELECT RecordType.Name FROM Sample__c]; "
+            "List<Unresolved__c> unresolved = [SELECT RecordType.Name FROM Unresolved__c]; } }"
+        ),
+    }
+    for relative, content in files.items():
+        file = package / Path(relative)
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(content, encoding="utf-8")
+    bundle = build_project(source, out=tmp_path / "snapshot")
+    path = f"force-app/{metadata_path}"
+    terminal, = [row for row in bundle["facts"]["relationships"] if row["target"] == "sf:field:recordtype.name"]
+    occurrence, = [row for row in bundle["facts"]["evidence"] if row["id"] in terminal["evidence_ids"]]
+    definition = occurrence["resolution"]["steps"][0]["schema_source"]
+    assert definition["path"] == path
+    assert bundle["manifest"]["inputs"][path] == definition["content_hash"]
+    unresolved, = [row for row in bundle["diagnostics"] if row["code"] == "RECORD_TYPE_METADATA_UNRESOLVED"]
+    invalid_path = f"force-app/{invalid_path}"
+    assert unresolved["location"]["path"] == invalid_path
+    assert unresolved["location"]["content_hash"] == bundle["manifest"]["inputs"][invalid_path]
+    assert any(row["code"] == "APEX_SOQL_FIELD_PATH_UNSUPPORTED" for row in bundle["diagnostics"])
+    assert not any(row["id"] == "sf:field:unresolved__c.recordtypeid" for row in bundle["facts"]["components"])
+    assert not any(row["code"] == "unsupported_metadata" for row in bundle["diagnostics"])

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
-from .schema import DataError, FactStore, canonical_json
+from .schema import API_NAME, DataError, FactStore, canonical_json
 from .xml_source import Document
 
 SUFFIXES = {".flow-meta.xml": ("flow", "Flow"),
             ".object-meta.xml": ("object", "CustomObject"),
             ".field-meta.xml": ("field", "CustomField"),
-            ".validationRule-meta.xml": ("validationrule", "ValidationRule")}
+            ".validationRule-meta.xml": ("validationrule", "ValidationRule"),
+            ".recordType-meta.xml": ("recordtype", "RecordType")}
+_CHILD_DIRECTORIES = {"field": "fields", "validationrule": "validationRules", "recordtype": "recordTypes"}
 
 
 def identity(document):
@@ -23,20 +25,44 @@ def identity(document):
             declared = document.root.value("fullName")
             if declared and declared != name:
                 raise DataError(f"Metadata fullName and filename differ: {document.path}")
-            if kind in {"field", "validationrule"}:
-                directory = "fields" if kind == "field" else "validationRules"
-                if path.parent.name != directory or path.parent.parent.parent.name != "objects":
+            if kind in _CHILD_DIRECTORIES:
+                if path.parent.name != _CHILD_DIRECTORIES[kind] or path.parent.parent.parent.name != "objects":
                     raise DataError(f"{root_tag} is not in decomposed Salesforce DX format: {document.path}")
-                if kind == "validationrule" and len(document.root.all("fullName")) > 1:
-                    raise DataError(f"ValidationRule has multiple fullName elements: {document.path}")
+                if kind in {"validationrule", "recordtype"} and len(document.root.all("fullName")) > 1:
+                    raise DataError(f"{root_tag} has multiple fullName elements: {document.path}")
+                if kind == "recordtype" and not all(API_NAME.fullmatch(part) for part in (path.parent.parent.name, name)):
+                    raise DataError(f"Invalid RecordType identity: {document.path}")
                 name = f"{path.parent.parent.name}.{name}"
             return kind, name
     raise DataError(f"Unsupported metadata document: {document.path}")
 
 
+def _record_type_owners(definitions, store):
+    """Keep one unambiguous definition per owner as schema evidence."""
+    owners = {}
+    for name, documents in sorted(definitions.items()):
+        if len(documents) != 1:
+            for document in documents:
+                store.diagnostic("RECORD_TYPE_METADATA_AMBIGUOUS", "Multiple local definitions have this RecordType name.",
+                                 document.location(document.root), state="ambiguous")
+            continue
+        document = documents[0]
+        statuses = document.root.all("active")
+        if len(statuses) != 1 or statuses[0].children or statuses[0].text not in {"true", "false", "1", "0"}:
+            store.diagnostic("RECORD_TYPE_METADATA_UNRESOLVED", "A unique local active boolean is required in RecordType metadata.",
+                             document.location(document.root), state="unresolved")
+            continue
+        owners.setdefault(name.split(".", 1)[0], document.location(document.root))
+    return owners
+
+
 def index_definitions(documents: list[Document], store: FactStore):
+    record_types = {}
     for document in documents:
         kind, name = identity(document)
+        if kind == "recordtype":
+            record_types.setdefault(name.casefold(), []).append(document)
+            continue
         attrs = {}
         if kind == "field":
             attrs["data_type"] = document.root.value("type") or None
@@ -72,6 +98,7 @@ def index_definitions(documents: list[Document], store: FactStore):
             if metadata not in definitions:
                 definitions.append(metadata)
                 definitions.sort(key=canonical_json)
+    store.record_type_definitions = _record_type_owners(record_types, store)
     for component in list(store.components.values()):
         if component["definition_status"] == "ambiguous":
             if component["kind"] == "object":
@@ -109,7 +136,7 @@ _OBJECT_DESCRIPTIVE = {
 def extract_inventory(documents: list[Document], store: FactStore):
     for document in documents:
         kind, name = identity(document)
-        if kind in {"flow", "validationrule"}:
+        if kind in {"flow", "validationrule", "recordtype"}:
             continue
         root = document.root
         source = store.resolve_component(kind, name, document.location(root))

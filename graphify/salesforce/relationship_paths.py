@@ -24,8 +24,21 @@ _STANDARD_PARENTS = {
 # Additional SOQL and Flow paths from the API 64.0 vocabulary. Opportunity.Contact
 # was introduced in API 46.0. RecordType availability depends on org configuration.
 # https://developer.salesforce.com/docs/platform/object-reference/references/
-_RECORD_TYPE_OWNERS = ("account", "case", "contact", "lead", "opportunity", "order")
+# Audit fields are present on many objects, but not on every standard object.
+# https://developer.salesforce.com/docs/platform/object-reference/guide/system-fields.html
+_CREATED_BY_OWNERS = (
+    "account", "asset", "campaign", "campaignmember", "case", "contact", "contentdocument",
+    "contentversion", "contract", "event", "group", "lead", "opportunity", "order", "orderitem",
+    "pricebook2", "pricebookentry", "product2", "profile", "quote", "quotelineitem", "recordtype",
+    "task", "user",
+)
+_RECORD_TYPE_OWNERS = (
+    "account", "asset", "campaign", "campaignmember", "case", "contact", "contentversion",
+    "contract", "event", "lead", "opportunity", "order", "product2", "quote", "task",
+)
 SOURCE_STANDARD_PARENTS = {
+    ("campaignmember", "campaign"): ("CampaignId", "Campaign"),
+    ("campaignmember", "contact"): ("ContactId", "Contact"),
     ("case", "account"): ("AccountId", "Account"),
     ("case", "contact"): ("ContactId", "Contact"),
     ("opportunity", "account"): ("AccountId", "Account"),
@@ -33,14 +46,38 @@ SOURCE_STANDARD_PARENTS = {
     ("order", "account"): ("AccountId", "Account"),
     ("order", "billtocontact"): ("BillToContactId", "Contact"),
     ("order", "shiptocontact"): ("ShipToContactId", "Contact"),
+    ("orderitem", "order"): ("OrderId", "Order"),
+    ("orderitem", "product2"): ("Product2Id", "Product2"),
     ("user", "profile"): ("ProfileId", "Profile"),
     **{(owner, "recordtype"): ("RecordTypeId", "RecordType") for owner in _RECORD_TYPE_OWNERS},
-    **{(owner, "createdby"): ("CreatedById", "User") for owner in _RECORD_TYPE_OWNERS},
+    **{(owner, "createdby"): ("CreatedById", "User") for owner in _CREATED_BY_OWNERS},
 }
 
 
+def resolve_source_field_path(store, owner: str, path: str) -> dict | None:
+    """Resolve paths in static SOQL and typed Flow expressions."""
+    return resolve_field_path(store, owner, path, standard_parents=SOURCE_STANDARD_PARENTS,
+                              use_local_system_fields=True)
+
+
+def _local_system_parent(store, owner, parent, component):
+    """Recognize audit and record type fields from the typed owner's metadata."""
+    if (owner.endswith(("__b", "__e", "__mdt", "__x"))
+            or component and component.get("custom_settings_type")):
+        return None, None
+    record_type = store.record_type_definitions.get(owner)
+    if parent == "recordtype" and record_type is not None and owner != "user":
+        return ("RecordTypeId", "RecordType"), record_type
+    if parent == "createdby" and owner.endswith("__c"):
+        definition = component["definitions"][0] if component and component["definitions"] else record_type
+        if definition is not None:
+            return ("CreatedById", "User"), definition
+    return None, None
+
+
 def resolve_field_path(store, owner: str, path: str, *,
-                       standard_parents: dict[tuple[str, str], tuple[str, str]] | None = None) -> dict | None:
+                       standard_parents: dict[tuple[str, str], tuple[str, str]] | None = None,
+                       use_local_system_fields: bool = False) -> dict | None:
     """Return the exact terminal field and schema hops, or None with no mutation.
 
     Consumers can opt into additional documented parent pairs. The default
@@ -71,6 +108,9 @@ def resolve_field_path(store, owner: str, path: str, *,
             return None
         pair = (current.casefold(), parent.casefold())
         standard = (standard_parents or {}).get(pair) or _STANDARD_PARENTS.get(pair)
+        schema_source = None
+        if standard is None and use_local_system_fields:
+            standard, schema_source = _local_system_parent(store, *pair, store.components.get(object_id))
         # Account.ParentId can be represented by Hierarchy metadata. This is a
         # single verified self-reference, not a general alias for Lookup.
         hierarchy = (pair == ("account", "parent") and declaration is not None
@@ -105,8 +145,11 @@ def resolve_field_path(store, owner: str, path: str, *,
             target_id = component_id("object", target_name)
             if target_id in store.components and store.is_ambiguous(target_id):
                 return None
-            steps.append({"field": component_id("field", current + "." + field_name),
-                          "target": target_id, "basis": "standard_schema"})
+            step = {"field": component_id("field", current + "." + field_name),
+                    "target": target_id, "basis": "standard_schema"}
+            if schema_source is not None:
+                step["schema_source"] = schema_source
+            steps.append(step)
             current = target_name
     return {"owner": current, "field": parts[-1], "steps": steps}
 

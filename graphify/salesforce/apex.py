@@ -17,7 +17,7 @@ from urllib.parse import quote
 from tree_sitter import Node, Tree
 
 from .schema import API_NAME, FactStore, component_id
-from .relationship_paths import SOURCE_STANDARD_PARENTS, add_navigation_reads, resolve_field_path
+from .relationship_paths import add_navigation_reads, resolve_source_field_path
 
 
 PARSER_VERSION = "tree-sitter-language-pack==0.11.0/apex"
@@ -666,7 +666,7 @@ class _MethodExtractor:
                 if name.casefold() in aliases:
                     self.diagnostic("APEX_SOQL_ALIAS_UNSUPPORTED", "This name matches a SELECT alias; it is not resolved as an object field.", current)
                 elif not API_NAME.fullmatch(name):
-                    resolved = resolve_field_path(self.store, owner, name, standard_parents=SOURCE_STANDARD_PARENTS)
+                    resolved = resolve_source_field_path(self.store, owner, name)
                     if resolved is None:
                         self.diagnostic("APEX_SOQL_FIELD_PATH_UNSUPPORTED", "No unique declared or supported standard parent path establishes the terminal field owner.", current)
                         return

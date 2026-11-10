@@ -121,6 +121,7 @@ class FactStore:
         self.relationships: dict[str, dict] = {}
         self.evidence: dict[str, dict] = {}
         self.diagnostics: list[dict] = []
+        self.record_type_definitions: dict[str, dict] = {}
         self._diagnostic_ids: set[str] = set()
 
     def ensure_component(self, kind, api_name, definition=None, **attrs):

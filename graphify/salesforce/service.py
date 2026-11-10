@@ -69,6 +69,17 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
             triggers[path] = data
         elif path.endswith(".trigger-meta.xml"):
             trigger_metadata.append(parse_xml(path, data))
+        elif path.casefold().endswith(".recordtype-meta.xml"):
+            # RecordType XML only corroborates lookup resolution. An invalid
+            # optional definition must not hide unrelated dependency evidence.
+            try:
+                document = parse_xml(path, data)
+                identity(document)
+            except (ValueError, LookupError) as exc:
+                store.diagnostic("RECORD_TYPE_METADATA_UNRESOLVED", str(exc),
+                                 {"path": path, "content_hash": scan.inputs[path]}, state="unresolved")
+            else:
+                documents.append(document)
         else:
             documents.append(parse_xml(path, data))
     index_definitions(documents, store)
@@ -119,6 +130,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         "untested_api_versions": [v for v in versions if v not in TESTED_API_VERSIONS],
         "supported_metadata": ["Flow (bounded typed references, decisions and formula dependencies)", "CustomObject (inventory)",
                                "CustomField (inventory and lookup targets)",
+                               "RecordType (local evidence for a SOQL or Flow relationship)",
                                "ValidationRule (local activation, bounded formula references and error display fields)",
                                "ApexTrigger (events, literal handlers and bounded record references)",
                                "ApexClass/ApexMethod (bounded AST, invocable methods and static SOQL/DML)",

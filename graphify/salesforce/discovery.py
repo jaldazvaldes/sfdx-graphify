@@ -25,7 +25,8 @@ EXCLUDED_DIRS = frozenset({
     "sfdx-graphify-out", "coverage", "logs",
 })
 _CONFIG_FILES = ("sfdx-project.json", ".forceignore", ".gitignore")
-_SUPPORTED = (".flow-meta.xml", ".object-meta.xml", ".field-meta.xml", ".validationrule-meta.xml", ".workflow-meta.xml",
+_SUPPORTED = (".flow-meta.xml", ".object-meta.xml", ".field-meta.xml", ".validationrule-meta.xml",
+              ".recordtype-meta.xml", ".workflow-meta.xml",
               ".cls", ".trigger", ".trigger-meta.xml")
 _MAX_FILE_BYTES = 32 * 1024 * 1024
 
