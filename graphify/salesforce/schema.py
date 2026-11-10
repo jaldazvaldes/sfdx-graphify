@@ -10,8 +10,8 @@ from urllib.parse import quote
 
 SCHEMA_VERSION = 8
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
-EXTRACTOR_VERSION = "0.5.7"
-UPSTREAM_REVISION = "6c8002eca4acad58db6160eabcb466e61fc35afb"
+EXTRACTOR_VERSION = "0.5.8"
+UPSTREAM_REVISION = "5eedffa87476a063a05bed96f17275ed63f05c1a"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
 KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc",
