@@ -215,5 +215,11 @@ def test_trigger_handler_continues_to_unique_cross_class_static_method():
 def test_cross_class_static_call_does_not_ignore_local_member_or_inherited_shadowing(handler):
     store, _ = analyze("", classes=[("Handler", handler),
                                     ("Utility", "public class Utility { public static void work() {} }")])
-    assert not any(r["target"] == "sf:apexmethod:utility.work" and r["relation"] == "calls"
-                   for r in store.relationships.values())
+    calls = [r for r in store.relationships.values()
+             if r["target"] == "sf:apexmethod:utility.work" and r["relation"] == "calls"]
+    if "extends Parent" in handler:
+        edge, = calls
+        assert edge["qualifiers"]["resolution_status"] == "candidate"
+        assert edge["qualifiers"]["missing_ancestors"] == ["Parent"]
+    else:
+        assert not calls

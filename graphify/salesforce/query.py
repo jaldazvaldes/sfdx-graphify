@@ -5,7 +5,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
-from .schema import SCHEMA_VERSION, DataError
+from .schema import DISPATCH_EVIDENCE_SITES, SCHEMA_VERSION, DataError, relationship_resolution
 
 
 class QueryError(DataError):
@@ -62,6 +62,10 @@ def envelope(bundle: dict, results: list, *, source=None, truncated: bool = Fals
         "activity_policy": policy,
         "results": results,
         "truncated": truncated,
+        "resolution_policy": {
+            "candidate_calls_included": True,
+            "interpretation": "Candidate calls have an unverified external hierarchy or conditional trigger dispatch. Inspect their reason and source evidence before relying on a path.",
+        },
         "limitations": [
             "Missing relationships do not prove absence of dependencies.",
             "Check current source before drawing consequential conclusions.",
@@ -132,8 +136,14 @@ def diagnostic_context(bundle: dict, target: dict, results: list, *, mode: str =
     locations = list(target.get("definitions", []))
     for result in results:
         occurrences = result.get("evidence", [])
-        paths.update(item["path"] for item in occurrences)
         locations.extend(occurrences)
+        for occurrence in occurrences:
+            proof = occurrence.get("resolution", {})
+            for key, _ in DISPATCH_EVIDENCE_SITES:
+                site = proof.get(key)
+                if isinstance(site, dict) and isinstance(site.get("path"), str):
+                    locations.append(site)
+    paths.update(item["path"] for item in locations)
     spans = defaultdict(list)
     for location in locations:
         start = location.get("line")
@@ -198,7 +208,8 @@ def diagnostic_context(bundle: dict, target: dict, results: list, *, mode: str =
 
 
 def _expanded(relationship: dict, evidence: dict) -> dict:
-    return {**relationship, "evidence": [evidence[key] for key in relationship["evidence_ids"]]}
+    return {**relationship, "resolution": relationship_resolution(relationship),
+            "evidence": [evidence[key] for key in relationship["evidence_ids"]]}
 
 
 def _limit(limit: int) -> None:
@@ -295,6 +306,9 @@ def impact(bundle: dict, name: str, *, depth: int = 2, limit: int = 1000,
     for items in incoming.values():
         items.sort(key=lambda item: _relationship_key(item, indexed))
     queue = deque([(target["id"], 0)])
+    # One deterministic shortest witness per visited node. It does not assert
+    # that all possible paths have the same certainty, nor describe execution.
+    witness_paths = {target["id"]: ([], [])}
     visited_nodes = {target["id"]}
     visited_edges = set()
     results = []
@@ -316,9 +330,18 @@ def impact(bundle: dict, name: str, *, depth: int = 2, limit: int = 1000,
                 limit_limited = True
                 break
             visited_edges.add(item["id"])
-            results.append({**_expanded(item, evidence), "depth": distance + 1})
+            path, candidate_ids = witness_paths[item["target"]]
+            path = [item["id"], *path]
+            candidate_ids = ([item["id"], *candidate_ids]
+                             if relationship_resolution(item)["status"] == "candidate"
+                             else list(candidate_ids))
+            results.append({**_expanded(item, evidence), "depth": distance + 1,
+                            "traversal": {"relationship_ids": path,
+                                          "candidate_relationship_ids": candidate_ids,
+                                          "includes_candidate_calls": bool(candidate_ids)}})
             if item["source"] not in visited_nodes:
                 visited_nodes.add(item["source"])
+                witness_paths[item["source"]] = (path, candidate_ids)
                 queue.append((item["source"], distance + 1))
         if limit_limited:
             break
@@ -328,6 +351,7 @@ def impact(bundle: dict, name: str, *, depth: int = 2, limit: int = 1000,
                    "max_depth": depth, "depth_limited": depth_limited,
                    "limit_limited": limit_limited, "test_filter": filtering,
                    "returned_count": len(results)})
+    result["traversal_policy"] = "Each witness starts with the returned relationship, then follows a deterministic shortest route from its target to the focus; it may revisit nodes. Candidate flags describe that witness, not all possible paths or runtime execution."
     result["diagnostic_context"] = diagnostic_context(bundle, target, results, mode=diagnostics)
     return result
 

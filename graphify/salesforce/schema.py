@@ -8,18 +8,40 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-SCHEMA_VERSION = 5
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
-EXTRACTOR_VERSION = "0.5.2"
+SCHEMA_VERSION = 7
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
+EXTRACTOR_VERSION = "0.5.4"
 UPSTREAM_REVISION = "6c8002eca4acad58db6160eabcb466e61fc35afb"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
 KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc", "outboundmessage", "validationrule"})
 API_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_DISPATCH_CANDIDATE_INVOCATIONS = {"conditional_virtual_dispatch": "constructed_virtual_dispatch",
+                                   "fflib_event_dispatch": "fflib_event_dispatch"}
+DISPATCH_EVIDENCE_SITES = (("dispatch_site", "Dispatch"), ("class_literal", "Domain literal"),
+                           ("construct_site", "Factory construction"), ("constructor", "Domain constructor"),
+                           ("hook", "Hook"))
 
 
 class DataError(ValueError):
     """Invalid input or a failed integrity contract; safe to report to the CLI."""
+
+
+def relationship_resolution(relationship: dict) -> dict:
+    """Describe extraction certainty, never runtime execution or org validity."""
+    qualifiers = relationship.get("qualifiers", {})
+    reason = qualifiers.get("uncertainty") if qualifiers.get("resolution_status") == "candidate" else None
+    # Earlier snapshots preserve this conditional dispatch in evidence, but
+    # predate explicit candidate qualifiers for it.
+    if (reason is None and relationship.get("relation") == "calls"
+            and qualifiers.get("invocation") == "constructed_virtual_dispatch"):
+        reason = "conditional_virtual_dispatch"
+    return {
+        "status": "candidate" if reason else "extracted",
+        "confidence": "AMBIGUOUS" if reason else "EXTRACTED",
+        "reason": reason,
+        "missing_ancestors": list(qualifiers.get("missing_ancestors", [])) if reason == "external_hierarchy" else [],
+    }
 
 
 def canonical_json(value) -> str:
@@ -270,6 +292,35 @@ def validate_bundle(bundle):
             source, target, relation = (relationship[k] for k in ("source", "target", "relation"))
             if source not in components or target not in components or relation not in RELATIONS:
                 raise DataError("Dangling or invalid relationship.")
+            qualifiers = relationship["qualifiers"]
+            if not isinstance(qualifiers, dict):
+                raise DataError("Invalid relationship qualifiers.")
+            dispatch_reason = None
+            if "resolution_status" in qualifiers:
+                if manifest["schema_version"] < 6:
+                    raise DataError("Candidate relationships require snapshot schema version 6.")
+                if qualifiers["resolution_status"] != "candidate" or relation != "calls":
+                    raise DataError("Invalid candidate call resolution.")
+                reason = qualifiers.get("uncertainty")
+                if reason == "external_hierarchy":
+                    missing = qualifiers.get("missing_ancestors")
+                    if (not isinstance(missing, list) or not missing
+                            or any(not isinstance(name, str) or not name for name in missing)
+                            or len(set(missing)) != len(missing)):
+                        raise DataError("Invalid candidate call resolution.")
+                elif isinstance(reason, str) and reason in _DISPATCH_CANDIDATE_INVOCATIONS:
+                    if manifest["schema_version"] < 7:
+                        raise DataError("Dispatch candidates require snapshot schema version 7.")
+                    if (qualifiers.get("invocation") != _DISPATCH_CANDIDATE_INVOCATIONS[reason]
+                            or "missing_ancestors" in qualifiers or components[source]["kind"] != "apextrigger"
+                            or components[target]["kind"] != "apexmethod"):
+                        raise DataError("Invalid candidate call resolution.")
+                    if (reason == "fflib_event_dispatch"
+                            and qualifiers.get("trigger_event") not in (components[source].get("trigger_events") or [])):
+                        raise DataError("Invalid fflib candidate trigger event.")
+                    dispatch_reason = reason
+                else:
+                    raise DataError("Invalid candidate call resolution.")
             if rid != stable_id("rel", [source, target, relation, relationship["qualifiers"]]):
                 raise DataError("Relationship identity is inconsistent.")
             evidence_ids = relationship["evidence_ids"]
@@ -280,6 +331,14 @@ def validate_bundle(bundle):
                 if occurrence["relationship_id"] != rid or occurrence["source_component"] != source:
                     raise DataError("Evidence points to the wrong relationship.")
                 validate_location(occurrence)
+                if dispatch_reason:
+                    resolution = occurrence["resolution"]
+                    if resolution.get("conditional") is not True or resolution.get("hook") not in components[target]["definitions"]:
+                        raise DataError("Invalid dispatch candidate evidence.")
+                    locations = (("dispatch_site",) if dispatch_reason == "conditional_virtual_dispatch"
+                                 else ("class_literal", "construct_site", "constructor"))
+                    for key in locations:
+                        validate_location(resolution[key])
                 if eid != stable_id("ev", [rid, occurrence["path"], occurrence["locator"],
                                            occurrence["rule"], occurrence["resolution"]]):
                     raise DataError("Evidence identity is inconsistent.")

@@ -43,7 +43,30 @@ const checks = `
       results: [{path, line: offset + 1, locator: 'synthetic', rule: 'fixture'}], next_offset: null};
   }
   function firstPath() { return $('evidence-rows').children[0].children[0].textContent; }
-  if (scenario === 'snapshot') {
+  if (scenario === 'candidate') {
+    const pending = showEvidence(), request = requests.at(-1);
+    const data = payload('Caller.cls');
+    data.resolution = {status: 'candidate', reason: 'external_hierarchy', missing_ancestors: ['ExternalBase']};
+    request.respond(data);
+    await pending;
+    assert.match($('qualifiers').textContent, /Candidate call: external hierarchy not verified/);
+    assert.match($('qualifiers').textContent, /Missing ancestors: ExternalBase/);
+    assert.equal(firstPath(), 'Caller.cls');
+    assert.equal(candidateSummary({resolution_counts: {candidate: 1, extracted: 2}}), '1 candidate, 2 extracted relationships');
+    const fflib = showEvidence(), fflibRequest = requests.at(-1);
+    const dispatch = payload('Sample.trigger');
+    dispatch.resolution = {status: 'candidate', reason: 'fflib_event_dispatch', missing_ancestors: []};
+    dispatch.results[0].resolution = {hook: {path: 'Domain.cls', line: 12}};
+    fflibRequest.respond(dispatch);
+    await fflib;
+    assert.match($('qualifiers').textContent, /Candidate call: fflib event dispatch is conditional/);
+    assert.doesNotMatch($('qualifiers').textContent, /Missing ancestors/);
+    assert.equal($('evidence-rows').children[0].children[2].children[0].textContent, 'Hook Domain.cls:12');
+    const next = showEvidence(), nextRequest = requests.at(-1);
+    nextRequest.respond(payload('Other.cls'));
+    await next;
+    assert.doesNotMatch($('qualifiers').textContent, /Candidate|ExternalBase/);
+  } else if (scenario === 'snapshot') {
     const old = showEvidence(), oldRequest = requests.at(-1);
     state.evidenceSnapshot = 'before';
     const latest = showEvidence(), latestRequest = requests.at(-1);

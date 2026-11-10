@@ -27,6 +27,18 @@ async function api(path, params={}) {
 function showError(message) { $('error').textContent=message; $('error').hidden=!message; }
 function shortId(value) { return value ? value.split(':').pop().slice(0,12) : 'No Git revision'; }
 function count(value) { return Number(value || 0).toLocaleString(); }
+function candidateSummary(edge) {
+  const candidates=edge.resolution_counts?.candidate || 0;
+  return candidates ? `${count(candidates)} candidate, ${count(edge.resolution_counts.extracted)} extracted relationships` : '';
+}
+function candidateDescription(resolution) {
+  if(resolution?.status!=='candidate') return '';
+  const missing=resolution.missing_ancestors || [];
+  const reason=({external_hierarchy:'external hierarchy not verified',
+    conditional_virtual_dispatch:'local virtual dispatch is conditional',
+    fflib_event_dispatch:'fflib event dispatch is conditional'})[resolution.reason] || 'dispatch remains uncertain';
+  return `Candidate call: ${reason}` + (missing.length ? ` · Missing ancestors: ${missing.join(', ')}` : '');
+}
 
 async function search(query) {
   const request = ++state.searchRequest;
@@ -76,6 +88,8 @@ async function renderView() {
     $('empty').hidden=true; $('graph').removeAttribute('hidden'); $('center').disabled=false;
     const notes=$('view-notes'); notes.replaceChildren();
     notes.append(element('p',`${count(data.nodes.length)} named components · ${count(data.edges.length)} typed relationships · depth ${data.depth}`));
+    const candidateCount=data.edges.reduce((total,edge)=>total+(edge.resolution_counts?.candidate || 0),0);
+    if(candidateCount) notes.append(element('p',`${count(candidateCount)} candidate calls. Paths through them remain uncertain; inspect their reason and source evidence.`,'caution'));
     if(data.field_targets_grouped) notes.append(element('p','References to this object’s fields are grouped under the selected object; evidence retains the exact field names.'));
     if(data.method_members_grouped) {
       notes.append(element('p',`${count(data.method_members_grouped)} declared methods are grouped under this class. Membership supplies viewing context, never a causal dependency; evidence keeps exact method names.`));
@@ -138,9 +152,11 @@ function draw(data) {
       path=`M ${sx} ${sy} C ${middle} ${sy}, ${middle} ${ty}, ${tx} ${ty}`;
       lx=(sx+tx)/2; ly=(sy+ty)/2-5+offset;
     }
-    const group=svgElement('g',{class:'edge-group '+edge.change,'data-edge':edge.id,tabindex:0,role:'button','aria-label':`${source.node.label} ${edge.relation} ${target.node.label}; show evidence`});
+    const uncertainty=candidateSummary(edge);
+    const group=svgElement('g',{class:'edge-group '+edge.change+(uncertainty?' candidate':''),'data-edge':edge.id,tabindex:0,role:'button','aria-label':`${source.node.label} ${edge.relation} ${target.node.label}${uncertainty?'; '+uncertainty:''}; show evidence`});
+    if(uncertainty) group.append(svgElement('title',{},`${uncertainty}. Candidate call: external hierarchy not verified.`));
     group.append(svgElement('path',{class:'edge-hit',d:path}),svgElement('path',{class:'edge-path',d:path,stroke:colors[edge.relation]||colors.references,'marker-end':'url(#arrow-'+edge.relation+')'}));
-    group.append(svgElement('text',{x:lx,y:ly,class:'edge-label',fill:colors[edge.relation]||colors.references,'text-anchor':'middle'},edge.relation+(edge.relationship_count>1?' ×'+edge.relationship_count:'')));
+    group.append(svgElement('text',{x:lx,y:ly,class:'edge-label',fill:colors[edge.relation]||colors.references,'text-anchor':'middle'},edge.relation+(edge.relationship_count>1?' ×'+edge.relationship_count:'')+(uncertainty?' · candidate':'')));
     group.addEventListener('click',()=>selectEdge(edge)); group.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectEdge(edge);}});
     svg.append(group);
   }
@@ -170,7 +186,8 @@ function relationshipList(data) {
   const container=$('relationship-list');container.replaceChildren();
   const nodes=new Map(data.nodes.map(node=>[node.id,node]));
   for(const edge of data.edges) {
-    const label=`${nodes.get(edge.source).label} → ${edge.relation} → ${nodes.get(edge.target).label}`;
+    const uncertainty=candidateSummary(edge);
+    const label=`${nodes.get(edge.source).label} → ${edge.relation} → ${nodes.get(edge.target).label}${uncertainty?' · '+uncertainty:''}`;
     const button=element('button',label,'relationship-chip'); button.dataset.edge=edge.id;
     button.addEventListener('click',()=>selectEdge(edge));container.append(button);
   }
@@ -216,9 +233,10 @@ async function selectEdge(edge) {
   state.edge=edge;state.evidenceOffset=0;state.evidenceSnapshot=edge.change==='removed'?'before':'after';
   document.querySelectorAll('[data-edge]').forEach(node=>node.classList.toggle('selected',node.dataset.edge===edge.id));
   $('evidence-empty').hidden=true; $('evidence-content').hidden=false; $('evidence-count').hidden=false;
-  $('evidence-count').textContent=`${count(edge.evidence_count)} source occurrences`;
+  const uncertainty=candidateSummary(edge);
+  $('evidence-count').textContent=`${count(edge.evidence_count)} source occurrences${uncertainty?' · '+uncertainty:''}`;
   const choices=$('canonical-relation'); choices.replaceChildren();
-  for(const relation of edge.relationships) choices.append(new Option(`${relation.source_label} · ${edge.relation} · ${relation.target_label}`,relation.id));
+  for(const relation of edge.relationships) choices.append(new Option(`${relation.source_label} · ${edge.relation} · ${relation.target_label}${relation.resolution?.status==='candidate'?' · candidate':''}`,relation.id));
   $('evidence-snapshot').hidden=edge.change!=='evidence_changed';
   await showEvidence();
 }
@@ -231,11 +249,17 @@ async function showEvidence() {
     const data=await api('/api/evidence',{relationship:id,snapshot,offset});
     if(!current())return;
     const qualifiers=Object.entries(data.relationship.qualifiers||{}).map(([key,value])=>`${key.replaceAll('_',' ')}: ${typeof value==='object'?JSON.stringify(value):value}`).join(' · ');
-    $('qualifiers').textContent=(state.meta.comparison?`${snapshot==='before'?'Before':'After'} snapshot · `:'')+(qualifiers||'Explicit source relationship; no additional qualifiers.');
+    const uncertainty=candidateDescription(data.resolution);
+    $('qualifiers').textContent=(state.meta.comparison?`${snapshot==='before'?'Before':'After'} snapshot · `:'')+(uncertainty?uncertainty+' · ':'')+(qualifiers||'Explicit source relationship; no additional qualifiers.');
     $('evidence-rows').replaceChildren();
     for(const occurrence of data.results) {
       const row=element('tr');
-      row.append(element('td',occurrence.path),element('td',occurrence.line==null?'Unavailable':String(occurrence.line)),element('td',occurrence.locator||'Unavailable'),element('td',occurrence.rule));
+       const locator=element('td',occurrence.locator||'Unavailable');
+       for(const [key,label] of [['dispatch_site','Dispatch'],['class_literal','Domain literal'],['construct_site','Factory construction'],['constructor','Domain constructor'],['hook','Hook']]) {
+         const site=occurrence.resolution?.[key];
+         if(typeof site?.path==='string') locator.append(element('div',`${label} ${site.path}:${site.line}`));
+       }
+       row.append(element('td',occurrence.path),element('td',occurrence.line==null?'Unavailable':String(occurrence.line)),locator,element('td',occurrence.rule));
       $('evidence-rows').append(row);
     }
     $('evidence-page').textContent=`Showing ${data.total?data.offset+1:0}–${data.offset+data.results.length} of ${count(data.total)} occurrences. Relative paths refer to the analyzed source.`;

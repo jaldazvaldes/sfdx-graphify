@@ -53,8 +53,23 @@ function relationshipLabel(detail) {
     ? 'lookup to' : detail.relation;
 }
 
+function candidateReason(resolution) {
+  return ({external_hierarchy: 'external hierarchy not verified',
+    conditional_virtual_dispatch: 'local virtual dispatch is conditional',
+    fflib_event_dispatch: 'fflib event dispatch is conditional'})[resolution.reason] || 'dispatch remains uncertain';
+}
+
 function relationshipTitle(details, confidence) {
   const labels = [...new Set(details.map(relationshipLabel))].sort();
+  const candidates = details.filter(detail => detail.resolution?.status === 'candidate');
+  if (candidates.length) {
+    const ancestors = [...new Set(candidates.flatMap(detail => detail.resolution.missing_ancestors || []))].sort();
+    const reasons = [...new Set(candidates.map(detail => candidateReason(detail.resolution)))].sort();
+    return `${labels.join(', ')} [AMBIGUOUS] · ${candidates.length} candidate, ${details.length - candidates.length} extracted relationships` +
+      reasons.map(reason => `\nCandidate call: ${reason}`).join('') + (ancestors.length ? `\nMissing ancestors: ${ancestors.join(', ')}` : '');
+  }
+  // Filtering a mixed pair down to extracted relationships must clear the warning.
+  if (details.every(detail => detail.resolution?.status === 'extracted')) confidence = 'EXTRACTED';
   return `${labels.join(', ')} [${confidence}]`;
 }
 
@@ -79,7 +94,11 @@ function visibleNeighborRows(nodeId) {
     if (!neighbors.has(neighborId)) neighbors.set(neighborId, new Set());
     const descriptions = neighbors.get(neighborId);
     for (const detail of details) {
-      descriptions.add(`${outgoing ? 'Outgoing' : 'Incoming'}: ${relationshipLabel(detail)}`);
+      const resolution = detail.resolution;
+      const candidate = resolution?.status === 'candidate'
+        ? ` · Candidate call: ${candidateReason(resolution)}` +
+          (resolution.missing_ancestors?.length ? ` (missing: ${resolution.missing_ancestors.join(', ')})` : '') : '';
+      descriptions.add(`${outgoing ? 'Outgoing' : 'Incoming'}: ${relationshipLabel(detail)}${candidate}`);
     }
   }
   return [...neighbors].map(([id, descriptions]) => ({id, descriptions: [...descriptions].sort()}))
@@ -124,6 +143,7 @@ function applyComponentVisibility() {
     if (hidden !== hiddenEdgeIds.has(id)) update.hidden = hidden;
     if (layerChanged) {
       const title = relationshipTitle(active, edge.confidence);
+      update.dashes = active.some(detail => detail.resolution?.status === 'candidate');
       if (title !== displayedEdgeTitles[id]) {
         update.title = title;
         displayedEdgeTitles[id] = title;

@@ -93,13 +93,19 @@ def test_standard_renderer_retains_all_layer_details_and_reverse_pairs():
 
 
 @pytest.mark.parametrize("scenario", [
-    "layers", "direction", "combined_filters", "focus_styles", "focus_filters", "validation_empty", "validation_rules",
+    "layers", "direction", "combined_filters", "focus_styles", "focus_filters", "validation_empty", "validation_rules", "candidates",
 ])
 def test_browser_layer_filter_behavior(scenario):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is needed for the browser filter regression harness")
     bundle = layered_bundle()
+    if scenario == "candidates":
+        bundle["facts"]["relationships"].append({
+            "id": "candidate", "source": "owner", "target": "field", "relation": "calls",
+            "qualifiers": {"resolution_status": "candidate", "uncertainty": "external_hierarchy",
+                           "missing_ancestors": ["ExternalBase"]}, "evidence_ids": [],
+        })
     if scenario == "validation_rules":
         bundle["facts"]["components"].append({
             "id": "rule", "api_name": "owner.Require_Name", "kind": "validationrule",

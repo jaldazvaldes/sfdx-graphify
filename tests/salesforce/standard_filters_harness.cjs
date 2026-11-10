@@ -98,7 +98,24 @@ assert.equal(relationshipLayer, 'all');
 assert.equal(allPairs.length, scenario === 'validation_rules' ? 8 : 6);
 assert.equal(allNodes.length, scenario === 'validation_rules' ? 7 : 6);
 
-if (scenario === 'layers') {
+if (scenario === 'candidates') {
+  const mixedId = RAW_EDGES.findIndex(edge => edge.from === 'owner' && edge.to === 'field');
+  assert.match(displayedEdgeTitles[mixedId], /1 candidate, 2 extracted/);
+  assert.match(displayedEdgeTitles[mixedId], /Candidate call: external hierarchy not verified/);
+  assert.match(displayedEdgeTitles[mixedId], /ExternalBase/);
+  assert.ok(neighborDescriptions('owner').field.some(text => text.includes('Candidate call') && text.includes('ExternalBase')));
+  chooseLayer('schema');
+  assert.match(edgesDS.get(mixedId).title, /EXTRACTED/);
+  assert.doesNotMatch(edgesDS.get(mixedId).title, /Candidate|AMBIGUOUS/);
+  assert.equal(edgesDS.get(mixedId).dashes, false);
+  assert.deepEqual(neighborDescriptions('owner').field, ['Outgoing: contains']);
+  chooseLayer('dependencies');
+  assert.match(edgesDS.get(mixedId).title, /1 candidate, 1 extracted/);
+  assert.equal(edgesDS.get(mixedId).dashes, true);
+  chooseLayer('all');
+  assert.deepEqual(visibleNodes(), allNodes);
+  assert.deepEqual(visiblePairs(), allPairs);
+} else if (scenario === 'layers') {
   chooseLayer('schema');
   assert.deepEqual(visiblePairs(), ['field>target', 'owner>field']);
   assert.deepEqual(visibleNodes(), allNodes, 'layers must retain nodes, including isolates');

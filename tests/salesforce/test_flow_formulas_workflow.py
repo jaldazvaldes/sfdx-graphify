@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from graphify.salesforce import query
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.formula_refs import formula_references
 from graphify.salesforce.inventory import extract_inventory, index_definitions
@@ -136,7 +137,8 @@ def test_assignment_to_formula_never_marks_its_input_field_written():
 
 def test_formula_parent_path_uses_declared_lookup_and_retains_full_resolution():
     document, store = flow('''
-<start><object>Review__c</object><filterFormula>{!$Record.Item__r.Product2.UDICode__c} = 'X'</filterFormula></start>''')
+<start><object>Review__c</object><filterFormula>OR({!$Record.Item__r.Product2.UDICode__c} = 'X',
+{!$Record.Item__r.Product2.UDICode__c} = 'Y')</filterFormula></start>''')
     field = parse_xml("force-app/main/default/objects/Review__c/fields/Item__c.field-meta.xml", b'''<CustomField>
 <fullName>Item__c</fullName><type>Lookup</type><referenceTo>Asset</referenceTo></CustomField>''')
     index_definitions([field], store)
@@ -147,6 +149,40 @@ def test_formula_parent_path_uses_declared_lookup_and_retains_full_resolution():
     occurrence = store.evidence[edges[0]["evidence_ids"][0]]
     assert occurrence["resolution"]["relationship_path"] == "Item__r.Product2.UDICode__c"
     assert [step["basis"] for step in occurrence["resolution"]["steps"]] == ["declared_lookup", "standard_schema"]
+    assert "navigation_step" not in occurrence["resolution"]
+    bundle = {"manifest": {"snapshot_id": "synthetic"}, "facts": store.finish(), "diagnostics": store.diagnostics}
+    for step, field_name in enumerate(("Review__c.Item__c", "Asset.Product2Id"), 1):
+        navigation, = query.refs(bundle, field_name, relation="reads")["results"]
+        assert navigation["source"] == "sf:flow:formulademo"
+        assert navigation["qualifiers"] == {"context": "flow_relationship_navigation"}
+        assert {e["resolution"]["navigation_step"]["index"] for e in navigation["evidence"]} == {step}
+        assert len({e["resolution"]["formula_reference"]["decoded_character_offset"] for e in navigation["evidence"]}) == 2
+        assert all(e["content_hash"] == document.content_hash and e["line"] == occurrence["line"]
+                   and e["locator"].endswith(f"/navigation[{step}]") for e in navigation["evidence"])
+        impact, = query.impact(bundle, field_name, depth=1)["results"]
+        assert impact["id"] == navigation["id"]
+
+
+def test_relationship_assignment_preserves_terminal_write_and_navigation_read():
+    document, store = flow('''<start><object>Contact</object></start>
+<assignments><name>Rename</name><assignmentItems><assignToReference>$Record.Account.Name</assignToReference>
+<operator>Assign</operator><value><stringValue>Example</stringValue></value></assignmentItems></assignments>''')
+    extract_flow(document, store)
+    write, = [edge for edge in store.relationships.values() if edge["relation"] == "writes"]
+    navigation, = [edge for edge in store.relationships.values() if edge["relation"] == "reads"]
+    assert write["target"] == "sf:field:account.name"
+    assert write["qualifiers"]["effect"] == "memory"
+    assert navigation["target"] == "sf:field:contact.accountid"
+    assert navigation["qualifiers"] == {"context": "flow_relationship_navigation"}
+
+
+def test_unresolved_parent_hop_does_not_emit_partial_flow_navigation():
+    document, store = flow('''<start><object>Contact</object>
+<filterFormula>{!$Record.Account.Unknown__r.Name} = 'X'</filterFormula></start>''')
+    extract_flow(document, store)
+    assert not any(edge["relation"] in {"reads", "filters"} for edge in store.relationships.values())
+    assert "sf:field:contact.accountid" not in store.components
+    assert any(d["code"] == "FLOW_RELATIONSHIP_PATH_UNSUPPORTED" for d in store.diagnostics)
 
 
 def test_process_builder_object_is_explicit_and_duplicate_metadata_is_not_chosen():

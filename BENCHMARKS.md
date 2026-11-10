@@ -201,3 +201,33 @@ python memory/runner.py --phase 3 --split locomo --n 300 \
 # Code cross-tool (ERPNext)
 python crosstool/run.py --repo erpnext --max-spend <budget>
 ```
+
+## Local Salesforce benchmark
+
+From the fork checkout, in an environment with the package installed, run:
+
+```sh
+python -m scripts.salesforce_benchmark --extra-flows 0 100 1000 --repeats 3
+```
+
+The benchmark copies the [synthetic Salesforce example](examples/salesforce/) into
+a temporary directory. Larger cases add uniquely named copies of the active
+`SampleNotify` Flow, sharing the same outbound message and payload field. This
+measures the cost of more consumers of one field. The script reports corpus
+counts and medians in milliseconds for three operations:
+
+- Build and publish a fresh snapshot.
+- Run `impact Account.Description` to depth three on a snapshot in memory.
+- Start the viewer, including snapshot verification and graph preparation, and
+  fetch the main page and its local JavaScript and CSS over loopback. Browser
+  rendering time is outside this measurement.
+
+Example run with extractor 0.5.3, Windows 10 and Python 3.11.15, with three
+repetitions per size. These medians describe this machine and this synthetic
+workload.
+
+| Extra Flows | Supported files | Relationships | Build (ms) | Impact (ms) | Viewer start and fetch (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 10 | 25 | 143 | 0.18 | 619 |
+| 100 | 110 | 325 | 381 | 1.50 | 735 |
+| 1,000 | 1,010 | 3,025 | 2,963 | 13.20 | 2,370 |

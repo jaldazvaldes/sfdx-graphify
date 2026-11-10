@@ -7,7 +7,7 @@ remain diagnostics instead of being interpreted as fields of the rule's object.
 from __future__ import annotations
 
 from .formula_refs import formula_references
-from .relationship_paths import resolve_field_path
+from .relationship_paths import add_navigation_reads, resolve_field_path
 from .schema import API_NAME, component_id
 
 _DESCRIPTIVE = {"fullName", "active", "description", "errorConditionFormula", "errorDisplayField", "errorMessage"}
@@ -143,20 +143,8 @@ def _formula(document, node, store, source, owner):
                       }}
         store.relation(source, target, "reads", occurrence, "validation_rule.formula_reference",
                        resolution=resolution, qualifiers={"context": "validation_formula"})
-        for step_number, step in enumerate(resolved["steps"], 1):
-            # Reaching the terminal field also depends on every lookup value.
-            # Keep those reads distinguishable so reverse queries can find a
-            # consumer without treating navigation as a direct formula operand.
-            declaration = store.components.get(step["field"])
-            api_name = declaration["api_name"] if declaration else step["field"].split(":", 2)[2]
-            lookup_owner, lookup_field = api_name.split(".", 1)
-            navigation_location = {**occurrence, "locator": f"{occurrence['locator']}/navigation[{step_number}]"}
-            lookup = store.field(lookup_owner, lookup_field, navigation_location)
-            if lookup is None:
-                continue
-            store.relation(source, lookup, "reads", navigation_location, "validation_rule.formula_navigation",
-                           resolution={**resolution, "navigation_step": {"index": step_number, **step}},
-                           qualifiers={"context": "validation_formula_navigation"})
+        add_navigation_reads(store, source, occurrence, resolution, rule="validation_rule.formula_navigation",
+                             qualifiers={"context": "validation_formula_navigation"})
 
 
 def extract_validation_rule(document, store):

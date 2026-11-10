@@ -172,7 +172,10 @@ def standard_assets(bundle: dict) -> dict[str, tuple[bytes, str]]:
         raise DataError("The upstream Graphify edge data could not be located.")
     edges = json.loads(edge_match.group(1))
     for edge in edges:
-        edge["relationship_details"] = graph[edge["from"]][edge["to"]]["relationship_details"]
+        projected = graph[edge["from"]][edge["to"]]
+        edge["relationship_details"] = projected["relationship_details"]
+        edge["resolution_counts"] = projected["resolution_counts"]
+        edge["resolution_status"] = projected["resolution_status"]
         edge["width"] = 0.7
         edge["color"] = {"color": "#8491a5", "highlight": "#63b3ed", "hover": "#63b3ed",
                          "inherit": False, "opacity": 0.045 if len(edges) > 5000 else 0.18}

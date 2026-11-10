@@ -25,6 +25,7 @@ LIMITATIONS = [
     "A dependency graph does not describe Flow execution order or approved requirements.",
     "Formula references and declared parent relationship paths have bounded support; formula evaluation, arbitrary aliases, layouts and permissions remain outside coverage.",
     "Apex analysis is bounded and static; dynamic queries, unknown types and runtime data flow remain unresolved.",
+    "Candidate static calls through an external caller hierarchy are explicitly marked; verify the missing base before treating dispatch as resolved.",
     "Flow, trigger and validation rule activation metadata describe local XML, not deployed or active org behavior.",
     "Referenced-only targets have not been validated against a complete Salesforce schema.",
 ]
@@ -109,6 +110,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         "activity_policy": activity_policy,
         "component_counts": dict(sorted(Counter(c["kind"] for c in facts["components"]).items())),
         "relationship_counts": dict(sorted(Counter(r["relation"] for r in facts["relationships"]).items())),
+        "candidate_call_count": sum(r.get("qualifiers", {}).get("resolution_status") == "candidate"
+                                    for r in facts["relationships"]),
         "evidence_count": len(facts["evidence"]),
         "diagnostic_counts": dict(sorted(Counter(d["code"] for d in diagnostics).items())),
         "tested_api_versions": list(TESTED_API_VERSIONS),

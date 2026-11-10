@@ -9,7 +9,7 @@ import socket
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlsplit
 
-from .schema import DataError, canonical_json, component_id, stable_id
+from .schema import DataError, canonical_json, component_id, relationship_resolution, stable_id
 from .snapshot import load
 
 if TYPE_CHECKING:
@@ -312,12 +312,18 @@ class SnapshotView:
                                 "source_label": self.components[relation["source"]]["api_name"],
                                 "target_label": self.components[relation["target"]]["api_name"],
                                 "qualifiers": relation.get("qualifiers", {}),
+                                "resolution": relationship_resolution(relation),
                                 "evidence_count": len(relation["evidence_ids"])})
                 total_evidence += len(relation["evidence_ids"])
                 for eid in relation["evidence_ids"][:max(0, 12 - len(preview))]:
-                    preview.append({**evidence_index[eid], "qualifiers": relation.get("qualifiers", {})})
+                    preview.append({**evidence_index[eid], "qualifiers": relation.get("qualifiers", {}),
+                                    "relationship_resolution": relationship_resolution(relation)})
+            candidate_count = sum(record["resolution"]["status"] == "candidate" for record in records)
             edges.append({"id": stable_id("view", key), "source": source, "target": target,
                           "relation": kind, "change": change, "relationships": records,
+                          "resolution_counts": {"candidate": candidate_count, "extracted": len(records) - candidate_count},
+                          "resolution_status": ("mixed" if 0 < candidate_count < len(records)
+                                                else "candidate" if candidate_count else "extracted"),
                           "relationship_count": len(records), "evidence_count": total_evidence,
                           "evidence": preview, "evidence_truncated": total_evidence > len(preview)})
         note = ("Incoming dependencies identify candidates to inspect, not proven runtime effects."
@@ -378,7 +384,7 @@ class SnapshotView:
             raise DataError("No matching relationship in that snapshot.")
         relation = relations[rid]
         identifiers = relation["evidence_ids"]
-        return {"relationship": relation, "snapshot": snapshot,
+        return {"relationship": relation, "resolution": relationship_resolution(relation), "snapshot": snapshot,
                 "results": [index[eid] for eid in identifiers[offset:offset + EVIDENCE_LIMIT]],
                 "total": len(identifiers), "offset": offset,
                 "next_offset": offset + EVIDENCE_LIMIT if offset + EVIDENCE_LIMIT < len(identifiers) else None}

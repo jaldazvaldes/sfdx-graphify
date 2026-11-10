@@ -15,6 +15,91 @@ from .schema import API_NAME, FactStore, component_id
 _EVENTS = frozenset({"before_insert", "before_update", "before_delete", "after_insert",
                      "after_update", "after_delete", "after_undelete"})
 _CONTEXT_RECORDS = frozenset({"new", "old", "newmap", "oldmap"})
+_FFLIB = "fflib_sobjectdomain"
+# Single-Type dispatcher and matching event hooks in the public fflib contract:
+# https://github.com/apex-enterprise-patterns/fflib-apex-common/blob/master/sfdx-source/apex-common/main/classes/fflib_SObjectDomain.cls
+_FFLIB_EVENT_METHODS = {
+    "before_insert": ("beforeinsert", ()),
+    "before_update": ("beforeupdate", ("map<id,sobject>",)),
+    "before_delete": ("beforedelete", ()),
+    "after_insert": ("afterinsert", ()),
+    "after_update": ("afterupdate", ("map<id,sobject>",)),
+    "after_delete": ("afterdelete", ()),
+    "after_undelete": ("afterundelete", ()),
+}
+
+
+def _list_parameter(unit, declaration):
+    """Return the name and element type of one literal List<T> parameter."""
+    parameters = _significant(declaration.child_by_field_name("parameters"))
+    if len(parameters) != 1 or parameters[0].type != "formal_parameter":
+        return None
+    parameter = parameters[0]
+    declared_type = parameter.child_by_field_name("type")
+    if declared_type is None or declared_type.type != "generic_type":
+        return None
+    parts = _significant(declared_type)
+    if len(parts) != 2 or unit.text(parts[0]).casefold() != "list":
+        return None
+    types = _significant(parts[1])
+    if len(types) != 1 or types[0].type != "type_identifier":
+        return None
+    return unit.text(parameter.child_by_field_name("name")).casefold(), unit.text(types[0]).casefold()
+
+
+def _fflib_constructor(unit, owner):
+    """Prove the bounded public nested factory creates this concrete domain."""
+    members = _significant(unit.class_node.child_by_field_name("body"))
+    factories = [node for node in members if node.type == "class_declaration"
+                 and unit.text(node.child_by_field_name("name")).casefold() == "constructor"]
+    if len(factories) != 1:
+        return None
+    factory = factories[0]
+    flags, _ = _modifiers(unit.data, factory)
+    if ("abstract" in flags or not flags & {"public", "global"}
+            or factory.child_by_field_name("superclass") is not None):
+        return None
+    interfaces = _significant(factory.child_by_field_name("interfaces"))
+    if len(interfaces) != 1 or not any(
+            tuple(unit.text(part).casefold() for part in _significant(interface)) == (_FFLIB, "iconstructable")
+            for interface in _significant(interfaces[0]) if interface.type == "scoped_type_identifier"):
+        return None
+    factory_members = _significant(factory.child_by_field_name("body"))
+    factory_constructors = [node for node in factory_members if node.type == "constructor_declaration"]
+    if factory_constructors:
+        no_argument = [node for node in factory_constructors if not _significant(node.child_by_field_name("parameters"))]
+        if len(no_argument) != 1 or not _modifiers(unit.data, no_argument[0])[0] & {"public", "global"}:
+            return None
+    constructs = [node for node in factory_members if node.type == "method_declaration"
+                  and unit.text(node.child_by_field_name("name")).casefold() == "construct"
+                  and (parameter := _list_parameter(unit, node)) is not None and parameter[1] == "sobject"]
+    if len(constructs) != 1:
+        return None
+    construct = constructs[0]
+    flags, _ = _modifiers(unit.data, construct)
+    if ("static" in flags or not flags & {"public", "global"}
+            or unit.text(construct.child_by_field_name("type")).casefold() != _FFLIB):
+        return None
+    statements = _significant(construct.child_by_field_name("body"))
+    if len(statements) != 1 or statements[0].type != "return_statement":
+        return None
+    expressions = _significant(statements[0])
+    if len(expressions) != 1 or expressions[0].type != "object_creation_expression":
+        return None
+    construction = expressions[0]
+    arguments = _significant(construction.child_by_field_name("arguments"))
+    parameter = _list_parameter(unit, construct)
+    if (unit.text(construction.child_by_field_name("type")).casefold() != unit.name.casefold()
+            or len(arguments) != 1 or arguments[0].type != "identifier"
+            or parameter is None or unit.text(arguments[0]).casefold() != parameter[0]):
+        return None
+    constructors = [node for node in members if node.type == "constructor_declaration"
+                    and len(_significant(node.child_by_field_name("parameters"))) == 1]
+    if len(constructors) != 1 or (parameter := _list_parameter(unit, constructors[0])) is None:
+        return None
+    if parameter[1] not in {owner.casefold(), "sobject"}:
+        return None
+    return construction, constructors[0]
 
 
 @dataclass
@@ -303,7 +388,7 @@ class _TriggerExtractor(_MethodExtractor):
                       {"basis": "local_custom_setting_metadata", "object": owner})
         elif name.casefold() == "get" and self._trigger_context(receiver) in _CONTEXT_RECORDS and len(arguments) == 1:
             self.visit(receiver)
-        else:
+        elif not self._fflib_dispatch(node, receiver, name, arguments):
             static = bool(receiver is not None and receiver.type == "identifier"
                           and not self.has_binding(self.unit.text(receiver), node))
             cid = self._local_class(self.unit.text(receiver)) if static else self._constructed_class(receiver, node)
@@ -323,8 +408,76 @@ class _TriggerExtractor(_MethodExtractor):
             else:
                 self.diagnostic("TRIGGER_CALL_UNRESOLVED", "Call target requires unavailable, ambiguous or inherited dispatch analysis.",
                                 node, "ambiguous" if len(candidates) > 1 else "unresolved")
+        # An fflib domain literal also keeps its independent class reference.
         for argument in arguments:
             self.visit(argument)
+
+    def _fflib_dispatch(self, node, receiver, name, arguments):
+        # A local framework implementation may have different dispatch semantics.
+        # Apply the public contract only when the exact base is external.
+        if (receiver is None or receiver.type != "identifier" or self.unit.text(receiver).casefold() != _FFLIB
+                or name.casefold() != "triggerhandler" or len(arguments) != 1
+                or _FFLIB in self.index.apex_types or self.has_binding(_FFLIB, node)):
+            return False
+        literal = arguments[0]
+        if literal.type != "field_access" or self.unit.text(literal.child_by_field_name("field")).casefold() != "class":
+            return False
+        domain_token = literal.child_by_field_name("object")
+        domain_name = self.unit.text(domain_token)
+        if domain_token is None or domain_token.type != "identifier" or self.has_binding(domain_name, literal):
+            return False
+        domain_id = self._local_class(domain_name)
+        domains = [unit for unit in self.index.units if unit.class_id == domain_id]
+        if len(domains) != 1:
+            return False
+        domain = domains[0]
+        if ((domain.superclass_name or "").casefold() != _FFLIB
+                or "abstract" in _modifiers(domain.data, domain.class_node)[0]
+                or domain.declared_types & {_FFLIB, domain.name.casefold(), "list", "map", "sobject", "id"}):
+            return False
+        binding = _fflib_constructor(domain, self.owner)
+        if binding is None:
+            return False
+        construct_site, constructor = binding
+        methods = self.index.methods[domain_id]
+        methods_by_name = {}
+        for method in methods:
+            methods_by_name.setdefault(method.name.casefold(), []).append(method)
+        location = self.unit.location(node)
+        for event in self.store.components[self.method.id]["trigger_events"]:
+            suffix, parameter_types = _FFLIB_EVENT_METHODS[event]
+            if "handle" + suffix in methods_by_name:
+                self.store.diagnostic("TRIGGER_FFLIB_HANDLER_UNSUPPORTED",
+                                      "A local fflib handler may bypass the default event hook.",
+                                      location, trigger_event=event)
+                continue
+            hooks = methods_by_name.get("on" + suffix, [])
+            if not hooks:
+                continue
+            matches = [hook for hook in hooks if tuple(item.casefold() for item in hook.parameter_types) == parameter_types]
+            if len(matches) != 1 or not self._fflib_hook(matches[0]):
+                self.store.diagnostic("TRIGGER_FFLIB_HOOK_UNRESOLVED",
+                                      "The local fflib hook name lacks a unique compatible event override.",
+                                      location, state="unresolved", trigger_event=event)
+                continue
+            hook = matches[0]
+            self.store.relation(self.method.id, hook.id, "calls", location,
+                                "trigger.fflib_event_dispatch",
+                                qualifiers={"invocation": "fflib_event_dispatch", "trigger_event": event,
+                                            "resolution_status": "candidate", "uncertainty": "fflib_event_dispatch"},
+                                resolution={"basis": "fflib_sobjectdomain_type_contract", "class": domain.class_id,
+                                            "dispatcher": "fflib_SObjectDomain.triggerHandler(Type)",
+                                            "class_literal": self.unit.location(literal),
+                                            "construct_site": domain.location(construct_site),
+                                            "constructor": domain.location(constructor), "hook": domain.location(hook.node),
+                                            "conditional": True, "parser": PARSER_VERSION})
+        return True
+
+    def _fflib_hook(self, hook):
+        flags, _ = _modifiers(hook.unit.data, hook.node)
+        return (not self.store.is_ambiguous(hook.id) and not hook.static and "override" in flags
+                and bool(flags & {"public", "global"}) and hook.unit.text(hook.node.child_by_field_name("type")).casefold() == "void"
+                and hook.node.child_by_field_name("body") is not None)
 
     def _constructed_virtual_dispatch(self, concrete_class, entry_method, call_node):
         """Retain overrides actually called by a proven inherited entry body.
@@ -356,9 +509,11 @@ class _TriggerExtractor(_MethodExtractor):
             self.store.relation(self.method.id, derived[0].id, "calls", self.unit.location(call_node),
                                 "trigger.constructed_virtual_dispatch",
                                 qualifiers={"invocation": "constructed_virtual_dispatch", "entry_method": entry_method.id,
-                                            "trigger_events": events},
+                                            "trigger_events": events, "resolution_status": "candidate",
+                                            "uncertainty": "conditional_virtual_dispatch"},
                                 resolution={"basis": "explicit_constructor_and_local_virtual_call", "class": concrete_class,
                                             "dispatch_site": entry_method.unit.location(invocation),
+                                            "hook": derived[0].unit.location(derived[0].node),
                                             "conditional": True, "parser": PARSER_VERSION})
 
 

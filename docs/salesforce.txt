@@ -1,15 +1,25 @@
-sfdx-graphify 0.5.2: local Salesforce dependency evidence
+sfdx-graphify 0.5.4
+Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
 endorsed by Graphify Labs or Salesforce. Preserve LICENSE, LICENSE-MIT and NOTICE.
 
-Run from an isolated Python 3.10+ environment with this checkout installed.
-Install the fixed fork release with:
+Use an isolated Python 3.10+ environment. Install from the fork checkout.
+
+  python -m pip install .
+
+This command installs the previous tagged release.
 
   python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.2"
 
-The Salesforce extractor reports 0.5.2; the inherited graphifyy package keeps
-its upstream version. The sfdx-prefixed Git tag identifies the fork release.
+The Salesforce CLI reports its own version via sfdx-graphify --version. The
+inherited graphifyy package keeps its upstream version. The sfdx-prefixed Git
+tag identifies a fork release.
+Use a fresh environment when changing fork releases. To replace a wheel in an
+existing isolated environment with the same dependencies, run
+python -m pip install --force-reinstall --no-deps <wheel> and verify the CLI
+version. A plain wheel install can keep the previous fork at the same package
+version.
 The module form works without installing the console script:
 
   python -m graphify.salesforce guide
@@ -69,6 +79,9 @@ Each nonblank input line receives one JSON line with id, exit_code and result.
 result is identical to the corresponding regular query, including every evidence
 occurrence, coverage, totals and truncation indicators. A malformed request or
 query error returns its own exit_code without stopping subsequent requests.
+Invalid UTF-8 frames, excessively nested JSON and unpaired Unicode surrogates
+in request strings receive an error response. The HTTP service applies the same
+JSON validation and returns HTTP 400 for these malformed requests.
 Startup errors stop the process; readiness and startup errors go to stderr.
 The session process exits normally at EOF even if some requests failed, so check
 each response's exit_code. Windows stdin/stdout use UTF-8; PowerShell pipelines
@@ -121,6 +134,9 @@ condition logic. Formula resources and start filterFormula expressions contribut
 bounded lexical field references, ignoring quoted strings and comments. Resource
 typing and declared parent paths determine the owning object; formulas are not
 evaluated. Unsupported formula contexts and ambiguous names remain diagnostic.
+When a typed Flow reference or formula resolves a complete parent path, reads
+with context flow_relationship_navigation identify each lookup used to reach the
+terminal field. The original read, write or filter on that field remains separate.
 Every relationship keeps its individual
 source occurrences, parser line/column when available, structural XML locator,
 input hash, extraction rule and typing evidence. Source excerpts are not stored.
@@ -162,8 +178,12 @@ instances support bounded method dispatch. Literal class references and locally
 corroborated managed namespace calls retain referenced-only external targets.
 Classes with a fully resolved local superclass chain also resolve static class
 calls, Database operations and corroborated namespace calls when local or
-inherited members do not shadow the qualifier. Unknown, ambiguous, cyclic or
-unparsed superclass chains remain diagnostic instead of implying a static call.
+inherited members do not shadow the qualifier. A class-qualified call may be
+recorded as a candidate when the only gap in the caller's hierarchy is an absent
+ancestor and there is exactly one accessible local static target. This requires
+a fully resolved target hierarchy and no shadowing in the known caller scopes.
+Ambiguous, cyclic or unparsed local ancestors remain diagnostic. This candidate
+rule applies to local class-qualified calls.
 Recognized namespace receivers are treated as class qualifiers rather than
 record fields; their arguments still contribute dependencies and diagnostics.
 An enhanced for loop with an explicitly declared single-record element type
@@ -173,7 +193,18 @@ This uses the declared element type, not inference from a collection or a
 method's return value. Unknown, primitive and collection-valued element types
 remain outside coverage. Assigning a field is not proof of a database write.
 Parent paths in static SOQL resolve through declared lookup targets and a small
-explicit standard-schema vocabulary, with the traversal retained in evidence.
+explicit standard-schema vocabulary. For both classes and triggers, fully
+resolved paths produce reads for each traversed lookup with context
+apex_soql_navigation. Flow, SOQL and validation-rule navigation evidence records
+the full path, lookup and target for each hop. The terminal dependency keeps its
+original relation and evidence.
+SOQL and Flow resolve explicit standard parent pairs in the tested API 64.0
+vocabulary. Case and Opportunity have Account and Contact paths. Order has
+Account, BillToContact and ShipToContact paths. User.Profile uses ProfileId.
+Account, Case, Contact, Lead, Opportunity and Order also have CreatedBy and
+RecordType paths. RecordType availability depends on org configuration.
+Contradictory local metadata blocks a standard fallback. A compound path such
+as CreatedBy.Profile.Name retains both lookup reads and the terminal field.
 Trigger declarations retain their object and event list with original source
 lines. Bounded trigger analysis covers literal static handlers, proven concrete
 construction/dispatch and typed Trigger context records. Construction references
@@ -182,11 +213,25 @@ virtual invocations on the constructed type as conditional candidates; trigger
 events are context, never an inference from a method's name. A byte-preserving
 parser workaround for Trigger context accesses retains original source positions
 and hashes. When a body still fails, a valid parsed header retains object/events.
+The fflib_SObjectDomain.triggerHandler(Domain.class) pattern can yield candidate
+calls to the domain's overrides for the events declared on the trigger. The
+extractor verifies the literal dispatcher, the domain type and its IConstructable
+factory, and matches the override signature to the event. Evidence records the
+trigger invocation, the factory and the hook. This analysis follows the public
+fflib dispatch convention when the library source is absent. Dynamic dispatch,
+ambiguous types and event overrides outside this convention remain diagnostic.
 Call edges are static candidates, not execution traces. Unknown receiver types,
 same-arity overloads, external hierarchies, query aliases, dynamic queries,
 polymorphic/unresolved paths and remaining parse failures are diagnosed rather
 than guessed. General collection/map aliases, constructor/initializer bodies and
 inner-class analysis remain outside this bounded implementation.
+
+Queries expose candidates as resolution.status=candidate with confidence
+AMBIGUOUS, a reason and source evidence. Reasons distinguish external caller
+hierarchy, conditional virtual dispatch and the fflib event convention. External
+hierarchy candidates also include the missing ancestors. The viewer marks
+candidate edges and shows their evidence. In impact results,
+traversal.candidate_relationship_ids lists the candidates on the reported path.
 
 Apex class/method is_test metadata comes from AST annotations and legacy
 testMethod modifiers. Helpers inside a test class inherit its classification;
@@ -263,6 +308,10 @@ locally. Git projects use current bytes of tracked files, plus configuration;
 --include-untracked explicitly adds untracked files allowed by Git ignore rules.
 Non-Git projects use filesystem discovery with built-in exclusions. The manifest
 records the exact selection policy, input hashes, working-tree state and scope.
+For Git working trees, dirty state compares selected files with HEAD using Git's
+built-in normalization, including line endings. Source hashes still cover the
+actual working-tree bytes. For files with a custom Git filter, the comparison
+uses raw bytes and emits git_filter_dirty_raw_fallback.
 Common Git-style .forceignore rules apply to both tracked and untracked files,
 including directory pruning and negation; exact Salesforce CLI parity is not
 asserted. Non-Git .gitignore semantics are explicitly diagnosed. Links and
@@ -382,23 +431,37 @@ option pages through all file diagnostics without discarding canonical records.
 With --before, the viewer compares canonical facts and their evidence. It also
 discloses extractor/schema/scope/source-input differences: added edges after an
 extractor upgrade can mean expanded coverage, not a source or runtime change.
-Version stamps alone do not mark evidence as changed. Schema versions 1, 2, 3
-and 4 remain readable; new builds emit version 5. The viewer does not rescan source,
-so freshness remains unknown; use status --source separately to verify it.
+Version stamps alone do not mark evidence as changed. Schema versions 1 through 6
+remain readable. New builds emit schema 7 for the additional dispatch candidate
+reasons. Rebuild from source and restart pinned sessions and viewers to load the
+new generation. Verify source freshness separately with status --source. Record
+the extractor revision with the snapshot ID. Start the query server with
+--expect-snapshot and check the viewer's /api/meta for the same ID.
 
 SYNTHETIC EXAMPLE
 
-examples/salesforce contains fictional extraction fixtures only. To try them
-before adding the files to Git, use --include-untracked and external output:
+examples/salesforce contains fictional extraction fixtures only. From the fork
+checkout, use an output directory outside the project and tool repository.
 
-  python -m graphify.salesforce build examples/salesforce --include-untracked --include-inactive --out <external-demo-directory>
+  python -m graphify.salesforce build examples/salesforce --include-inactive --out <external-demo-directory>
   python -m graphify.salesforce refs Contact.LastName --snapshot <external-demo-directory>
   python -m graphify.salesforce deps SampleAccount --snapshot <external-demo-directory>
   python -m graphify.salesforce view Contact.LastName --snapshot <external-demo-directory> --depth 2
   python -m graphify.salesforce serve --snapshot <external-demo-directory>
 
-The example Flows are Draft metadata. --include-inactive above includes them
-only for this synthetic demonstration; normal project builds exclude Draft.
+SampleAccount and SampleChild use Draft metadata. --include-inactive above
+includes them for this demonstration. SampleNotify, its outbound message and
+SampleAccountTrigger are included by default. The impact query exposes the
+candidate call with the absent SampleExternalBase ancestor.
+
+  sfdx-graphify impact Account.Description --snapshot <external-demo-directory> --depth 3
+
+Pass --include-untracked if testing eligible additions in a Git checkout before
+they are tracked. Fork CI builds and installs a wheel in a fresh environment on
+Windows and Linux, exercises the fictional project using
+scripts/salesforce_smoke.py, and runs the Salesforce regression suite. A Git
+tag beginning with sfdx-v must match the installed Salesforce CLI version.
+BENCHMARKS.md describes measurements on larger synthetic Salesforce projects.
 
 AGENT USE
 

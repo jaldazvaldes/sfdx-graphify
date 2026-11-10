@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize("scenario", ["snapshot", "page", "new-view", "diagnostics", "diagnostic-snapshot"])
+@pytest.mark.parametrize("scenario", ["snapshot", "page", "new-view", "diagnostics", "diagnostic-snapshot", "candidate"])
 def test_explorer_ignores_obsolete_responses(scenario):
     node = shutil.which("node")
     if node is None:

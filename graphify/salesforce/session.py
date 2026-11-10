@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import sys
 from typing import TextIO
 
@@ -18,13 +19,14 @@ _OPTIONS = {
     "impact": frozenset({"name", "relation", "limit", "depth", "exclude_tests", "diagnostics"}),
     "explain": frozenset({"name"}),
 }
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 def _unique_keys(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"Duplicate request key: {key}")
+            raise ValueError(f"Duplicate request key: {key!r}")
         result[key] = value
     return result
 
@@ -58,8 +60,19 @@ def _validate(request: object) -> tuple[str, dict]:
 
 
 def parse_request(text: str) -> object:
-    """Decode a JSON request without silently overriding duplicate keys."""
-    return json.loads(text, object_pairs_hook=_unique_keys)
+    """Decode JSON with duplicate-key and Unicode checks for the request envelope."""
+    try:
+        request = json.loads(text, object_pairs_hook=_unique_keys)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep.") from exc
+    # Requests are flat. Nested option values fail type validation without being
+    # echoed, while keys and string values can appear in response IDs and errors.
+    if isinstance(request, dict) and any(
+        _SURROGATE.search(key) or (isinstance(value, str) and _SURROGATE.search(value))
+        for key, value in request.items()
+    ):
+        raise ValueError("JSON request strings contain an unpaired Unicode surrogate.")
+    return request
 
 
 def answer_request(bundle: dict, request: object) -> dict:
@@ -86,7 +99,9 @@ def run_session(directory: Path, *, expect_snapshot: str | None = None,
     the session. Startup integrity or expected-ID failures do stop it. Source
     verification is deliberately separate; cached data never implies freshness.
     """
-    incoming = input_stream if input_stream is not None else sys.stdin
+    # Decode each frame independently so invalid UTF-8 cannot interrupt iteration
+    # over stdin or discard adjacent requests buffered by a text stream.
+    incoming = input_stream if input_stream is not None else getattr(sys.stdin, "buffer", sys.stdin)
     outgoing = output_stream if output_stream is not None else sys.stdout
     errors = error_stream if error_stream is not None else sys.stderr
     bundle = (snapshot.load(directory, expect_snapshot=expect_snapshot) if expect_snapshot is not None
@@ -97,14 +112,17 @@ def run_session(directory: Path, *, expect_snapshot: str | None = None,
     print(f"Query session ready: {snapshot_id}. Snapshot pinned until EOF; source freshness is unknown.",
           file=errors, flush=True)
     for line in incoming:
-        if not line.strip():
-            continue
         try:
-            response = answer_request(bundle, parse_request(line))
+            text = line.decode("utf-8") if isinstance(line, bytes) else line
+            if not text.strip():
+                continue
+            request = parse_request(text)
         except ValueError as exc:
             result = query.envelope(bundle, [])
             result["error"] = f"Invalid JSON request: {exc}"
             response = {"id": None, "exit_code": 2, "result": result}
+        else:
+            response = answer_request(bundle, request)
         print(json.dumps(response, ensure_ascii=False, sort_keys=True, allow_nan=False),
               file=outgoing, flush=True)
     return 0

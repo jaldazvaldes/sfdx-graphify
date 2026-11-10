@@ -125,7 +125,7 @@ def create_query_server(directory: Path, host: str = "127.0.0.1", port: int = 87
                 if len(body) != size:
                     return self.respond(400, _error(bundle, "Incomplete query request."))
                 request = parse_request(body.decode("utf-8"))
-            except (UnicodeError, ValueError, RecursionError, TimeoutError) as exc:
+            except (ValueError, TimeoutError) as exc:
                 return self.respond(400, _error(bundle, f"Invalid JSON request: {exc}"))
             return self.respond(200, answer_request(bundle, request))
 
@@ -170,7 +170,7 @@ def request_query(server_url: str, request: dict, *, expected_snapshot: str | No
         raise DataError("Expected snapshot must be a nonempty ASCII identifier without whitespace.")
     try:
         payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise DataError(f"Invalid query request: {exc}") from exc
     if len(payload) > _REQUEST_LIMIT:
         raise DataError("Query request exceeds 1 MiB; no request or response data was truncated.")

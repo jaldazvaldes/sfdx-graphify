@@ -128,6 +128,164 @@ def test_git_deletion_and_empty_rebuild_remove_obsolete_facts(tmp_path):
     assert load(out)["facts"]["components"] == []
 
 
+@pytest.mark.parametrize("autocrlf,attributes,working,modified", [
+    ("true", "", b"<Flow>\r\n</Flow>\r\n", 0),
+    ("input", "", b"<Flow>\r\n</Flow>\r\n", 0),
+    ("false", "*.xml text eol=lf\n", b"<Flow>\r\n</Flow>\r\n", 0),
+    ("false", "*.xml text=auto\n", b"<Flow>\r\n</Flow>\n", 0),
+    ("true", "*.xml -text\n", b"<Flow>\r\n</Flow>\r\n", 1),
+    ("false", "", b"<Flow>\r\n</Flow>\r\n", 1),
+    ("true", "", b"<Flow>\r\nchanged\r\n</Flow>\r\n", 1),
+])
+def test_dirty_obeys_git_eol_without_changing_source_hashes(tmp_path, autocrlf, attributes, working, modified):
+    root = project(tmp_path / "source")
+    put(root, FLOW, "<Flow>\n</Flow>\n")
+    if attributes:
+        put(root, ".gitattributes", attributes)
+    commit(root)
+    git(root, "config", "core.autocrlf", autocrlf)
+    before = discover(root)
+    (root / FLOW).write_bytes(working)
+    index_before = (root / ".git/index").read_bytes()
+    scan = discover(root)
+    assert scan.scope["changes_from_head"] == {"modified": modified, "added": 0, "deleted": 0}
+    assert scan.scope["dirty_basis"] == "git_normalized_working_tree_vs_head_with_raw_filter_fallback"
+    assert scan.inputs[FLOW] == hashlib.sha256(working).hexdigest()
+    assert scan.files[FLOW] == working
+    assert (root / ".git/index").read_bytes() == index_before
+    with pytest.raises(DataError, match="changed during"):
+        before.assert_unchanged()
+
+
+def test_dirty_does_not_normalize_binary_or_crlf_already_committed(tmp_path):
+    root = project(tmp_path / "source")
+    put(root, FLOW, "<Flow>\r\n</Flow>\r\n")
+    binary = root / "force-app/binary.resource"
+    binary.write_bytes(b"binary\0one\ntwo\n")
+    commit(root)
+    git(root, "config", "core.autocrlf", "true")
+    put(root, FLOW, "<Flow>\n</Flow>\n")
+    binary.write_bytes(b"binary\0one\r\ntwo\r\n")
+    assert discover(root).scope["changes_from_head"]["modified"] == 2
+
+
+def test_dirty_ignores_source_index_stat_cache_and_assume_unchanged(tmp_path):
+    root = project(tmp_path / "source")
+    commit(root)
+    path = root / FLOW
+    before = path.stat()
+    git(root, "update-index", "--assume-unchanged", FLOW)
+    path.write_bytes(path.read_bytes().replace(b"64.0", b"63.0"))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    index_before = (root / ".git/index").read_bytes()
+    assert discover(root).scope["changes_from_head"]["modified"] == 1
+    assert (root / ".git/index").read_bytes() == index_before
+
+
+@pytest.mark.parametrize("filter_kind", ["clean", "process"])
+def test_dirty_never_executes_project_filters_or_helpers(tmp_path, filter_kind):
+    root = project(tmp_path / "source")
+    put(root, FLOW, "<Flow>\n</Flow>\n")
+    put(root, ".gitattributes", "*.xml filter=sentinel diff=sentinel text\n")
+    commit(root)
+    marker = root / "executed.txt"
+    # A command that would leave evidence and fail if Git executes any helper.
+    command = "echo executed > executed.txt; exit 1"
+    for key in (f"filter.sentinel.{filter_kind}", "diff.sentinel.command", "diff.sentinel.textconv",
+                "diff.external", "core.fsmonitor"):
+        git(root, "config", key, command)
+    git(root, "config", "filter.sentinel.required", "true")
+    hook = root / ".git/hooks/post-index-change"
+    hook.write_text("#!/bin/sh\nprintf executed > hook-fired.txt\n", encoding="utf-8", newline="")
+    hook.chmod(0o755)
+    put(root, FLOW, "<Flow>\r\n</Flow>\r\n")
+    index_before = (root / ".git/index").read_bytes()
+    scan = discover(root)
+    assert not marker.exists()
+    assert not (root / "hook-fired.txt").exists()
+    assert (root / ".git/index").read_bytes() == index_before
+    assert scan.scope["changes_from_head"]["modified"] == 1
+    diagnostics = [d for d in scan.diagnostics if d["code"] == "git_filter_dirty_raw_fallback"]
+    assert [d["location"]["path"] for d in diagnostics] == [FLOW]
+
+
+def test_dirty_stays_within_nested_project_scope(tmp_path):
+    repository = tmp_path / "repository"
+    root = project(repository / "nested")
+    put(repository, "outside.txt", "unchanged\n")
+    commit(repository)
+    put(repository, "outside.txt", "changed\n")
+    assert discover(root).dirty is False
+    put(root, FLOW, "<Flow>changed</Flow>")
+    assert discover(root).scope["changes_from_head"]["modified"] == 1
+
+
+def test_dirty_reads_conflicted_working_file_without_touching_conflict_index(tmp_path):
+    root = project(tmp_path / "source")
+    commit(root)
+    oid = git(root, "rev-parse", "HEAD:" + FLOW).decode().strip()
+    entries = f"0 {'0' * 40}\t{FLOW}\n" + "".join(
+        f"100644 {oid} {stage}\t{FLOW}\n" for stage in (1, 2, 3))
+    result = subprocess.run(["git", "-C", str(root), "update-index", "--index-info"],
+                            input=entries.encode(), capture_output=True, shell=False,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    assert result.returncode == 0, result.stderr
+    put(root, FLOW, "<Flow>local conflict resolution</Flow>")
+    index_before = (root / ".git/index").read_bytes()
+    assert discover(root).scope["changes_from_head"]["modified"] == 1
+    assert (root / ".git/index").read_bytes() == index_before
+    assert len(git(root, "ls-files", "--unmerged", "--", FLOW).splitlines()) == 3
+
+
+def test_dirty_added_deleted_and_optional_untracked_counts(tmp_path):
+    root = project(tmp_path / "source")
+    commit(root)
+    (root / FLOW).unlink()
+    staged = "force-app/main/default/classes/Staged.cls"
+    put(root, staged, "class Staged {}")
+    git(root, "add", staged)
+    put(root, "force-app/main/default/classes/Untracked.cls", "class Untracked {}")
+    assert discover(root).scope["changes_from_head"] == {"modified": 0, "added": 1, "deleted": 1}
+    assert discover(root, include_untracked=True).scope["changes_from_head"] == {
+        "modified": 0, "added": 2, "deleted": 1}
+
+
+@pytest.mark.parametrize("before,staged,modified", [
+    ("*.xml text\n", "*.xml -text\n", 1),
+    ("*.xml -text\n", "*.xml text\n", 0),
+    (None, "*.xml text\n", 0),
+    ("*.xml text\n", None, 1),
+])
+def test_dirty_preserves_missing_working_attributes_index_fallback(tmp_path, before, staged, modified):
+    repository = tmp_path / "repository"
+    root = project(repository / "nested")
+    put(root, FLOW, "<Flow>\n</Flow>\n")
+    if before:
+        put(repository, ".gitattributes", before)
+    commit(repository)
+    if staged:
+        put(repository, ".gitattributes", staged)
+        git(repository, "add", ".gitattributes")
+        (repository / ".gitattributes").unlink()
+    else:
+        git(repository, "rm", ".gitattributes")
+    put(root, FLOW, "<Flow>\r\n</Flow>\r\n")
+    index_before = (repository / ".git/index").read_bytes()
+    assert discover(root).scope["changes_from_head"]["modified"] == modified
+    assert (repository / ".git/index").read_bytes() == index_before
+
+
+def test_dirty_attribute_file_itself_still_compares_with_head(tmp_path):
+    root = project(tmp_path / "source")
+    put(root, FLOW, "<Flow>\n</Flow>\n")
+    put(root, "force-app/.gitattributes", "*.xml text\n")
+    commit(root)
+    put(root, "force-app/.gitattributes", "*.xml -text\n")
+    git(root, "add", "force-app/.gitattributes")
+    put(root, FLOW, "<Flow>\r\n</Flow>\r\n")
+    assert discover(root).scope["changes_from_head"]["modified"] == 2
+
+
 @pytest.mark.parametrize("change", ["file", "configuration", "new_file"])
 def test_mutation_guard_covers_inputs_and_scope(tmp_path, change):
     root = project(tmp_path / "source")

@@ -1,0 +1,61 @@
+name: Salesforce fork CI
+
+on:
+  push:
+    branches: [main, feat/salesforce-local-graph]
+    tags: ["sfdx-v*"]
+  pull_request:
+    branches: [main, feat/salesforce-local-graph]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  salesforce:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Build and smoke-test an installed wheel
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $dist = Join-Path $env:RUNNER_TEMP sfdx-wheel
+          $venv = Join-Path $env:RUNNER_TEMP sfdx-venv
+          uv build --wheel --out-dir $dist
+          $wheels = @(Get-ChildItem -LiteralPath $dist -Filter '*.whl' -File)
+          if ($wheels.Count -ne 1) { throw 'Expected one Salesforce fork wheel.' }
+          uv venv --python '${{ matrix.python }}' $venv
+          $bin = Join-Path $venv ($IsWindows ? 'Scripts' : 'bin')
+          $python = Join-Path $bin ($IsWindows ? 'python.exe' : 'python')
+          $cli = Join-Path $bin ($IsWindows ? 'sfdx-graphify.exe' : 'sfdx-graphify')
+          uv pip install --python $python $wheels[0].FullName
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^sfdx-v', ''
+            if ((& $cli --version) -ne "sfdx-graphify $version") {
+              throw 'Salesforce extractor version does not match the release tag.'
+            }
+          }
+          & $python scripts/salesforce_smoke.py $cli
+      - name: Run Salesforce regression tests from the checkout
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $venv = Join-Path $env:RUNNER_TEMP sfdx-venv
+          $python = Join-Path $venv ($IsWindows ? 'Scripts/python.exe' : 'bin/python')
+          uv pip install --python $python 'pytest>=9.0.3'
+          & $python -m pytest tests/salesforce -q --tb=short

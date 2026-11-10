@@ -3,6 +3,7 @@ import hashlib
 
 import pytest
 
+from graphify.salesforce import query
 from graphify.salesforce.apex import extract_apex, index_apex
 from graphify.salesforce.inventory import extract_inventory, index_definitions
 from graphify.salesforce.schema import DataError, FactStore, component_id
@@ -34,18 +35,49 @@ def lookup(owner="Inspection__c", name="Device__c", targets=("Asset",)):
 
 
 def test_parent_soql_path_resolves_terminal_owner_and_retains_chain_evidence():
-    store = build([("Reader", "public class Reader { public void read() { List<Inspection__c> rows = "
-                   "[SELECT Device__r.Product2.Serial__c FROM Inspection__c WHERE Device__r.Product2.Name != null]; } }")],
-                  metadata=[lookup()])
+    code = ("public class Reader { public void read() { List<Inspection__c> rows = "
+            "[SELECT Device__r.Product2.Serial__c FROM Inspection__c WHERE Device__r.Product2.Name != null]; } }")
+    store = build([("Reader", code)], metadata=[lookup()])
     fields = [edge for edge in store.relationships.values() if edge["source"] == "sf:apexmethod:reader.read"
-              and store.components[edge["target"]]["kind"] == "field"]
+              and store.components[edge["target"]]["kind"] == "field"
+              and edge["qualifiers"].get("context") != "apex_soql_navigation"]
     assert {(store.components[e["target"]]["api_name"], e["relation"]) for e in fields} == {
         ("Product2.Serial__c", "reads"), ("Product2.Name", "filters")}
     evidence = store.evidence[fields[0]["evidence_ids"][0]]
     assert evidence["resolution"]["steps"] == [
         {"field": "sf:field:inspection__c.device__c", "target": "sf:object:asset", "basis": "declared_lookup"},
         {"field": "sf:field:asset.product2id", "target": "sf:object:product2", "basis": "standard_schema"}]
+    assert "navigation_step" not in evidence["resolution"]
     assert "sf:field:inspection__c.serial__c" not in store.components
+    bundle = {"manifest": {"snapshot_id": "synthetic"}, "facts": store.finish(), "diagnostics": store.diagnostics}
+    for step, field_name in enumerate(("Inspection__c.Device__c", "Asset.Product2Id"), 1):
+        results = query.refs(bundle, field_name, relation="reads")["results"]
+        assert {edge["qualifiers"]["clause"] for edge in results} == {"select", "where"}
+        assert len(results) == 2
+        for edge in results:
+            assert edge["source"] == "sf:apexmethod:reader.read"
+            assert edge["qualifiers"]["context"] == "apex_soql_navigation"
+            occurrence, = edge["evidence"]
+            assert occurrence["content_hash"] == hashlib.sha256(code.encode()).hexdigest()
+            assert occurrence["locator"].endswith(f"/navigation[{step}]")
+            assert occurrence["resolution"]["navigation_step"] == {"index": step, **evidence["resolution"]["steps"][step - 1]}
+        assert {edge["id"] for edge in query.impact(bundle, field_name, depth=1)["results"]} == {
+            edge["id"] for edge in results}
+
+
+def test_trigger_soql_distinguishes_direct_lookup_read_from_repeated_navigation():
+    code = ("trigger Sample on Account (after update) {\n"
+            "  List<Account> rows = [SELECT ParentId, Parent.Parent.Name FROM Account];\n}")
+    store = build(trigger=code)
+    bundle = {"manifest": {"snapshot_id": "synthetic"}, "facts": store.finish(), "diagnostics": store.diagnostics}
+    results = query.refs(bundle, "Account.ParentId", relation="reads")["results"]
+    assert len(results) == 2 and {edge["source"] for edge in results} == {"sf:apextrigger:sample"}
+    assert {edge["qualifiers"].get("context") for edge in results} == {None, "apex_soql_navigation"}
+    navigation, = [edge for edge in results if edge["qualifiers"].get("context") == "apex_soql_navigation"]
+    assert {e["resolution"]["navigation_step"]["index"] for e in navigation["evidence"]} == {1, 2}
+    assert len({e["locator"] for e in navigation["evidence"]}) == 2
+    assert all(e["line"] == 2 and e["content_hash"] == hashlib.sha256(code.encode()).hexdigest()
+               for e in navigation["evidence"])
 
 
 @pytest.mark.parametrize("data_type,expected", [("Lookup", True), ("Text", False), ("MasterDetail", False)])

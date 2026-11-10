@@ -1,3 +1,23 @@
+# sfdx-graphify
+
+Map dependencies in a local Salesforce DX project. Inspect which Flows and Apex code use a field, follow a dependency back to its source evidence, or explore the snapshot in a local browser. The Salesforce commands work entirely from local metadata.
+
+This independent fork builds on Graphify. To try the fictional project, run these commands from the checkout in an isolated Python 3.10+ environment.
+
+```sh
+python -m pip install .
+sfdx-graphify build examples/salesforce --out ../sfdx-demo-snapshot
+sfdx-graphify refs Account.Description --snapshot ../sfdx-demo-snapshot --format text
+sfdx-graphify impact Account.Description --snapshot ../sfdx-demo-snapshot --depth 3 --format text
+sfdx-graphify serve --snapshot ../sfdx-demo-snapshot
+```
+
+Open the loopback address printed by `serve`. The example shows the field's direct references, an incoming trigger path and a call that requires checking a missing ancestor. In Git projects the default scope is tracked files. Add `--include-untracked` when you want eligible local additions in the snapshot.
+
+The [Salesforce guide](docs/salesforce.txt) covers release installation, supported metadata, candidates, diagnostics and freshness. The [synthetic project](examples/salesforce) is suitable for examples and CI. The [Salesforce benchmarks](BENCHMARKS.md#local-salesforce-benchmark) document how to reproduce measurements.
+
+## Upstream Graphify
+
 <p align="center">
   <a href="https://graphify.com"><img src="https://raw.githubusercontent.com/Graphify-Labs/graphify/v8/docs/graphify-logo.png" width="360" height="189" alt="Graphify"/></a>
 </p>

@@ -194,9 +194,8 @@ def test_status_exposes_readiness_without_source_mapping_or_cors(service, publis
 ])
 def test_http_boundaries_reject_unsafe_or_ambiguous_requests(service, alteration, expected_status):
     server, _ = service
-    body = b'{"command":"status"}'
     host = f"127.0.0.1:{server.server_port}"
-    headers = [("Host", host), ("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+    headers = [("Host", host), ("Content-Type", "application/json"), ("Content-Length", "20")]
     if alteration == "foreign_host":
         headers[0] = ("Host", "attacker.example:8769")
     elif alteration == "duplicate_host":
@@ -208,7 +207,7 @@ def test_http_boundaries_reject_unsafe_or_ambiguous_requests(service, alteration
     elif alteration == "missing_length":
         headers.pop()
     elif alteration == "duplicate_length":
-        headers.append(("Content-Length", str(len(body))))
+        headers.append(headers[-1])
     elif alteration == "huge_length":
         headers[-1] = ("Content-Length", "9" * 5000)
     elif alteration == "too_large":
@@ -221,16 +220,30 @@ def test_http_boundaries_reject_unsafe_or_ambiguous_requests(service, alteration
         headers.append(("Content-Type", "application/json"))
     elif alteration == "duplicate_expected":
         headers.extend([("X-SFDX-Snapshot", "same"), ("X-SFDX-Snapshot", "same")])
-    status, response_headers, result = raw_request(server, body=body, headers=headers)
+    # Reject these headers before reading a body. Sending unread bytes can race
+    # with socket closure and reset the connection before Windows delivers the response.
+    status, response_headers, result = raw_request(server, body=b"", headers=headers)
     assert status == expected_status and result["exit_code"] == 2
     assert "Access-Control-Allow-Origin" not in response_headers
 
 
-@pytest.mark.parametrize("body", [b"{", b"\xff", b'{"command":"status","command":"components"}'])
+@pytest.mark.parametrize("body", [
+    b"{",
+    b"\xff",
+    b'{"command":"status","command":"components"}',
+    b"[" * (sys.getrecursionlimit() + 100) + b"0" + b"]" * (sys.getrecursionlimit() + 100),
+    br'{"command":"status","id":"\ud800"}',
+    br'{"command":"refs","name":"\udfff"}',
+    br'{"command":"status","\ud800":1}',
+    br'{"command":"status","\ud800":1,"\ud800":2}',
+])
 def test_invalid_json_is_rejected_without_desynchronizing_next_request(service, body):
     server, _ = service
-    assert raw_request(server, body=body)[0] == 400
-    assert query_server.request_query(address(server), {"command": "status"})["exit_code"] == 0
+    status, _, invalid = raw_request(server, body=body)
+    assert status == 400 and invalid["id"] is None and invalid["exit_code"] == 2
+    assert invalid["result"]["error"].startswith("Invalid JSON request:")
+    status, _, after = raw_request(server, body=br'{"command":"status","id":"\ud83d\ude80"}')
+    assert status == 200 and after["id"] == "\N{ROCKET}" and after["exit_code"] == 0
 
 
 def test_expected_id_guard_reads_only_current_before_failure(published, monkeypatch):

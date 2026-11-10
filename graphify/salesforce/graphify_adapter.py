@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 
-from .schema import DataError
+from .schema import DataError, relationship_resolution
 
 
 def projection_graph(bundle: dict):
@@ -48,8 +48,14 @@ def projection_graph(bundle: dict):
             structural = (item["relation"] == "contains"
                           or (item["relation"] == "references" and context == "lookup_declaration"))
             details.append({"id": item["id"], "relation": item["relation"],
-                            "layer": "schema" if structural else "dependencies", "context": context})
-        graph.add_edge(source, target, relation=", ".join(verbs), confidence="EXTRACTED",
+                            "layer": "schema" if structural else "dependencies", "context": context,
+                            "resolution": relationship_resolution(item)})
+        candidate_count = sum(item["resolution"]["status"] == "candidate" for item in details)
+        graph.add_edge(source, target, relation=", ".join(verbs),
+                       confidence="AMBIGUOUS" if candidate_count else "EXTRACTED",
+                       resolution_counts={"candidate": candidate_count, "extracted": len(details) - candidate_count},
+                       resolution_status=("mixed" if 0 < candidate_count < len(details)
+                                          else "candidate" if candidate_count else "extracted"),
                        canonical_relationship_ids=sorted(item["id"] for item in relationships),
                        relationship_details=details,
                        relation_counts=dict(sorted(Counter(item["relation"]

@@ -17,7 +17,7 @@ from urllib.parse import quote
 from tree_sitter import Node, Tree
 
 from .schema import API_NAME, FactStore, component_id
-from .relationship_paths import resolve_field_path
+from .relationship_paths import SOURCE_STANDARD_PARENTS, add_navigation_reads, resolve_field_path
 
 
 PARSER_VERSION = "tree-sitter-language-pack==0.11.0/apex"
@@ -363,6 +363,37 @@ def _class_hierarchy(index, store, class_id):
     return hierarchy
 
 
+def _external_hierarchy(index, store, class_id):
+    """Return a known prefix only when its sole gap is an absent ancestor.
+
+    A local file with no indexed Unit may have failed parsing or another
+    coverage check; it is not an external dependency. Duplicates and cycles
+    likewise cannot justify a candidate qualifier.
+    """
+    hierarchy, seen = [], set()
+    while class_id:
+        if class_id in seen:
+            return None
+        seen.add(class_id)
+        component = store.components.get(class_id)
+        if component and store.is_ambiguous(class_id):
+            return None
+        units = [unit for unit in index.units if unit.class_id == class_id]
+        if not units:
+            if (not hierarchy or (component and component.get("definitions"))
+                    or (component and component["api_name"].casefold() in index.apex_types)):
+                return None
+            return hierarchy, [hierarchy[-1].superclass_name]
+        if len(units) != 1 or units[0].parse_error:
+            return None
+        unit = units[0]
+        hierarchy.append(unit)
+        if not unit.has_superclass or not unit.superclass_name:
+            return None
+        class_id = component_id("apexclass", unit.superclass_name)
+    return None
+
+
 def _method_candidates(index, store, class_id, name, arity):
     hierarchy = _class_hierarchy(index, store, class_id)
     if hierarchy is None:
@@ -387,6 +418,8 @@ class _MethodExtractor:
         # has no superclass and is intentionally absent from the Apex index.
         self.qualifier_hierarchy = (_class_hierarchy(index, store, self.unit.class_id)
                                     if self.unit.has_superclass else [self.unit])
+        self.external_hierarchy = (_external_hierarchy(index, store, self.unit.class_id)
+                                   if self.qualifier_hierarchy is None else None)
 
     def diagnostic(self, code, message, node, state="unsupported"):
         self.store.diagnostic(code, message, self.unit.location(node), state=state)
@@ -633,14 +666,22 @@ class _MethodExtractor:
                 if name.casefold() in aliases:
                     self.diagnostic("APEX_SOQL_ALIAS_UNSUPPORTED", "This name matches a SELECT alias; it is not resolved as an object field.", current)
                 elif not API_NAME.fullmatch(name):
-                    resolved = resolve_field_path(self.store, owner, name)
-                    if resolved:
-                        self.edge(resolved["owner"], resolved["field"], relation, current,
-                                  "apex.static_soql_parent_field", {"operation": "soql", "clause": clause_name, "field_path": name},
-                                  {"basis": "declared_parent_path", "root_object": owner,
-                                   "steps": resolved["steps"], "parser": PARSER_VERSION})
-                    else:
+                    resolved = resolve_field_path(self.store, owner, name, standard_parents=SOURCE_STANDARD_PARENTS)
+                    if resolved is None:
                         self.diagnostic("APEX_SOQL_FIELD_PATH_UNSUPPORTED", "No unique declared or supported standard parent path establishes the terminal field owner.", current)
+                        return
+                    location = self.unit.location(current)
+                    target = self.store.field(resolved["owner"], resolved["field"], location)
+                    if target is None:
+                        return
+                    resolution = {"basis": "declared_parent_path", "root_object": owner,
+                                  "steps": resolved["steps"], "parser": PARSER_VERSION}
+                    qualifiers = {"operation": "soql", "clause": clause_name}
+                    self.store.relation(self.method.id, target, relation, location, "apex.static_soql_parent_field",
+                                        resolution=resolution, qualifiers={**qualifiers, "field_path": name})
+                    add_navigation_reads(self.store, self.method.id, location,
+                                         {**resolution, "relationship_path": name}, rule="apex.static_soql_navigation",
+                                         qualifiers={**qualifiers, "context": "apex_soql_navigation"})
                 else:
                     self.edge(owner, name, relation, current, "apex.static_soql_field", {"operation": "soql", "clause": clause_name})
                 return
@@ -721,12 +762,50 @@ class _MethodExtractor:
                 self.store.relation(self.method.id, candidates[0].id, "calls", self.unit.location(node),
                                     "apex.cross_class_static_call", resolution={"basis": "unique_local_static_method"},
                                     qualifiers={"invocation": "static_method"})
+            elif self._candidate_static_invocation(node, object_node, object_name, candidates):
+                pass
             elif self._instance_invocation(node):
                 pass
             else:
                 self.diagnostic("APEX_EXTERNAL_CALL_UNSUPPORTED", "No unique literal local static target is proven; external, instance and inherited dispatch remain unresolved.", node)
         for arg in args:
             self.visit(arg)
+
+    def _candidate_static_invocation(self, node, receiver, name, candidates):
+        """Expose a local static target without claiming an unknown base is safe."""
+        if (self.external_hierarchy is None or receiver is None or receiver.type != "identifier"
+                or not API_NAME.fullmatch(name) or name.casefold() in _RESERVED_RECEIVERS
+                or self.has_binding(name, receiver) or len(candidates) != 1):
+            return False
+        hierarchy, missing = self.external_hierarchy
+        if any(name.casefold() in unit.declared_members or name.casefold() in unit.declared_types
+               for unit in hierarchy):
+            return False
+        target = candidates[0]
+        if (not target.static or self.store.is_ambiguous(target.id)
+                or not _modifiers(target.unit.data, target.node)[0] & {"public", "global"}):
+            return False
+        target_hierarchy = _class_hierarchy(self.index, self.store, component_id("apexclass", name))
+        if target_hierarchy is None or any(
+            self.store.is_ambiguous(method.id)
+            for unit in target_hierarchy for method in self.index.methods.get(unit.class_id, [])
+            if method.name.casefold() == target.name.casefold() and method.parameter_count == target.parameter_count
+        ):
+            return False
+        location = self.unit.location(node)
+        self.store.relation(
+            self.method.id, target.id, "calls", location, "apex.candidate_static_call",
+            qualifiers={"invocation": "static_method", "resolution_status": "candidate",
+                        "uncertainty": "external_hierarchy", "missing_ancestors": missing},
+            resolution={"basis": "local_static_target_unverified_hierarchy",
+                        "missing_ancestors": missing, "parser": PARSER_VERSION},
+        )
+        self.store.diagnostic(
+            "APEX_CALL_CANDIDATE",
+            "A unique local static target is a candidate: the absent ancestor may shadow its class qualifier.",
+            location, state="ambiguous", candidates=[target.id], missing_ancestors=missing,
+        )
+        return True
 
     def _managed_invocation(self, node):
         """Retain a literal namespace.Class.method target without claiming org existence."""

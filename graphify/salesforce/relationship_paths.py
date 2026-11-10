@@ -21,6 +21,23 @@ _STANDARD_PARENTS = {
     ("asset", "product2"): ("Product2Id", "Product2"),
 }
 
+# Additional SOQL and Flow paths from the API 64.0 vocabulary. Opportunity.Contact
+# was introduced in API 46.0. RecordType availability depends on org configuration.
+# https://developer.salesforce.com/docs/platform/object-reference/references/
+_RECORD_TYPE_OWNERS = ("account", "case", "contact", "lead", "opportunity", "order")
+SOURCE_STANDARD_PARENTS = {
+    ("case", "account"): ("AccountId", "Account"),
+    ("case", "contact"): ("ContactId", "Contact"),
+    ("opportunity", "account"): ("AccountId", "Account"),
+    ("opportunity", "contact"): ("ContactId", "Contact"),
+    ("order", "account"): ("AccountId", "Account"),
+    ("order", "billtocontact"): ("BillToContactId", "Contact"),
+    ("order", "shiptocontact"): ("ShipToContactId", "Contact"),
+    ("user", "profile"): ("ProfileId", "Profile"),
+    **{(owner, "recordtype"): ("RecordTypeId", "RecordType") for owner in _RECORD_TYPE_OWNERS},
+    **{(owner, "createdby"): ("CreatedById", "User") for owner in _RECORD_TYPE_OWNERS},
+}
+
 
 def resolve_field_path(store, owner: str, path: str, *,
                        standard_parents: dict[tuple[str, str], tuple[str, str]] | None = None) -> dict | None:
@@ -59,7 +76,7 @@ def resolve_field_path(store, owner: str, path: str, *,
         hierarchy = (pair == ("account", "parent") and declaration is not None
                      and declaration.get("data_type") == "Hierarchy")
         compatible_types = {None, "", "Lookup", "Hierarchy"} if hierarchy else {None, "", "Lookup"}
-        # Opt-in formula vocabulary must not override contradictory local XML.
+        # Opt-in standard vocabularies require agreement with local XML.
         if (standard_parents is not None and standard and declaration is not None
                 and declaration.get("definition_status") != "referenced_only"
                 and declaration.get("data_type") not in compatible_types):
@@ -92,3 +109,17 @@ def resolve_field_path(store, owner: str, path: str, *,
                           "target": target_id, "basis": "standard_schema"})
             current = target_name
     return {"owner": current, "field": parts[-1], "steps": steps}
+
+
+def add_navigation_reads(store, source, occurrence, resolution, *, rule, qualifiers):
+    """Make resolved lookup hops queryable as reads separate from the terminal edge."""
+    for step_number, step in enumerate(resolution["steps"], 1):
+        declaration = store.components.get(step["field"])
+        api_name = declaration["api_name"] if declaration else step["field"].split(":", 2)[2]
+        lookup_owner, lookup_field = api_name.split(".", 1)
+        location = {**occurrence, "locator": f"{occurrence['locator']}/navigation[{step_number}]"}
+        lookup = store.field(lookup_owner, lookup_field, location)
+        if lookup is not None:
+            store.relation(source, lookup, "reads", location, rule,
+                           resolution={**resolution, "navigation_step": {"index": step_number, **step}},
+                           qualifiers=qualifiers)

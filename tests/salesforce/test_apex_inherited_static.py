@@ -125,7 +125,12 @@ def test_unavailable_or_ambiguous_ancestor_never_proves_a_qualified_receiver(sce
     elif scenario == "cycle":
         classes["classes/Base.cls"] = "public virtual class Base extends Handler {}"
     store = analyze(classes)
-    assert not targets(store)
+    if scenario in {"missing", "external"}:
+        assert targets(store) == {"sf:apexmethod:checks.run"}
+        edge, = [edge for edge in store.relationships.values() if edge["relation"] == "calls"]
+        assert edge["qualifiers"]["resolution_status"] == "candidate"
+    else:
+        assert not targets(store)
     assert not database_writes(store)
     assert any(d["code"] == "APEX_EXTERNAL_CALL_UNSUPPORTED" for d in store.diagnostics)
 

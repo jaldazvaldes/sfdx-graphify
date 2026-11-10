@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, overload
@@ -112,18 +113,21 @@ def _capture(path: Path, *, keep_bytes: bool, git_algorithm: str | None = None) 
 
 
 @overload
-def _git(root: Path, args: list[str], *, optional: Literal[False] = False) -> bytes: ...
+def _git(root: Path, args: list[str], *, optional: Literal[False] = False,
+         input_data: bytes | None = None, env: dict[str, str] | None = None) -> bytes: ...
 
 
 @overload
-def _git(root: Path, args: list[str], *, optional: Literal[True]) -> bytes | None: ...
+def _git(root: Path, args: list[str], *, optional: Literal[True],
+         input_data: bytes | None = None, env: dict[str, str] | None = None) -> bytes | None: ...
 
 
-def _git(root: Path, args: list[str], *, optional: bool = False) -> bytes | None:
+def _git(root: Path, args: list[str], *, optional: bool = False,
+         input_data: bytes | None = None, env: dict[str, str] | None = None) -> bytes | None:
     try:
         result = subprocess.run(
             ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(root), *args],
-            capture_output=True, check=False,
+            capture_output=True, check=False, input=input_data, env=env,
             shell=False, timeout=60,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -138,6 +142,61 @@ def _git(root: Path, args: list[str], *, optional: bool = False) -> bytes | None
             return None
         raise DataError(f"Cannot inspect Git source state ({args[0]})")
     return result.stdout
+
+
+def _normalized_changes(root: Path, revision: str, package_dirs: list[str],
+                        paths: set[str]) -> tuple[set[str], set[str]]:
+    """Compare working bytes with HEAD using Git's built-in normalization.
+
+    A fresh, private index avoids trusting source-index stat/assume-unchanged
+    flags and never refreshes or writes the user's index. Attribute entries are
+    copied from the source index so missing working .gitattributes files retain
+    Git's index fallback. Numstat forces content
+    comparison (name-only would report every fresh-index entry as modified).
+    External filters, diff drivers, textconv and fsmonitor must never execute.
+    Filtered files are returned separately for a conservative raw-byte fallback.
+    """
+    keys = _git(root, ["config", "--null", "--name-only", "--list"])
+    settings = ["-c", "core.sparseCheckout=false", "-c", "index.sparse=false",
+                "-c", "core.splitIndex=false"]
+    for key in sorted(set(keys.decode("utf-8").split("\0"))):
+        if re.fullmatch(r"filter\..*\.(clean|process|required)", key, flags=re.IGNORECASE):
+            settings.extend(["-c", key + ("=false" if key.lower().endswith(".required") else "=")])
+    filtered: set[str] = set()
+    if paths:
+        attributes = _git(root, ["check-attr", "-z", "--stdin", "filter"],
+                          input_data=b"".join(path.encode("utf-8") + b"\0" for path in sorted(paths)))
+        values = attributes.decode("utf-8").split("\0")
+        for pos in range(0, len(values) - 1, 3):
+            if values[pos + 2] not in {"unspecified", "unset"}:
+                filtered.add(values[pos])
+    pathspecs = [":(literal)" + path for path in sorted(set(package_dirs) | set(_CONFIG_FILES))]
+    attribute_args = ["ls-files", "--stage", "--full-name", "-z", "--",
+                      ":(top,glob)**/.gitattributes"]
+    source_attributes = _git(root, attribute_args)
+    git_root = Path(_git(root, ["rev-parse", "--show-toplevel"]).decode("utf-8").strip())
+    with tempfile.TemporaryDirectory(prefix="sfdx-graphify-git-") as temporary:
+        hooks = Path(temporary) / "empty-hooks"
+        hooks.mkdir()
+        # read-tree writes only our private index, but would otherwise still run
+        # the source repository's post-index-change hook.
+        settings.extend(["-c", "core.hooksPath=" + str(hooks)])
+        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        _git(root, [*settings, "read-tree", revision], env=environment)
+        head_attributes = _git(root, [*settings, *attribute_args], env=environment)
+        attribute_paths = {entry.split(b"\t", 1)[1]
+                           for entry in head_attributes.split(b"\0") if entry}
+        if attribute_paths or source_attributes:
+            removals = b"".join(b"0 " + b"0" * len(revision) + b"\t" + path + b"\0"
+                                for path in sorted(attribute_paths))
+            _git(git_root, [*settings, "update-index", "-z", "--index-info"],
+                 env=environment, input_data=removals + source_attributes)
+        output = _git(root, [*settings, "diff", revision, "--numstat", "-z", "--relative",
+                             "--no-renames", "--no-ext-diff", "--no-textconv", "--", *pathspecs],
+                      env=environment)
+    changed = {entry.split(b"\t", 2)[2].decode("utf-8")
+               for entry in output.split(b"\0") if entry}
+    return changed, filtered
 
 
 def _excluded(relative: str) -> bool:
@@ -319,11 +378,19 @@ def discover(root: Path, include_untracked: bool = False) -> Scan:
     inputs = dict(sorted(inputs.items()))
     supported = dict(sorted(supported.items()))
     unsupported = sorted(paths - supported.keys())
+    normalized_changes, filtered_paths = (_normalized_changes(root, revision, package_dirs,
+                                                               inputs.keys() & head_files.keys())
+                                          if revision else (set(), set()))
     diagnostics: list[dict] = [{
         "code": "unsupported_metadata", "severity": "warning", "path": relative,
         "construct": "metadata_file", "resolution_state": "unsupported",
         "message": "This source file is inventoried for freshness but is outside v0.1 extraction coverage.",
     } for relative in unsupported]
+    diagnostics.extend({
+        "code": "git_filter_dirty_raw_fallback", "severity": "warning", "path": relative,
+        "resolution_state": "unsupported",
+        "message": "Custom Git filters are not executed. Dirty state for this file compares raw working-tree bytes with HEAD; filter-normalized equality is not asserted.",
+    } for relative in sorted(filtered_paths))
     if not is_git and ".gitignore" in config:
         diagnostics.append({"code": "gitignore_not_applied", "severity": "warning", "path": ".gitignore",
                             "message": "Git ignore semantics require a Git working tree; only built-in exclusions apply."})
@@ -343,7 +410,8 @@ def discover(root: Path, include_untracked: bool = False) -> Scan:
             if prior is None:
                 counts["added"] += 1
             else:
-                counts["modified"] += blob_hashes[relative] != prior
+                counts["modified"] += (blob_hashes[relative] != prior if relative in filtered_paths
+                                       else relative in normalized_changes)
         counts["deleted"] = len(set(comparable_head) - inputs.keys())
         dirty = any(counts.values())
     scope = {
@@ -358,6 +426,6 @@ def discover(root: Path, include_untracked: bool = False) -> Scan:
         "excluded_directory_names": sorted(EXCLUDED_DIRS), "excluded_paths": sorted(excluded),
         "unsupported_paths": unsupported, "selected_file_count": len(paths),
         "supported_file_count": len(supported), "changes_from_head": counts,
-        "dirty_basis": "working_tree_bytes_vs_head_blobs" if is_git else "not_available",
+        "dirty_basis": "git_normalized_working_tree_vs_head_with_raw_filter_fallback" if is_git else "not_available",
     }
     return Scan(root, supported, inputs, revision, dirty, scope, diagnostics)

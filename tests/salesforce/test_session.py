@@ -130,6 +130,11 @@ def test_query_failures_keep_regular_error_codes_and_allow_following_requests(mo
     '{"command":"refs","name":""}',
     '{"command":"status","id":true}',
     '{"command":"status","command":"components"}',
+    '[' * (sys.getrecursionlimit() + 100) + '0' + ']' * (sys.getrecursionlimit() + 100),
+    r'{"command":"status","id":"\ud800"}',
+    r'{"command":"refs","name":"\udfff"}',
+    r'{"command":"status","\ud800":1}',
+    r'{"command":"status","\ud800":1,"\ud800":2}',
 ])
 def test_invalid_jsonl_request_does_not_desynchronize_the_session(monkeypatch, tmp_path, line):
     bundle = synthetic_bundle()
@@ -138,7 +143,7 @@ def test_invalid_jsonl_request_does_not_desynchronize_the_session(monkeypatch, t
     code = session.run_session(tmp_path, input_stream=io.StringIO(
         line + '\n{"command":"status","id":"following"}\n'),
         output_stream=output, error_stream=io.StringIO())
-    replies = [json.loads(item) for item in output.getvalue().splitlines()]
+    replies = [json.loads(item) for item in output.getvalue().encode("utf-8").splitlines()]
     assert code == 0 and len(replies) == 2
     assert replies[0]["exit_code"] == 2 and replies[0]["result"]["error"]
     assert replies[1] == {"id": "following", "exit_code": 0, "result": query.status(bundle)}
@@ -221,11 +226,19 @@ def test_cli_jsonl_uses_utf8_even_when_inherited_pipe_encoding_differs(tmp_path)
     env = {**os.environ, "PYTHONIOENCODING": "cp1252", "PYTHONDONTWRITEBYTECODE": "1"}
     process = subprocess.run(
         [sys.executable, "-m", "graphify.salesforce", "session", "--snapshot", str(directory)],
-        input='{"command":"status","id":"sesión-ñ"}\n'.encode("utf-8"),
+        input=(
+            '{"command":"status","id":"sesión-ñ"}\n'.encode("utf-8")
+            + b'{"command":"status","id":"\xff"}\n'
+            + br'{"command":"status","id":"\ud83d\ude80"}' + b"\n"
+        ),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=30, shell=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert process.returncode == 0, process.stderr.decode("utf-8")
-    assert json.loads(process.stdout.decode("utf-8")) == {
+    before, invalid, after = map(json.loads, process.stdout.splitlines())
+    assert before == {
         "id": "sesión-ñ", "exit_code": 0, "result": query.status(bundle),
     }
+    assert invalid["id"] is None and invalid["exit_code"] == 2
+    assert invalid["result"]["error"].startswith("Invalid JSON request:")
+    assert after == {"id": "\N{ROCKET}", "exit_code": 0, "result": query.status(bundle)}

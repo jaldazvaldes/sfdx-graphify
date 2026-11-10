@@ -12,6 +12,7 @@ from dataclasses import replace
 from .schema import TESTED_API_VERSIONS, canonical_json
 from .symbols import API_NAME, RESOURCE_NAME, index_symbols
 from .formula_refs import formula_references
+from .relationship_paths import SOURCE_STANDARD_PARENTS, add_navigation_reads, resolve_field_path
 
 _BASE = {"name", "label", "description", "locationX", "locationY", "connector", "faultConnector", "processMetadataValues"}
 _OP = _BASE | {"object", "filters", "filterLogic"}
@@ -109,8 +110,7 @@ class _Extractor:
             self.diagnostic("FLOW_FIELD_OWNER_UNRESOLVED", "The field's owning object is not established.", node, "unresolved")
             return
         if "." in (field or ""):
-            from .relationship_paths import resolve_field_path
-            resolved = resolve_field_path(self.store, owner, field)
+            resolved = resolve_field_path(self.store, owner, field, standard_parents=SOURCE_STANDARD_PARENTS)
             if resolved is None:
                 self.diagnostic("FLOW_RELATIONSHIP_PATH_UNSUPPORTED", "The complete parent relationship path is not uniquely established.", node)
                 return
@@ -120,13 +120,18 @@ class _Extractor:
         elif not API_NAME.fullmatch(field or ""):
             self.diagnostic("FLOW_FIELD_DYNAMIC", "The field name is not a literal API name.", node, "dynamic")
             return
-        target = self.store.field(owner, field, self.doc.location(node))
-        if target:
-            resolution = resolution or {"basis": "explicit_object", "object": owner}
-            if node.locator in self.formula_tokens:
-                resolution = {**resolution, "formula_reference": self.formula_tokens[node.locator]}
-            self.store.relation(self.source, target, relation, self.doc.location(node), rule,
-                                resolution=resolution, qualifiers=qualifiers)
+        location = self.doc.location(node)
+        target = self.store.field(owner, field, location)
+        if target is None:
+            return
+        resolution = resolution or {"basis": "explicit_object", "object": owner}
+        if node.locator in self.formula_tokens:
+            resolution = {**resolution, "formula_reference": self.formula_tokens[node.locator]}
+        self.store.relation(self.source, target, relation, location, rule,
+                            resolution=resolution, qualifiers=qualifiers)
+        if "steps" in resolution:
+            add_navigation_reads(self.store, self.source, location, resolution, rule="flow.relationship_navigation",
+                                 qualifiers={"context": "flow_relationship_navigation"})
 
     def reference(self, node, relation="reads", rule="flow.direct_reference", qualifiers=None):
         if node is None:

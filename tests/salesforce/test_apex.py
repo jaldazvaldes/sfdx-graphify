@@ -86,7 +86,10 @@ def test_static_soql_preserves_root_ownership_and_having_filters():
 
 def test_relationship_chains_and_subqueries_are_not_assigned_to_outer_object():
     store, _ = analyze("List<Account> found = [SELECT Id, Owner.Name, (SELECT LastName FROM Contacts) FROM Account WHERE Parent.Name = 'Example'];")
-    assert field_relations(store) == {("Account.Id", "reads", None), ("Account.Name", "filters", None)}
+    fields = {(edge["target"], edge["relation"]) for edge in store.relationships.values()
+              if store.components[edge["target"]]["kind"] == "field"}
+    assert fields == {("sf:field:account.id", "reads"), ("sf:field:account.name", "filters"),
+                      ("sf:field:account.parentid", "reads")}
     assert {"APEX_SOQL_FIELD_PATH_UNSUPPORTED", "APEX_SOQL_CONSTRUCT_UNSUPPORTED"} <= codes(store)
     assert "sf:field:account.lastname" not in store.components
     assert "sf:field:account.owner" not in store.components

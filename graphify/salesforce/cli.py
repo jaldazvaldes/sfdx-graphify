@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-from .schema import DataError, EXTRACTOR_VERSION, SCHEMA_VERSION
+from .schema import DISPATCH_EVIDENCE_SITES, DataError, EXTRACTOR_VERSION, SCHEMA_VERSION
 from . import query
 
 
@@ -39,6 +39,9 @@ Then: sfdx-graphify refs Account.Name --server http://127.0.0.1:8769 --exclude-t
 Use --expect-snapshot <id> to require the same snapshot on either local or server queries.
 Tests remain in canonical facts. --exclude-tests filters explicit AST classifications; unknowns remain included.
 Impact results identify candidates for inspection, not execution order or proven runtime effects.
+Candidate calls include unverified external hierarchies and conditional trigger dispatch.
+They are included in queries and marked AMBIGUOUS in Graphify; inspect the reason and source evidence.
+Impact traversal.candidate_relationship_ids marks candidate calls anywhere in the returned witness path.
 Open the cited relative source files and locators before making consequential changes.
 An absent edge is never proof that no dependency exists. Unknown coverage remains unknown.
 Keep private snapshots outside repositories. Never upload source, snapshots, or logs automatically.
@@ -130,16 +133,35 @@ def _text(result: dict) -> str:
         lines.append(f"Visible: {len(result['nodes'])} components, {len(result['edges'])} grouped edges")
         for edge in result["edges"]:
             lines.append(f"{edge['source']} --{edge['relation']}--> {edge['target']}")
+            candidate_count = edge.get("resolution_counts", {}).get("candidate", 0)
+            if candidate_count:
+                lines.append(f"  CANDIDATE: {candidate_count} call(s); inspect their resolution and evidence.")
             for occurrence in edge.get("evidence", []):
                 lines.append(f"  {occurrence['path']}:{occurrence.get('line', '?')} "
                              f"{occurrence.get('locator', '')} [{occurrence['id']}]")
     for item in result.get("results", []):
         if "relation" in item:
             lines.append(f"{item['source']} --{item['relation']}--> {item['target']} [{item['id']}]")
+            resolution = item.get("resolution", {})
+            if resolution.get("status") == "candidate":
+                reason = {"external_hierarchy": "external hierarchy not verified",
+                          "conditional_virtual_dispatch": "local virtual dispatch is conditional",
+                          "fflib_event_dispatch": "fflib event dispatch is conditional"}.get(
+                              resolution.get("reason"), "dispatch remains uncertain")
+                missing = ", ".join(resolution.get("missing_ancestors", []))
+                lines.append(f"  CANDIDATE: {reason}" + (f"; missing ancestors: {missing}" if missing else ""))
+            traversal = item.get("traversal", {})
+            if traversal.get("includes_candidate_calls"):
+                lines.append("  Witness path includes candidate calls: "
+                             + ", ".join(traversal["candidate_relationship_ids"]))
             for occurrence in item.get("evidence", []):
                 location = occurrence.get("line")
                 suffix = f":{location}" if location is not None else ""
                 lines.append(f"  {occurrence['path']}{suffix} {occurrence['locator']} [{occurrence['id']}]")
+                for key, label in DISPATCH_EVIDENCE_SITES:
+                    site = occurrence.get("resolution", {}).get(key)
+                    if isinstance(site, dict) and site.get("path"):
+                        lines.append(f"    {label}: {site['path']}:{site.get('line', '?')} {site.get('locator', '')}")
         else:
             lines.append(f"{item['id']} {item.get('api_name', '')}")
     if result.get("truncated"):
