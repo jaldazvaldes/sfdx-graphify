@@ -6,7 +6,7 @@ This independent fork builds on Graphify. The Salesforce workflow uses the `sfdx
 
 ## 1. Install the tool
 
-**0.5.7.** Once the GitHub Release is available, run this PowerShell command from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
+Install the published **0.5.7** wheel from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
 
 ```powershell
 uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.7/sfdx_graphify-0.5.7-py3-none-any.whl'
