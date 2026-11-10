@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.5 (unreleased)
+sfdx-graphify 0.5.5
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -10,7 +10,7 @@ Use an isolated Python 3.10+ environment. Install from the fork checkout.
 
 This command installs the tagged release.
 
-  python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.4"
+  python -m pip install "git+https://github.com/jaldazvaldes/sfdx-graphify.git@sfdx-v0.5.5"
 
 The Salesforce CLI reports its own version via sfdx-graphify --version. The
 inherited graphifyy package keeps its upstream version. The sfdx-prefixed Git
