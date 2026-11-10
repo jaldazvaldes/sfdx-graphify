@@ -138,7 +138,9 @@ def diagnostic_context(bundle: dict, target: dict, results: list, *, mode: str =
         occurrences = result.get("evidence", [])
         locations.extend(occurrences)
         for occurrence in occurrences:
-            proof = occurrence.get("resolution", {})
+            proof = occurrence.get("resolution")
+            if not isinstance(proof, dict):
+                continue  # Older snapshots can store the resolution as text.
             for key, _ in DISPATCH_EVIDENCE_SITES:
                 site = proof.get(key)
                 if isinstance(site, dict) and isinstance(site.get("path"), str):

@@ -142,6 +142,8 @@ def test_cli_outputs_one_json_document_and_preserves_exit_status(bundle, monkeyp
     output = capsys.readouterr()
     assert code == 0 and output.err == ""
     assert json.loads(output.out)["total"] == 1
+    assert cli.main(["refs", "Account.Name", "--snapshot", "unused", "--format", "text"]) == 0
+    assert "flows/Sample.flow-meta.xml:1" in capsys.readouterr().out
     assert cli.main(["refs", "Missing", "--snapshot", "unused"]) == 4
     output = capsys.readouterr()
     assert json.loads(output.out)["error"] == "No matching component: Missing"

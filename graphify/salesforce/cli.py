@@ -158,8 +158,11 @@ def _text(result: dict) -> str:
                 location = occurrence.get("line")
                 suffix = f":{location}" if location is not None else ""
                 lines.append(f"  {occurrence['path']}{suffix} {occurrence['locator']} [{occurrence['id']}]")
+                proof = occurrence.get("resolution")
+                if not isinstance(proof, dict):
+                    continue
                 for key, label in DISPATCH_EVIDENCE_SITES:
-                    site = occurrence.get("resolution", {}).get(key)
+                    site = proof.get(key)
                     if isinstance(site, dict) and site.get("path"):
                         lines.append(f"    {label}: {site['path']}:{site.get('line', '?')} {site.get('locator', '')}")
         else:
