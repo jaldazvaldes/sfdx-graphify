@@ -527,9 +527,9 @@ option pages through all file diagnostics without discarding canonical records.
 With --before, the viewer compares canonical facts and their evidence. It also
 discloses extractor/schema/scope/source-input differences: added edges after an
 extractor upgrade can mean expanded coverage, not a source or runtime change.
-Version stamps alone do not mark evidence as changed. Schema versions 1 through 6
-remain readable. New builds emit schema 7 for the additional dispatch candidate
-reasons. Rebuild from source and restart pinned sessions and viewers to load the
+Version stamps alone do not mark evidence as changed. Schema versions 1 through 8
+remain readable. New builds emit schema 9, which adds approval, Aura and Visualforce
+component kinds. Rebuild from source and restart pinned sessions and viewers to load the
 new generation. Verify source freshness separately with status --source. Record
 the extractor revision with the snapshot ID. Start the query server with
 --expect-snapshot and check the viewer's /api/meta for the same ID.
