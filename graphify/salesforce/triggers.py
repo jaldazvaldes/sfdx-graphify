@@ -235,6 +235,8 @@ class _Constructed:
 
 
 class _TriggerExtractor(_MethodExtractor):
+    _constructor_reference_rule = "trigger.constructed_class"
+
     def __init__(self, unit, apex_index, store):
         super().__init__(Method(unit, unit.class_node, unit.class_id, unit.name, False, False, False, 0),
                          apex_index, store)
@@ -286,28 +288,6 @@ class _TriggerExtractor(_MethodExtractor):
             return self.unit.text(member).casefold()
         return None
 
-    def _setting_owner(self, node):
-        if node is None or node.type != "method_invocation":
-            return None
-        receiver = node.child_by_field_name("object")
-        if receiver is None or receiver.type != "identifier":
-            return None
-        name = self.unit.text(receiver)
-        if not API_NAME.fullmatch(name) or self.has_binding(name, node):
-            return None
-        cid = component_id("object", name)
-        item = self.store.components.get(cid)
-        if (not item or item.get("definition_status") != "defined"
-                or item.get("custom_settings_type") not in {"Hierarchy", "List"}):
-            return None
-        method = self.unit.text(node.child_by_field_name("name")).casefold()
-        arguments = _significant(node.child_by_field_name("arguments"))
-        if ((method in {"getinstance", "getvalues"} and len(arguments) == 1)
-                or (method == "getinstance" and not arguments and item["custom_settings_type"] == "Hierarchy")
-                or (method == "getorgdefaults" and not arguments and item["custom_settings_type"] == "Hierarchy")):
-            return item["api_name"]
-        return None
-
     def _record_expression(self, node):
         if node is None:
             return None
@@ -353,18 +333,6 @@ class _TriggerExtractor(_MethodExtractor):
                 self.visit(receiver)
             return
         super().field_access(node, relation, operation=operation)
-
-    def constructor(self, node, *, database_operation=None):
-        name = self.unit.text(node.child_by_field_name("type"))
-        cid = self._local_class(name)
-        if cid:
-            self.store.relation(self.method.id, cid, "references", self.unit.location(node),
-                                "trigger.constructed_class", qualifiers={"invocation": "constructor"},
-                                resolution={"basis": "literal_local_class", "parser": PARSER_VERSION})
-            for argument in _significant(node.child_by_field_name("arguments")):
-                self.visit(argument)
-            return None
-        return super().constructor(node, database_operation=database_operation)
 
     def _constructed_class(self, receiver, node):
         if receiver is None:
@@ -415,18 +383,18 @@ class _TriggerExtractor(_MethodExtractor):
             cid = self._local_class(self.unit.text(receiver)) if static else self._constructed_class(receiver, node)
             if receiver is not None and receiver.type != "identifier":
                 self.visit(receiver)
-            candidates = _method_candidates(self.index, self.store, cid, name, len(arguments)) if cid else []
-            if (len(candidates) == 1 and not self.store.is_ambiguous(candidates[0].id)
-                    and candidates[0].static == static and candidates[0].parameter_count == len(arguments)
-                    and _modifiers(candidates[0].unit.data, candidates[0].node)[0] & {"public", "global"}):
-                method = candidates[0]
+            candidates = (_method_candidates(self.index, self.store, cid, name, len(arguments), include_ambiguous=True)
+                          if cid else [])
+            method, overload = self._select_method(candidates, arguments)
+            if (method is not None and method.static == static
+                    and _modifiers(method.unit.data, method.node)[0] & {"public", "global"}):
                 self.store.relation(self.method.id, method.id, "calls", self.unit.location(node),
                                     "trigger.local_method_call", qualifiers={"invocation": "static_method" if static else "constructed_instance_method"},
                                     resolution={"basis": "unique_local_static_method" if static else "explicit_constructor_type",
-                                                "class": cid, "parser": PARSER_VERSION})
+                                                "class": cid, "parser": PARSER_VERSION, **overload})
                 if not static:
                     self._constructed_virtual_dispatch(cid, method, node)
-            else:
+            elif not self._ambiguous_call(node, candidates, code="TRIGGER_CALL_UNRESOLVED"):
                 self.diagnostic("TRIGGER_CALL_UNRESOLVED", "Call target requires unavailable, ambiguous or inherited dispatch analysis.",
                                 node, "ambiguous" if len(candidates) > 1 else "unresolved")
         # An fflib domain literal also keeps its independent class reference.

@@ -6,13 +6,14 @@ from http.client import HTTPConnection
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 
 import pytest
 
-from graphify.salesforce import cli, query_server, session, snapshot
+from graphify.salesforce import cli, query_server, session, snapshot, viewer
 from graphify.salesforce.schema import DataError, FactStore, SCHEMA_VERSION, stable_id
 
 
@@ -82,6 +83,22 @@ def service(published, monkeypatch):
 
 def address(server):
     return f"http://127.0.0.1:{server.server_port}"
+
+
+@pytest.mark.parametrize(("first", "second"), [
+    (query_server.create_query_server, viewer.create_server),
+    (viewer.create_server, query_server.create_query_server),
+])
+def test_loopback_listeners_reject_an_occupied_port(published, first, second):
+    _, directory, _, _ = published
+    with first(directory, port=0) as server:
+        if sys.platform == "win32":
+            # Prove the occupied socket is exclusive before attempting a bind.
+            assert server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE) == 1
+            assert server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        with pytest.raises(DataError, match=rf"Local port {server.server_port} is already in use"):
+            with second(directory, port=server.server_port):
+                pass
 
 
 def raw_request(server, *, method="POST", path="/query", body=b'{"command":"status"}', headers=None):
@@ -380,6 +397,108 @@ def test_cli_empty_server_url_fails_cleanly_without_loading_snapshot(monkeypatch
     output = capsys.readouterr()
     assert "loopback server URL" in json.loads(output.out)["error"]
     assert "loopback server URL" in output.err
+
+
+def test_cli_server_auto_pins_current_id_without_loading_artifacts(service, published, monkeypatch, capsys):
+    server, loads = service
+    source, directory, _, first = published
+    second = copy.deepcopy(first)
+    second["manifest"].pop("snapshot_id")
+    second["manifest"]["coverage"]["note"] = "Another local generation"
+    second["manifest"]["snapshot_id"] = stable_id("snapshot", second)
+    snapshot.publish(second, directory, source)
+    (source / "sfdx-project.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(snapshot, "default_output", lambda root: directory)
+    original_read = snapshot._read_limited
+    reads = []
+
+    def sidecars_only(path, *args, **kwargs):
+        reads.append(path.name)
+        assert path.name in {"SOURCE.json", "CURRENT.json"}
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(snapshot, "_read_limited", sidecars_only)
+    command = ["status", "--server", address(server)]
+    assert cli.main(command) == 6
+    result = json.loads(capsys.readouterr().out)
+    first_id = first["manifest"]["snapshot_id"]
+    assert result["snapshot_id"] == first_id
+    assert second["manifest"]["snapshot_id"] in result["error"]
+    assert reads == ["SOURCE.json", "CURRENT.json"]
+    assert len(loads) == 1
+
+    # An explicitly chosen shared snapshot overrides the current checkout.
+    reads.clear()
+    assert cli.main([*command, "--expect-snapshot", first_id]) == 0
+    assert json.loads(capsys.readouterr().out)["snapshot_id"] == first_id
+    assert not reads
+
+
+@pytest.mark.parametrize(("invalid", "message"), [
+    ("checksum", "Invalid snapshot artifact checksum"),
+    ("directory", "Snapshot pointer is missing or is not a file"),
+    ("nesting", "Snapshot pointer nesting is too deep"),
+    ("source", "Cannot read snapshot source mapping"),
+])
+def test_cli_server_invalid_current_fails_before_network(published, monkeypatch, capsys, invalid, message):
+    source, directory, _, _ = published
+    (source / "sfdx-project.json").write_text("{}", encoding="utf-8")
+    pointer = directory / "CURRENT.json"
+    if invalid == "checksum":
+        value = json.loads(pointer.read_bytes())
+        value["sha256"]["facts.json"] = "bad-checksum"
+        pointer.write_text(json.dumps(value), encoding="utf-8")
+    elif invalid == "directory":
+        pointer.unlink()
+        pointer.mkdir()
+    elif invalid == "nesting":
+        pointer.write_text("[" * 10_000 + "]" * 10_000, encoding="utf-8")
+    else:
+        (directory / "SOURCE.json").write_text("[" * 10_000 + "]" * 10_000, encoding="utf-8")
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(snapshot, "default_output", lambda root: directory)
+
+    def must_not_connect(*args, **kwargs):
+        raise AssertionError("An invalid local pointer cannot result in an unpinned request")
+
+    monkeypatch.setattr(query_server, "request_query", must_not_connect)
+    assert cli.main(["status", "--server", "http://127.0.0.1:8769"]) == 1
+    assert message in json.loads(capsys.readouterr().out)["error"]
+
+
+@pytest.mark.parametrize("has_project", [False, True])
+def test_cli_server_without_a_saved_project_snapshot_stays_unpinned(service, tmp_path, monkeypatch, capsys, has_project):
+    server, _ = service
+    project = tmp_path / "empty-project"
+    project.mkdir()
+    if has_project:
+        (project / "sfdx-project.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(snapshot, "default_output", lambda root: tmp_path / "absent-snapshot")
+    assert cli.main(["status", "--server", address(server)]) == 0
+    assert json.loads(capsys.readouterr().out)["snapshot_id"]
+
+
+@pytest.mark.parametrize(("command", "module", "entrypoint"), [
+    ("session", session, "run_session"),
+    ("query-server", query_server, "serve_queries"),
+])
+def test_cli_persistent_startup_uses_the_project_snapshot(published, monkeypatch, command, module, entrypoint):
+    source, directory, _, bundle = published
+    (source / "sfdx-project.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(snapshot, "default_output", lambda root: directory)
+    expected = bundle["manifest"]["snapshot_id"]
+    calls = []
+
+    def verify_startup(path, **options):
+        calls.append((path, options["expect_snapshot"]))
+        return 0
+
+    monkeypatch.setattr(module, entrypoint, verify_startup)
+    assert cli.main([command, "--expect-snapshot", expected]) == 0
+    assert calls == [(directory, expected)]
 
 
 @pytest.mark.parametrize("command,name", [("refs", "Account.Name"), ("deps", "Set_Name"), ("impact", "Account.Name")])

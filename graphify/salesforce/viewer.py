@@ -400,11 +400,10 @@ def build_view(bundle: dict, component: str, *, mode: str = "impact", depth: int
 def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
                   *, before: Path | None = None) -> ThreadingHTTPServer:
     """Load verified snapshots once and bind only to an explicit loopback address."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from http.server import BaseHTTPRequestHandler
+    from .listener import LoopbackHTTPServer
 
-    class ViewerServer(ThreadingHTTPServer):
-        daemon_threads = True
-
+    class ViewerServer(LoopbackHTTPServer):
         def __init__(self, address, handler, model):
             self.model = model
             super().__init__(address, handler)

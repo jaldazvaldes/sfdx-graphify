@@ -119,7 +119,8 @@ def literal_mentions(manifest: dict, component: dict) -> dict:
     else:
         short_key = "field_name"
         interpretation = (
-            "Literal matches are review hints. Field-name matches include standalone names and "
+            "Literal matches are review hints. The scan excludes Apex class and trigger source. "
+            "Field-name matches include standalone names and "
             "suffixes of other dotted tokens, which may refer to another object, markup, or unrelated text."
         )
     if index is None:

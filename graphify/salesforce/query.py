@@ -387,6 +387,11 @@ def components(bundle: dict, term: str = "", *, kind: str | None = None,
                            or needle in str(item.get("api_name", "")).casefold())),
                      key=lambda item: (item.get("is_test") is True, str(item.get("api_name", item["id"])).casefold(), item["id"]))
     result = envelope(bundle, matches[:limit], source=source, truncated=len(matches) > limit)
+    scope = bundle["manifest"].get("scope", {})
+    if not matches and scope.get("selection") == "git_tracked" and not scope.get("include_untracked"):
+        result["limitations"].append(
+            "This snapshot uses tracked source files. If the component is untracked, rebuild with --include-untracked."
+        )
     result["total"] = len(matches)
     result["test_filter"] = filtering
     return result

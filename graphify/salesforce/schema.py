@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 SCHEMA_VERSION = 9
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
-EXTRACTOR_VERSION = "0.5.9"
+EXTRACTOR_VERSION = "0.5.10"
 UPSTREAM_REVISION = "5eedffa87476a063a05bed96f17275ed63f05c1a"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})

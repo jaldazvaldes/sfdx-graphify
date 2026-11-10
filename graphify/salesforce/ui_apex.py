@@ -162,6 +162,28 @@ def _controller_names(markup, root_location, store, *, visualforce=False):
     return names
 
 
+def _vf_controller_references(source, root, definition, owners, local_classes, store):
+    first_index = 0 if root.values("controller") else 1
+    for index, owner in enumerate(owners, first_index):
+        is_controller = index == 0
+        attribute = "controller" if is_controller else "extensions"
+        role = "controller" if is_controller else "extension"
+        locator = f"{definition['locator']}/@{attribute}"
+        if not is_controller:
+            locator += f"[{index}]"
+        location = {**definition, "locator": locator}
+        target = component_id("apexclass", owner)
+        ambiguous = target in store.components and store.is_ambiguous(target)
+        if ambiguous or target not in local_classes:
+            store.diagnostic("VISUALFORCE_APEX_CLASS_UNRESOLVED",
+                             "A unique local Apex class definition is required for this Visualforce declaration.",
+                             location, state="ambiguous" if ambiguous else "unresolved", target=owner)
+            continue
+        store.relation(source, target, "references", location, f"visualforce.apex_{role}",
+                       {"basis": "literal_visualforce_apex_declaration", "attribute": attribute},
+                       {"context": f"visualforce_apex_{role}"})
+
+
 def _target(name, owners, apex_index, local_classes, store, location, *, channel, annotation=None):
     candidates = []
     ambiguous = False
@@ -511,6 +533,7 @@ def extract_ui_apex(sources: dict[str, bytes], apex_index, store: FactStore) -> 
         owners = _controller_names(markup, definition, store, visualforce=True)
         if owners is None:
             continue
+        _vf_controller_references(source, markup.root, definition, owners, local_classes, store)
         for index, element in enumerate(markup.actions if owners else [], 1):
             location = _location(definition["path"], definition["content_hash"],
                                  f"/markup/{element.name}[{index}]/@action", line=element.line, column=element.column)

@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.9 (unreleased)
+sfdx-graphify 0.5.10 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -55,7 +55,9 @@ The module form works without installing the console script:
   python -m graphify.salesforce serve --snapshot <external-directory> --before <earlier-directory>
 
 The installed command is sfdx-graphify. JSON is the default and keeps full
-coverage details. Query output with --format text shows a short coverage summary.
+coverage details. Query output with --format brief includes one source location
+per relationship and diagnostic totals. Use --format text for all displayed
+evidence and diagnostic records with a short coverage summary.
 Add --full-coverage to include the complete coverage object in text output. Use --source and --require-current on a query when freshness
 must be verified. Queries without source access report unknown freshness. Name
 ambiguity is an error with candidates, including duplicate local definitions.
@@ -64,7 +66,7 @@ From the folder containing sfdx-project.json, build once and query or open the
 viewer from that folder. The default private cache belongs to the checkout path.
 
   sfdx-graphify build .
-  sfdx-graphify refs Account.Name --format text
+  sfdx-graphify refs Account.Name --format brief
   sfdx-graphify serve
 
 Use --snapshot for an output directory selected with build --out. Rebuild when
@@ -86,15 +88,21 @@ REPEATED AGENT QUERIES
 
 For independent agent tool calls, keep a read-only loopback service running:
 
-  sfdx-graphify query-server --snapshot <external-directory> --port 8769 --expect-snapshot <snapshot-id>
-  sfdx-graphify refs Account.Name --server http://127.0.0.1:8769 --exclude-tests --expect-snapshot <snapshot-id>
-  sfdx-graphify deps SampleAccount --server http://127.0.0.1:8769
+  sfdx-graphify query-server --port 0
+  sfdx-graphify refs Account.Name --server <printed-url> --exclude-tests --format brief
+  sfdx-graphify deps SampleAccount --server <printed-url> --expect-snapshot <snapshot-id>
 
 The service verifies the full snapshot once at startup. Separate CLI calls reuse
 that in-memory generation; restarting adopts a new CURRENT.json. GET /status and
 POST /query accept the same query objects shown below. Responses contain id,
 exit_code and result. X-SFDX-Snapshot optionally pins each HTTP request. The CLI
 also accepts --expect-snapshot with --snapshot for early identity verification.
+From the project root, query-server and session default to the saved project
+snapshot. Pass --snapshot to start from a custom output directory. If the
+current project has a saved snapshot, --server checks its identity by default.
+Pass --expect-snapshot explicitly when querying a different saved generation
+or when running from outside the project. A fixed port must be free. With
+--port 0, the system chooses a free port and the service prints its URL.
 The service binds only to loopback, validates Host/Origin, permits no cross-origin
 access, and cannot select another snapshot or source directory from a request.
 The client follows no redirects or proxies. The 1 MiB HTTP limit is for request
@@ -230,8 +238,10 @@ SOQL, typed locals/parameters, direct record assignments, DML and unique explici
 static helper calls, including unique accessible local class-qualified targets.
 Overloaded names use canonical parameter signatures in component identities;
 unique method names keep their previous identities. Queries by an overloaded
-unqualified signature family return candidates. Call resolution uses arity and
-does not select between different signatures with the same argument count.
+name return candidates with readable signatures. When overloads share an arity,
+a local declaration or cast can prove an exact match for built-in types and
+typed collections of those types. The extractor requires verified local
+dispatch and reports candidate signatures for unresolved overloads.
 Declared local inheritance, unqualified/this calls and explicitly constructed
 instances support bounded method dispatch. Literal class references and locally
 corroborated managed namespace calls retain referenced-only external targets.
@@ -244,7 +254,11 @@ a fully resolved target hierarchy and no shadowing in the known caller scopes.
 Ambiguous, cyclic or unparsed local ancestors remain diagnostic. This candidate
 rule applies to local class-qualified calls.
 Recognized namespace receivers are treated as class qualifiers rather than
-record fields; their arguments still contribute dependencies and diagnostics.
+record fields. Their arguments still contribute dependencies and diagnostics.
+In classes and triggers, literal custom setting accessors can establish
+record and field reads from a unique local setting declaration. A literal
+new expression for a unique local Apex class creates a reference to that
+class. It does not infer which method a platform scheduler runs.
 An enhanced for loop with an explicitly declared single-record element type
 supports direct reads, memory assignments and explicit DML in its body. The
 element binding never leaks into the iterable expression or outside the loop.
@@ -297,7 +311,7 @@ This analysis follows the public fflib dispatch convention when the library
 source is absent. Dynamic dispatch, ambiguous types and event overrides outside
 this convention remain diagnostic.
 Call edges are static candidates, not execution traces. Unknown receiver types,
-same-arity overloads, external hierarchies, query aliases, dynamic queries,
+unresolved overloads, external hierarchies, query aliases, dynamic queries,
 polymorphic/unresolved paths and remaining parse failures are diagnosed rather
 than guessed. General collection/map aliases, constructor/initializer bodies and
 inner-class analysis remain outside this bounded implementation.
@@ -332,8 +346,9 @@ wire adapters establish separate static call candidates. Local bindings and
 shadowing are checked with the pinned JavaScript AST. Literal @salesforce/schema
 imports create object and field references, including resolved lookup hops.
 Aura tracks verified enqueues of literal controller actions to unique local
-@AuraEnabled methods. Visualforce tracks supported literal action bindings and
-remote action calls to unique local Apex targets. Dynamic bindings and ambiguous
+@AuraEnabled methods. Visualforce references unique local Apex controllers and
+extensions declared in markup. It also tracks supported literal action bindings
+and remote action calls to unique local Apex targets. Dynamic bindings and ambiguous
 targets remain diagnostic. Source modules and markup are hashed for provenance.
 
 Workflow outbound message definitions include object ownership and declared

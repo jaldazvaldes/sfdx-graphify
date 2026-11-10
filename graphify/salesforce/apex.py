@@ -31,6 +31,7 @@ _IGNORED = _COMMENTS | {"string_literal", "multi_line_string_literal"}
 _MAX_SOURCE_BYTES = 8 * 1024 * 1024
 _MAX_NODES = 200_000
 _RESERVED_RECEIVERS = frozenset({"trigger", "system", "schema", "database", "label", "page", "apexpages"})
+_BUILTIN_COLLECTION_ARITY = {"list": 1, "set": 1, "map": 2}
 
 
 def _parse_source(parser, data):
@@ -401,7 +402,7 @@ def _external_hierarchy(index, store, class_id):
     return None
 
 
-def _method_candidates(index, store, class_id, name, arity):
+def _method_candidates(index, store, class_id, name, arity, *, include_ambiguous=False):
     hierarchy = _class_hierarchy(index, store, class_id)
     if hierarchy is None:
         return []
@@ -412,10 +413,12 @@ def _method_candidates(index, store, class_id, name, arity):
                 continue
             signature = tuple(t.casefold() for t in method.parameter_types)
             selected.setdefault(signature, method)
-    return [method for method in selected.values() if not store.is_ambiguous(method.id)]
+    return [method for method in selected.values() if include_ambiguous or not store.is_ambiguous(method.id)]
 
 
 class _MethodExtractor:
+    _constructor_reference_rule = "apex.constructed_class"
+
     def __init__(self, method, index, store):
         self.method, self.index, self.store = method, index, store
         self.unit = method.unit
@@ -526,17 +529,102 @@ class _MethodExtractor:
         return any(b.name.casefold() == name.casefold() and b.scope.id in ancestors
                    and b.available_from <= node.start_byte for b in self.bindings)
 
-    def unshadowed_qualifier(self, name, node):
+    def unshadowed_qualifier(self, name, node, *, allow_external=False):
         """Prove a class/namespace receiver is not a lexical or inherited member.
 
         An unavailable ancestor may declare a field, property or inner type with
         this name. A complete local hierarchy lets us check those declarations
         instead of rejecting every qualified call made from a subclass.
         """
-        return (self.qualifier_hierarchy is not None and not self.has_binding(name, node)
+        hierarchy = self.qualifier_hierarchy
+        if hierarchy is None and allow_external and self.external_hierarchy is not None:
+            hierarchy = self.external_hierarchy[0]
+        return (hierarchy is not None and not self.has_binding(name, node)
                 and all(name.casefold() not in unit.declared_members
                         and name.casefold() not in unit.declared_types
-                        for unit in self.qualifier_hierarchy))
+                        for unit in hierarchy))
+
+    def _builtin_overload_type(self, node):
+        if node is None:
+            return None
+        if node.type == "type_identifier":
+            name = self.unit.text(node)
+            return name if name.casefold() in _PRIMITIVES else None
+        if node.type != "generic_type":
+            return None
+        parts = _significant(node)
+        if len(parts) != 2 or parts[1].type != "type_arguments":
+            return None
+        name = self.unit.text(parts[0])
+        arguments = _significant(parts[1])
+        if len(arguments) != _BUILTIN_COLLECTION_ARITY.get(name.casefold()):
+            return None
+        types = []
+        for argument in arguments:
+            argument_type = self._builtin_overload_type(argument)
+            if argument_type is None:
+                return None
+            types.append(argument_type)
+        return f"{name}<{','.join(types)}>"
+
+    def _argument_type_proof(self, argument):
+        argument = _without_parentheses(argument)
+        if argument is None:
+            return None
+        if argument.type == "cast_expression":
+            declaration, basis = argument, "explicit_cast"
+        elif argument.type == "identifier":
+            binding = self.binding(self.unit.text(argument), argument, report=False)
+            if binding is None:
+                return None
+            declaration = binding.node
+            if declaration.type == "variable_declarator":
+                declaration = declaration.parent
+            basis = "lexical_declaration"
+        else:
+            return None
+        type_node = declaration.child_by_field_name("type") if declaration is not None else None
+        name = self._builtin_overload_type(type_node)
+        if name is None:
+            return None
+        return {"type": name, "basis": basis, "location": self.unit.location(type_node)}
+
+    def _select_method(self, candidates, arguments):
+        """Keep arity-only dispatch, or narrow a proven local overload by exact types."""
+        if len(candidates) == 1 and not self.store.is_ambiguous(candidates[0].id):
+            return candidates[0], {}
+        if (len(candidates) < 2 or self.qualifier_hierarchy is None
+                or any(self.store.is_ambiguous(method.id) for method in candidates)):
+            return None, {}
+        proof = []
+        for argument in arguments:
+            item = self._argument_type_proof(argument)
+            if item is None:
+                return None, {}
+            proof.append(item)
+        signature = tuple(item["type"].casefold() for item in proof)
+        matches = [method for method in candidates
+                   if tuple(kind.casefold() for kind in method.parameter_types) == signature]
+        if len(matches) != 1:
+            return None, {}
+        target = matches[0]
+        types = set(re.findall(r"[a-z]+", ",".join(signature)))
+        target_hierarchy = _class_hierarchy(self.index, self.store, target.unit.class_id)
+        if (types & self.index.apex_types or target_hierarchy is None
+                or any(types & unit.declared_types for unit in self.qualifier_hierarchy + target_hierarchy)):
+            return None, {}
+        return target, {"overload_resolution": {"basis": "exact_builtin_argument_types", "arguments": proof}}
+
+    def _ambiguous_call(self, node, candidates, *, code="APEX_CALL_UNRESOLVED"):
+        if len(candidates) < 2 and not any(self.store.is_ambiguous(method.id) for method in candidates):
+            return False
+        ordered = sorted(candidates, key=lambda method: method.api_name.casefold())
+        shown = ordered[:8]
+        signatures = [f"{method.qualified_name}({','.join(method.parameter_types)})" for method in shown]
+        self.store.diagnostic(code, "No unique supported overload is established. Candidates: " + ", ".join(signatures),
+                              self.unit.location(node), state="ambiguous", candidates=[method.id for method in shown],
+                              signatures=signatures, candidate_count=len(ordered))
+        return True
 
     def edge(self, owner, name, relation, node, rule, qualifiers, resolution=None):
         location = self.unit.location(node)
@@ -545,6 +633,36 @@ class _MethodExtractor:
             self.store.relation(self.method.id, target, relation, location, rule,
                                 resolution=resolution or {"basis": "apex_ast", "parser": PARSER_VERSION, "object": owner},
                                 qualifiers=qualifiers)
+
+    def _setting_owner(self, node):
+        node = _without_parentheses(node)
+        if node is None or node.type != "method_invocation":
+            return None
+        method = self.unit.text(node.child_by_field_name("name")).casefold()
+        if method not in {"getinstance", "getvalues", "getorgdefaults"}:
+            return None
+        receiver = node.child_by_field_name("object")
+        if receiver is None or receiver.type != "identifier":
+            return None
+        name = self.unit.text(receiver)
+        if not API_NAME.fullmatch(name) or name.casefold() in self.index.apex_types:
+            return None
+        item = self.store.components.get(component_id("object", name))
+        if (not item or item.get("definition_status") != "defined"
+                or item.get("custom_settings_type") not in {"Hierarchy", "List"}):
+            return None
+        # Apex identifiers cannot contain consecutive underscores. For an exact
+        # unqualified local setting API name, an absent base cannot declare an
+        # Apex member with that name. Still check all visible scopes and types.
+        local_setting_name = name.casefold().endswith("__c") and not item.get("namespace")
+        if not self.unshadowed_qualifier(name, node, allow_external=local_setting_name):
+            return None
+        arity = len(_significant(node.child_by_field_name("arguments")))
+        if ((method in {"getinstance", "getvalues"} and arity == 1)
+                or (method in {"getinstance", "getorgdefaults"} and arity == 0
+                    and item["custom_settings_type"] == "Hierarchy")):
+            return item["api_name"]
+        return None
 
     def _indexed_record(self, expression):
         """Resolve one element access on a lexically declared List or Map."""
@@ -618,6 +736,13 @@ class _MethodExtractor:
                                         resolution={"basis": "literal_class_token", "parser": PARSER_VERSION})
                 return
         if resource is not None and resource.type != "identifier" and field_node is not None:
+            setting = self._setting_owner(resource)
+            if setting is not None and API_NAME.fullmatch(self.unit.text(field_node)):
+                self.edge(setting, self.unit.text(field_node), relation, field_node, "apex.custom_setting_field",
+                          {"operation": operation, "effect": "memory"},
+                          {"basis": "local_custom_setting_metadata", "object": setting})
+                self.visit(resource)
+                return
             indexed = self._indexed_record(resource)
             if indexed is not None and field_node.type == "identifier" and self.unit.text(field_node).casefold() != "class":
                 owner, binding, access, selector = indexed
@@ -649,11 +774,28 @@ class _MethodExtractor:
                    "declaration": {key: value for key, value in self.unit.location(binding.node).items() if key in {"path", "locator"}}})
 
     def constructor(self, node, *, database_operation=None):
-        owner, collection = self.record_type(node.child_by_field_name("type"))
+        type_node = node.child_by_field_name("type")
+        owner, collection = self.record_type(type_node)
         args = node.child_by_field_name("arguments")
         assignments = _significant(args)
         if not owner or collection:
-            self.diagnostic("APEX_CONSTRUCTOR_TYPE_UNRESOLVED", "The constructor does not establish a supported single-record object type.", node, "unresolved")
+            name = self.unit.text(type_node)
+            cid = (component_id("apexclass", name)
+                   if type_node is not None and type_node.type == "type_identifier" and API_NAME.fullmatch(name)
+                   else None)
+            target = self.store.components.get(cid) if cid is not None else None
+            folded = name.casefold()
+            if (target and target["definition_status"] == "defined" and target.get("inventory_method") == "apex_ast"
+                    and folded not in self.index.object_names and folded not in _STANDARD_OBJECTS
+                    and self.qualifier_hierarchy is not None
+                    and all(folded not in unit.declared_types for unit in self.qualifier_hierarchy)):
+                self.store.relation(self.method.id, cid, "references", self.unit.location(node),
+                                    self._constructor_reference_rule, qualifiers={"invocation": "constructor"},
+                                    resolution={"basis": "literal_local_class", "parser": PARSER_VERSION})
+            else:
+                self.diagnostic("APEX_CONSTRUCTOR_TYPE_UNRESOLVED",
+                                "The constructor does not establish a supported record type or unique local Apex class.",
+                                node, "unresolved")
             for arg in assignments:
                 self.visit(arg)
             return None
@@ -793,6 +935,14 @@ class _MethodExtractor:
             return
         if object_node is not None and object_node.type != "identifier":
             self.visit(object_node)
+        setting = self._setting_owner(node)
+        if setting is not None:
+            self.edge(setting, None, "reads", node, "apex.custom_setting_accessor",
+                      {"operation": "custom_setting", "field_set": "partial_explicit"},
+                      {"basis": "local_custom_setting_metadata", "object": setting})
+            for arg in args:
+                self.visit(arg)
+            return
         is_database = (object_name.casefold() == "database" and object_node is not None
                        and object_node.type == "identifier"
                        and self.unshadowed_qualifier(object_name, object_node)
@@ -808,15 +958,18 @@ class _MethodExtractor:
             return
         elif not object_name or object_name.casefold() == "this" or (object_name.casefold() == self.unit.name.casefold()
                                   and self.binding(object_name, object_node, report=False) is None):
-            candidates = _method_candidates(self.index, self.store, self.unit.class_id, name, len(args))
-            if (len(candidates) == 1 and (candidates[0].static or (not self.method.static
-                    and object_name.casefold() in {"", "this"}))):
-                static = candidates[0].static
-                self.store.relation(self.method.id, candidates[0].id, "calls", self.unit.location(node),
+            candidates = _method_candidates(self.index, self.store, self.unit.class_id, name, len(args), include_ambiguous=True)
+            target, overload = self._select_method(candidates, args)
+            if (target is not None and (target.static or (not self.method.static and object_name.casefold() in {"", "this"}))
+                    and (not overload or target.unit.class_id == self.unit.class_id
+                         or _modifiers(target.unit.data, target.node)[0] & {"public", "global", "protected"})):
+                static = target.static
+                self.store.relation(self.method.id, target.id, "calls", self.unit.location(node),
                                     "apex.local_static_call" if static else "apex.local_instance_call",
-                                    resolution={"basis": "unique_local_static_method" if static else "local_instance_method_candidate"},
+                                     resolution={"basis": "unique_local_static_method" if static else "local_instance_method_candidate",
+                                                 **overload},
                                     qualifiers={"invocation": "local_static_method" if static else "local_instance_method"})
-            else:
+            elif not self._ambiguous_call(node, candidates):
                 if self.unit.has_superclass and _class_hierarchy(self.index, self.store, self.unit.class_id) is None:
                     self.diagnostic("APEX_INHERITED_DISPATCH_UNSUPPORTED", "The local inheritance chain is unavailable or ambiguous; no inherited target is selected.", node)
                 self.diagnostic("APEX_CALL_UNRESOLVED", "The local call has no unique supported target with matching arity; parameter-type overload resolution remains deferred.", node,
@@ -826,23 +979,22 @@ class _MethodExtractor:
             # path, but a variable/member or inherited overload must never be
             # mistaken for a class-qualified reference.
             cid = component_id("apexclass", object_name) if API_NAME.fullmatch(object_name) else None
-            candidates = _method_candidates(self.index, self.store, cid, name, len(args)) if cid else []
+            candidates = (_method_candidates(self.index, self.store, cid, name, len(args), include_ambiguous=True)
+                          if cid else [])
             literal_class = (object_node is not None and object_node.type == "identifier"
                              and self.unshadowed_qualifier(object_name, object_node)
                              and cid in self.store.components
                              and not self.store.is_ambiguous(cid))
-            if (literal_class and len(candidates) == 1 and candidates[0].static
-                    and candidates[0].parameter_count == len(args)
-                    and not self.store.is_ambiguous(candidates[0].id)
-                    and _modifiers(candidates[0].unit.data, candidates[0].node)[0] & {"public", "global"}):
-                self.store.relation(self.method.id, candidates[0].id, "calls", self.unit.location(node),
-                                    "apex.cross_class_static_call", resolution={"basis": "unique_local_static_method"},
+            target, overload = self._select_method(candidates, args) if literal_class else (None, {})
+            if target is not None and target.static and _modifiers(target.unit.data, target.node)[0] & {"public", "global"}:
+                self.store.relation(self.method.id, target.id, "calls", self.unit.location(node),
+                                     "apex.cross_class_static_call", resolution={"basis": "unique_local_static_method", **overload},
                                     qualifiers={"invocation": "static_method"})
             elif self._candidate_static_invocation(node, object_node, object_name, candidates):
                 pass
             elif self._instance_invocation(node):
                 pass
-            else:
+            elif not (literal_class and self._ambiguous_call(node, candidates)):
                 self.diagnostic("APEX_EXTERNAL_CALL_UNSUPPORTED", "No unique literal local static target is proven; external, instance and inherited dispatch remain unresolved.", node)
         for arg in args:
             self.visit(arg)
@@ -934,13 +1086,15 @@ class _MethodExtractor:
         cid = self._constructed_class(node.child_by_field_name("object"), node)
         if not cid:
             return False
-        methods = _method_candidates(self.index, self.store, cid, self.unit.text(node.child_by_field_name("name")),
-                                     len(_significant(node.child_by_field_name("arguments"))))
-        if len(methods) != 1 or methods[0].static or not (_modifiers(methods[0].unit.data, methods[0].node)[0] & {"public", "global"}):
-            return False
-        self.store.relation(self.method.id, methods[0].id, "calls", self.unit.location(node), "apex.constructed_instance_call",
+        args = _significant(node.child_by_field_name("arguments"))
+        candidates = _method_candidates(self.index, self.store, cid, self.unit.text(node.child_by_field_name("name")),
+                                        len(args), include_ambiguous=True)
+        target, overload = self._select_method(candidates, args)
+        if target is None or target.static or not (_modifiers(target.unit.data, target.node)[0] & {"public", "global"}):
+            return self._ambiguous_call(node, candidates)
+        self.store.relation(self.method.id, target.id, "calls", self.unit.location(node), "apex.constructed_instance_call",
                             qualifiers={"invocation": "constructed_instance_method"},
-                            resolution={"basis": "explicit_constructor_type", "class": cid, "parser": PARSER_VERSION})
+                             resolution={"basis": "explicit_constructor_type", "class": cid, "parser": PARSER_VERSION, **overload})
         return True
 
     def visit(self, node):

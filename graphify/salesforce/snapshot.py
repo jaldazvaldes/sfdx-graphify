@@ -154,13 +154,15 @@ def _read_source_root(out: Path) -> Path | None:
     _no_links(path)
     if not path.exists():
         return None
+    if not path.is_file():
+        raise DataError("Invalid snapshot source mapping file")
     try:
         value = json.loads(_read_limited(path, _MAX_POINTER_BYTES).decode("utf-8"))
         value = value["source_root"]
         if not isinstance(value, str) or not Path(value).is_absolute():
             raise DataError("Invalid source mapping in snapshot sidecar")
         return Path(value).resolve()
-    except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
         if isinstance(exc, DataError):
             raise
         raise DataError("Cannot read snapshot source mapping") from exc
@@ -228,26 +230,50 @@ def publish(bundle: dict, out: Path, source_root: Path,
         raise DataError(f"Cannot publish snapshot: {exc}") from exc
 
 
+def _read_pointer(destination: Path) -> dict:
+    path = destination / "CURRENT.json"
+    _no_links(path)
+    if not path.is_file():
+        raise DataError("Snapshot pointer is missing or is not a file")
+    try:
+        pointer = json.loads(_read_limited(path, _MAX_POINTER_BYTES).decode("utf-8"))
+    except RecursionError as exc:
+        raise DataError("Snapshot pointer nesting is too deep") from exc
+    version = pointer.get("schema_version") if isinstance(pointer, dict) else None
+    if type(version) is not int or version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise DataError("Unsupported snapshot pointer schema")
+    generation = pointer.get("generation")
+    if not isinstance(generation, str) or not _HEX.fullmatch(generation):
+        raise DataError("Invalid snapshot generation identifier")
+    snapshot_id = pointer.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or generation != _sha(snapshot_id.encode("utf-8")):
+        raise DataError("Snapshot ID does not match its generation")
+    hashes = pointer.get("sha256")
+    if not isinstance(hashes, dict) or set(hashes) != set(_ARTIFACTS):
+        raise DataError("Invalid snapshot artifact manifest")
+    if any(not isinstance(digest, str) or not _HEX.fullmatch(digest) for digest in hashes.values()):
+        raise DataError("Invalid snapshot artifact checksum")
+    return pointer
+
+
+def current_snapshot_id(out: Path) -> str:
+    """Read the checked CURRENT identity without loading generation artifacts."""
+    try:
+        return _read_pointer(Path(out).expanduser().absolute())["snapshot_id"]
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, DataError):
+            raise
+        raise DataError(f"Cannot read snapshot pointer: {exc}") from exc
+
+
 def load(out: Path, *, expect_snapshot: str | None = None) -> dict:
     """Read one generation, verify every artifact, then validate canonical facts."""
     artifact_limit = _artifact_limit_bytes()
     destination = Path(out).expanduser().absolute()
     _no_links(destination)
     try:
-        pointer_path = destination / "CURRENT.json"
-        _no_links(pointer_path)
-        pointer = json.loads(_read_limited(pointer_path, _MAX_POINTER_BYTES).decode("utf-8"))
-        if not isinstance(pointer, dict) or pointer.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
-            raise DataError("Unsupported snapshot pointer schema")
-        generation = pointer.get("generation")
-        if not isinstance(generation, str) or not _HEX.fullmatch(generation):
-            raise DataError("Invalid snapshot generation identifier")
-        snapshot_id = pointer.get("snapshot_id")
-        if not isinstance(snapshot_id, str) or generation != _sha(snapshot_id.encode("utf-8")):
-            raise DataError("Snapshot ID does not match its generation")
-        hashes = pointer.get("sha256")
-        if not isinstance(hashes, dict) or set(hashes) != set(_ARTIFACTS):
-            raise DataError("Invalid snapshot artifact manifest")
+        pointer = _read_pointer(destination)
+        generation, snapshot_id, hashes = pointer["generation"], pointer["snapshot_id"], pointer["sha256"]
         if expect_snapshot is not None and snapshot_id != expect_snapshot:
             raise DataError(f"Expected snapshot {expect_snapshot}; loaded {snapshot_id}.")
         directory = destination / "generations" / generation
@@ -257,7 +283,7 @@ def load(out: Path, *, expect_snapshot: str | None = None) -> dict:
             path = directory / name
             _no_links(path)
             contents[name] = _read_limited(path, artifact_limit, artifact=True)
-            if not isinstance(hashes[name], str) or _sha(contents[name]) != hashes[name]:
+            if _sha(contents[name]) != hashes[name]:
                 raise DataError(f"Snapshot integrity check failed: {name}")
         bundle = {key: json.loads(contents[f"{key}.json"].decode("utf-8"))
                   for key in ("manifest", "facts", "diagnostics")}

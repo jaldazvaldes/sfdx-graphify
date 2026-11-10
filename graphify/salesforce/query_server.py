@@ -11,6 +11,7 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from . import query, snapshot
+from .listener import LoopbackHTTPServer
 from .schema import DataError, canonical_json
 from .session import answer_request, parse_request
 
@@ -46,8 +47,7 @@ def create_query_server(directory: Path, host: str = "127.0.0.1", port: int = 87
               else snapshot.load(directory))
     snapshot_id = bundle["manifest"]["snapshot_id"]
 
-    class QueryServer(ThreadingHTTPServer):
-        daemon_threads = True
+    class QueryServer(LoopbackHTTPServer):
         address_family = socket.AF_INET6 if version == 6 else socket.AF_INET
 
     class Handler(BaseHTTPRequestHandler):

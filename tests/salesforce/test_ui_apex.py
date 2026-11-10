@@ -1,4 +1,4 @@
-"""Synthetic Aura and Visualforce calls with conservative Apex resolution."""
+"""Synthetic Aura and Visualforce dependencies with conservative Apex resolution."""
 
 import hashlib
 
@@ -9,6 +9,7 @@ from graphify.salesforce.ui_apex import extract_ui_apex, ui_source
 
 AURA = "force-app/main/default/aura/Sample/Sample"
 PAGE = "force-app/main/default/pages/Sample.page"
+COMPONENT = "force-app/main/default/components/Sample.component"
 AURA_CLASS = b"""public class AuraExample {
     @AuraEnabled public static void load() {}
     @AuraEnabled public static void direct() {}
@@ -125,6 +126,53 @@ def test_visualforce_controller_conflicts_and_missing_extensions_are_diagnostic(
         assert not calls(store)
         assert any(row["code"] == "VISUALFORCE_APEX_TARGET_UNRESOLVED" and row["state"] == expected
                    for row in store.diagnostics)
+
+
+def test_visualforce_references_local_controller_and_extensions_without_actions():
+    page = b'<apex:page standardController="Account" extensions=" FirstExtension , SecondExtension "/>'
+    component = b'<apex:component controller="PageExample" extensions="SecondExtension"/>'
+    store = extract({PAGE: page, COMPONENT: component}, {
+        "PageExample": VF_CLASS,
+        "FirstExtension": b"public class FirstExtension {}",
+        "SecondExtension": b"public class SecondExtension {}",
+        "Account": b"public class Account {}",
+    })
+    assert not calls(store)
+    found = {(edge["source"], edge["target"]): store.evidence[edge["evidence_ids"][0]]
+             for edge in store.relationships.values() if edge["relation"] == "references"}
+    assert set(found) == {
+        ("sf:visualforcepage:sample", "sf:apexclass:firstextension"),
+        ("sf:visualforcepage:sample", "sf:apexclass:secondextension"),
+        ("sf:visualforcecomponent:sample", "sf:apexclass:pageexample"),
+        ("sf:visualforcecomponent:sample", "sf:apexclass:secondextension"),
+    }
+    controller = found["sf:visualforcecomponent:sample", "sf:apexclass:pageexample"]
+    assert controller["rule"] == "visualforce.apex_controller"
+    assert controller["locator"] == "/markup/apex:component/@controller"
+    assert controller["path"] == COMPONENT
+    assert controller["content_hash"] == hashlib.sha256(component).hexdigest()
+    second_extension = found["sf:visualforcepage:sample", "sf:apexclass:secondextension"]
+    assert second_extension["rule"] == "visualforce.apex_extension"
+    assert second_extension["locator"] == "/markup/apex:page/@extensions[2]"
+
+
+def test_visualforce_class_declarations_do_not_guess_ambiguous_or_external_targets():
+    page = b'<apex:page controller="PageExample" extensions="vendor.Extension, ValidExtension"/>'
+    store = extract({PAGE: page}, {
+        "one/PageExample": VF_CLASS,
+        "two/PageExample": VF_CLASS,
+        "Extension": b"public class Extension {}",
+        "ValidExtension": b"public class ValidExtension {}",
+    })
+    assert {edge["target"] for edge in store.relationships.values() if edge["relation"] == "references"} == {
+        "sf:apexclass:validextension",
+    }
+    assert "sf:apexclass:vendor.extension" not in store.components
+    assert {(row["target"], row["state"]) for row in store.diagnostics
+            if row["code"] == "VISUALFORCE_APEX_CLASS_UNRESOLVED"} == {
+        ("PageExample", "ambiguous"), ("vendor.Extension", "unresolved"),
+    }
+
 
 def test_aura_client_side_action_name_collision_is_diagnostic():
     controller = b'({ "load": function(component, event, helper) { helper.run(component); } })'

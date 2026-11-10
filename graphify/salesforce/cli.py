@@ -17,12 +17,13 @@ New builds exclude explicitly inactive local Flows (Obsolete, Draft, InvalidDraf
 Use build --include-inactive for historical analysis. Unknown/ambiguous status is retained.
 Check activity_policy in query results: older snapshots can include every local status.
 Inspect coverage and diagnostics before relying on results.
-Text queries show a compact coverage summary. Use --full-coverage for detail or --format json for structured output.
+Use --format brief for one source location per relationship and diagnostic totals.
+Use --format text for detailed evidence, --full-coverage for the complete coverage object or JSON for structured output.
 refs, deps and impact include diagnostic_context: complete counts by code/file and at most 20 focused records by default.
 Use --diagnostics full for every diagnostic in consulted files; JSONL/HTTP requests use diagnostics: "full".
 omitted_count reports records omitted from the response; no diagnostics are removed from the snapshot.
 Zero results or zero local diagnostics do not establish complete coverage of unknown consumers.
-Find exact references with: sfdx-graphify refs Account.Name --format text
+Find exact references with: sfdx-graphify refs Account.Name --format brief
 Inspect what a Flow uses with: sfdx-graphify deps Sample_Flow --format json
 Inspect validation rule inputs with: sfdx-graphify deps sf:validationrule:account.require_phone --format json
 Follow a specific relationship with: sfdx-graphify explain <relationship-id>
@@ -36,9 +37,10 @@ Inspect a focused graph: sfdx-graphify view Account.Name --mode impact
 Use status --source for explicit full verification at the start or when sources change.
 Ordinary queries and sessions do not rescan source and report unknown freshness.
 Artifact limit: 512 MiB by default; configure SFDX_GRAPHIFY_MAX_ARTIFACT_MIB. No records are dropped.
-For independent agent calls, keep a local service running: sfdx-graphify query-server --snapshot <directory> --port 8769
-Then: sfdx-graphify refs Account.Name --server http://127.0.0.1:8769 --exclude-tests
-Use --expect-snapshot <id> to require the same snapshot on either local or server queries.
+For independent agent calls, start the local service with sfdx-graphify query-server --port 0.
+Use the URL it prints with --server on subsequent queries. Pass --snapshot to load a custom snapshot.
+Server queries from a project root check its saved snapshot ID when available.
+Pass --expect-snapshot <id> to pin a specific snapshot, including one from another checkout.
 Tests remain in canonical facts. --exclude-tests filters explicit AST classifications; unknowns remain included.
 Impact results identify candidates for inspection, not execution order or proven runtime effects.
 Candidate calls include unverified external hierarchies and conditional trigger dispatch.
@@ -56,10 +58,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--version", action="version", version=f"%(prog)s {EXTRACTOR_VERSION}")
     commands = result.add_subparsers(dest="command", required=True)
     session = commands.add_parser("session", help="Load a snapshot once and answer UTF-8 JSONL queries until EOF.")
-    session.add_argument("--snapshot", required=True, type=Path)
+    session.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
     session.add_argument("--expect-snapshot", help="Refuse startup unless the loaded snapshot has this exact ID.")
     query_server = commands.add_parser("query-server", help="Keep a verified snapshot in memory for independent localhost queries.")
-    query_server.add_argument("--snapshot", required=True, type=Path)
+    query_server.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
     query_server.add_argument("--port", type=int, default=8769)
     query_server.add_argument("--expect-snapshot")
     build = commands.add_parser("build", help="Build a local canonical snapshot.")
@@ -91,7 +93,8 @@ def parser() -> argparse.ArgumentParser:
         location.add_argument("--server", help="Query the persistent localhost service without loading snapshot files.")
         command.add_argument("--expect-snapshot")
         command.add_argument("--source", type=Path)
-        command.add_argument("--format", choices=("json", "text"), default="json")
+        command.add_argument("--format", choices=("json", "text", "brief"), default="json",
+                             help="JSON, detailed text, or brief text with source locations and diagnostic totals.")
         command.add_argument("--full-coverage", action="store_true",
                              help="Include full snapshot coverage in text output.")
         command.add_argument("--require-current", action="store_true")
@@ -126,21 +129,40 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _project_snapshot() -> Path:
+def _available_project_snapshot(root: Path) -> Path | None:
     from .snapshot import default_output, source_root
 
-    root = Path.cwd()
-    if not (root / "sfdx-project.json").is_file():
-        raise DataError("Open the project folder containing sfdx-project.json or pass --snapshot.")
     snapshot = default_output(root)
-    if not (snapshot / "CURRENT.json").is_file():
-        raise DataError("No saved snapshot for this project. Run sfdx-graphify build . or pass --snapshot.")
+    try:
+        (snapshot / "CURRENT.json").lstat()
+    except FileNotFoundError:
+        return None
     if source_root(snapshot) != root.resolve():
-        raise DataError("The saved snapshot does not belong to this checkout. Run sfdx-graphify build . or pass --snapshot.")
+        raise DataError("The saved snapshot does not belong to this checkout. Rebuild it with sfdx-graphify build .")
     return snapshot
 
 
-def _text(result: dict, *, full_coverage: bool = False) -> str:
+def _project_snapshot() -> Path:
+    root = Path.cwd()
+    if not (root / "sfdx-project.json").is_file():
+        raise DataError("Open the project folder containing sfdx-project.json or pass --snapshot.")
+    snapshot = _available_project_snapshot(root)
+    if snapshot is None:
+        raise DataError("No saved snapshot for this project. Run sfdx-graphify build . or pass --snapshot.")
+    return snapshot
+
+
+def _project_snapshot_id() -> str | None:
+    from .snapshot import current_snapshot_id
+
+    root = Path.cwd()
+    if not (root / "sfdx-project.json").is_file():
+        return None
+    snapshot = _available_project_snapshot(root)
+    return current_snapshot_id(snapshot) if snapshot is not None else None
+
+
+def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> str:
     lines = [f"Snapshot: {result.get('snapshot_id', 'unavailable')}"]
     if "freshness" in result:
         freshness = result["freshness"]
@@ -168,7 +190,8 @@ def _text(result: dict, *, full_coverage: bool = False) -> str:
                              f"{occurrence.get('locator', '')} [{occurrence['id']}]")
     for item in result.get("results", []):
         if "relation" in item:
-            lines.append(f"{item['source']} --{item['relation']}--> {item['target']} [{item['id']}]")
+            relationship = f"{item['source']} --{item['relation']}--> {item['target']}"
+            lines.append(relationship if brief else f"{relationship} [{item['id']}]")
             resolution = item.get("resolution", {})
             if resolution.get("status") == "candidate":
                 reason = {"external_hierarchy": "external hierarchy not verified",
@@ -179,9 +202,17 @@ def _text(result: dict, *, full_coverage: bool = False) -> str:
                 lines.append(f"  CANDIDATE: {reason}" + (f"; missing ancestors: {missing}" if missing else ""))
             traversal = item.get("traversal", {})
             if traversal.get("includes_candidate_calls"):
-                lines.append("  Witness path includes candidate calls: "
-                             + ", ".join(traversal["candidate_relationship_ids"]))
-            for occurrence in item.get("evidence", []):
+                witness = "  Witness path includes candidate calls"
+                lines.append(witness + "." if brief else
+                             witness + ": " + ", ".join(traversal["candidate_relationship_ids"]))
+            evidence = item.get("evidence", [])
+            if brief and evidence:
+                occurrence = evidence[0]
+                line = occurrence.get("line")
+                location = occurrence["path"] + (f":{line}" if line is not None else "")
+                extra = len(evidence) - 1
+                lines.append(f"  {location}" + (f" (+{extra} more occurrences)" if extra else ""))
+            for occurrence in (() if brief else evidence):
                 location = occurrence.get("line")
                 suffix = f":{location}" if location is not None else ""
                 lines.append(f"  {occurrence['path']}{suffix} {occurrence['locator']} [{occurrence['id']}]")
@@ -193,14 +224,22 @@ def _text(result: dict, *, full_coverage: bool = False) -> str:
                     if isinstance(site, dict) and site.get("path"):
                         lines.append(f"    {label}: {site['path']}:{site.get('line', '?')} {site.get('locator', '')}")
         else:
-            lines.append(f"{item['id']} {item.get('api_name', '')}")
+            lines.append(f"{item['api_name']} ({item['kind']})" if brief else
+                         f"{item['id']} {item.get('api_name', '')}")
     if result.get("truncated"):
         lines.append("Results truncated by traversal depth or limit.")
-    if "truncation" in result:
+    if "truncation" in result and not brief:
         lines.append("Traversal limits: " + json.dumps(result["truncation"], sort_keys=True))
     if "test_filter" in result:
-        lines.append("Test filter: " + json.dumps(result["test_filter"], sort_keys=True))
-    if "diagnostic_context" in result:
+        test_filter = result["test_filter"]
+        if not brief:
+            lines.append("Test filter: " + json.dumps(test_filter, sort_keys=True))
+        elif test_filter["exclude_tests"]:
+            lines.append(f"Test components excluded: {test_filter['excluded_components_in_snapshot']}.")
+    if "diagnostic_context" in result and brief:
+        context = result["diagnostic_context"]
+        lines.append(f"Source diagnostics: {context['total']} ({context['scope']}).")
+    elif "diagnostic_context" in result:
         context = result["diagnostic_context"]
         lines.append(f"Source diagnostics: {context['total']} ({context['scope']}); "
                      f"{context['returned_count']} shown, {context['omitted_count']} omitted [{context['mode']}]")
@@ -225,7 +264,8 @@ def _text(result: dict, *, full_coverage: bool = False) -> str:
                 match = mentions[key]
                 lines.append(f"  {match['literal']} ({label}): {match['occurrence_count']} matches "
                              f"in {match['file_count']} files.")
-                lines.extend(f"    {path}" for path in match["example_paths"])
+                examples = match["example_paths"]
+                lines.extend(f"    {path}" for path in (examples[:1] if brief else examples))
             lines.append(mentions["interpretation"])
         else:
             lines.append(f"Literal search unavailable: {mentions['reason']}")
@@ -233,9 +273,12 @@ def _text(result: dict, *, full_coverage: bool = False) -> str:
     if result.get("error"):
         lines.append(f"Error: {result['error']}")
     for candidate in result.get("candidates", []):
-        lines.append(f"Candidate: {candidate['id']}")
+        name = candidate.get("api_name") or candidate["id"]
+        label = name if brief or name == candidate["id"] else f"{name} [{candidate['id']}]"
+        lines.append(f"Candidate: {label}")
         for definition in candidate.get("definitions", []):
-            lines.append(f"  {definition['path']} {definition.get('locator', '')}")
+            path = definition["path"]
+            lines.append(path if brief else f"  {path} {definition.get('locator', '')}")
     return "\n".join(lines)
 
 
@@ -262,7 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "query-server":
         from .query_server import serve_queries
         try:
-            serve_queries(args.snapshot, port=args.port, expect_snapshot=args.expect_snapshot)
+            serve_queries(args.snapshot or _project_snapshot(), port=args.port,
+                          expect_snapshot=args.expect_snapshot)
             return 0
         except KeyboardInterrupt:
             return 0
@@ -276,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
                 configure = getattr(stream, "reconfigure", None)
                 if callable(configure):
                     configure(encoding="utf-8")
-            return run_session(args.snapshot, expect_snapshot=args.expect_snapshot)
+            return run_session(args.snapshot or _project_snapshot(), expect_snapshot=args.expect_snapshot)
         except KeyboardInterrupt:
             return 130
         except (DataError, OSError, ValueError) as exc:
@@ -312,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
             for key in ("name", "relation", "limit", "depth", "kind", "exclude_tests", "diagnostics"):
                 if hasattr(args, key) and getattr(args, key) is not None:
                     request[key] = getattr(args, key)
-            response = request_query(args.server, request, expected_snapshot=args.expect_snapshot)
+            expected = args.expect_snapshot if args.expect_snapshot is not None else _project_snapshot_id()
+            response = request_query(args.server, request, expected_snapshot=expected)
             result, code = response["result"], response["exit_code"]
         else:
             from .snapshot import load
@@ -366,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         code = 1
     full_coverage = args.command in {"build", "export"} or getattr(args, "full_coverage", False)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True) if output_format == "json"
-          else _text(result, full_coverage=full_coverage))
+          else _text(result, full_coverage=full_coverage, brief=output_format == "brief"))
     if code:
         print(result["error"], file=sys.stderr)
     return code

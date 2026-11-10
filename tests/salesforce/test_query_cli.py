@@ -252,3 +252,37 @@ def test_query_text_coverage_is_compact_and_full_output_is_opt_in(bundle, monkey
 
     assert cli.main(command) == 0
     assert json.loads(capsys.readouterr().out)["coverage"] == coverage
+
+def test_brief_query_keeps_source_location_and_counts_without_verbose_evidence(bundle, monkeypatch, capsys):
+    from graphify.salesforce import snapshot
+
+    monkeypatch.setattr(snapshot, "load", lambda path: bundle)
+    bundle["diagnostics"] = [{
+        "code": "UNSUPPORTED", "message": "Verbose diagnostic details.",
+        "location": {"path": "flows/Sample.flow-meta.xml", "line": 1},
+    }]
+    command = ["refs", "Account.Name", "--snapshot", "unused"]
+    assert cli.main([*command, "--format", "brief"]) == 0
+    output = capsys.readouterr().out
+    assert "flows/Sample.flow-meta.xml:1 (+1 more occurrences)" in output
+    assert "Source diagnostics: 1" in output
+    assert "Missing relationships do not prove absence" in output
+    assert "relationship:0" not in output
+    assert "/Flow/assignments" not in output
+    assert "Verbose diagnostic details." not in output
+
+    assert cli.main([*command, "--format", "text"]) == 0
+    output = capsys.readouterr().out
+    assert "relationship:0" in output
+    assert "Verbose diagnostic details." in output
+
+def test_empty_component_search_explains_tracked_scope(bundle):
+    scope = bundle["manifest"]["scope"]
+    scope.update(selection="git_tracked", include_untracked=False)
+    result = query.components(bundle, "NewExample")
+    assert result["total"] == 0
+    assert any("--include-untracked" in item for item in result["limitations"])
+
+    scope["include_untracked"] = True
+    result = query.components(bundle, "NewExample")
+    assert all("--include-untracked" not in item for item in result["limitations"])
