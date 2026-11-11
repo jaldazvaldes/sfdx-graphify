@@ -1186,6 +1186,8 @@ class _MethodExtractor:
             return False
         member_name = self.unit.text(receiver)
         key = member_name.casefold()
+        if not explicit and key in _RESERVED_RECEIVERS:
+            return False
         for depth, unit in enumerate(hierarchy):
             if key not in unit.declared_members:
                 continue
