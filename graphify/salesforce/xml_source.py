@@ -11,6 +11,7 @@ from xml.parsers import expat
 from .schema import DataError
 
 METADATA_NS = "http://soap.sforce.com/2006/04/metadata"
+XML_SCHEMA_INSTANCE_NS = "http://www.w3.org/2001/XMLSchema-instance"
 MAX_XML_BYTES = 8 * 1024 * 1024
 
 
@@ -24,6 +25,9 @@ class Node:
     end_line: int | None = None
     end_column: int | None = None
     locator: str = ""
+    lexical_text: str | None = None
+    attributes: dict[str, str] | None = None
+    xsi_type_namespace: str | None = None
 
     def child(self, tag):
         return next((child for child in self.children if child.tag == tag), None)
@@ -67,6 +71,16 @@ def parse_xml(path: str, data: bytes) -> Document:
     parser = expat.ParserCreate(namespace_separator="|")
     stack, roots = [], []
     count = 0
+    capture_values = path.casefold().endswith(".md-meta.xml")
+    namespaces: dict[str | None, list[str | None]] = {}
+
+    def start_namespace(prefix, uri):
+        namespaces.setdefault(prefix, []).append(uri)
+
+    def end_namespace(prefix):
+        namespaces[prefix].pop()
+        if not namespaces[prefix]:
+            del namespaces[prefix]
 
     def start(name, attributes):
         nonlocal count
@@ -77,6 +91,14 @@ def parse_xml(path: str, data: bytes) -> Document:
             namespace, local = name.rsplit("|", 1)
             name = local if namespace == METADATA_NS else "{" + namespace + "}" + local
         node = Node(name, line=parser.CurrentLineNumber, column=parser.CurrentColumnNumber + 1)
+        if capture_values and name == "value":
+            node.attributes = attributes or None
+            lexical_type = attributes.get(f"{XML_SCHEMA_INSTANCE_NS}|type")
+            if lexical_type is not None:
+                prefix, separator, _ = lexical_type.strip().partition(":")
+                binding = namespaces.get(prefix if separator else None)
+                if binding:
+                    node.xsi_type_namespace = binding[-1]
         if stack:
             stack[-1].children.append(node)
         else:
@@ -85,6 +107,8 @@ def parse_xml(path: str, data: bytes) -> Document:
 
     def end(name):
         node = stack.pop()
+        if capture_values and node.tag == "value":
+            node.lexical_text = node.text
         node.text = node.text.strip()
         # Expat reports the start of the closing tag; keep end precision absent.
         node.end_line = None
@@ -97,6 +121,9 @@ def parse_xml(path: str, data: bytes) -> Document:
     def forbidden(*args):
         raise DataError(f"DTD and entity declarations are forbidden: {path}")
 
+    if capture_values:
+        parser.StartNamespaceDeclHandler = start_namespace
+        parser.EndNamespaceDeclHandler = end_namespace
     parser.StartElementHandler = start
     parser.EndElementHandler = end
     parser.CharacterDataHandler = text

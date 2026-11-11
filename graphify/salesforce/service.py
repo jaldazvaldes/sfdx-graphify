@@ -13,6 +13,8 @@ from .triggers import index_triggers, extract_triggers
 from .lwc import extract_lwc
 from .workflow import index_workflow, extract_workflow
 from .approval import index_approval_processes, extract_approval_processes
+from .custom_metadata import extract_custom_metadata, index_custom_metadata
+from .custom_metadata_accessors import extract_custom_metadata_accessors, parse_accessor_rules
 from .permissions import index_permissions, extract_permissions
 from .named_credentials import index_named_credentials, extract_named_credential_endpoints
 from .ui_apex import ui_source, extract_ui_apex
@@ -35,11 +37,13 @@ LIMITATIONS = [
     "Literal metadata mentions are review hints and do not establish dependency edges.",
     "Permission edges record explicit grants in local profiles and permission sets. Assignments, groups, muting, sharing and effective access are outside coverage.",
     "Named Credential references cover proven HttpRequest receivers with a literal callout endpoint; dynamic destinations and integration execution are outside coverage.",
+    "Custom metadata record values are explicit local declarations. Exact text mentions are inferred; configured Apex accessors require a literal field argument.",
     "Referenced-only targets have not been validated against a complete Salesforce schema.",
 ]
 
 
-def build_project(root, *, out=None, include_untracked=False, include_inactive=False):
+def build_project(root, *, out=None, include_untracked=False, include_inactive=False, custom_metadata_accessors=None):
+    accessor_rules = parse_accessor_rules(custom_metadata_accessors) if custom_metadata_accessors is not None else []
     root = Path(root).expanduser().absolute()
     output = validate_output(Path(out) if out is not None else default_output(root), source_root=root)
     scan = discover(root, include_untracked=include_untracked)
@@ -67,7 +71,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         store.diagnostic(**entry)
     documents, apex, triggers, trigger_metadata, lightning, workflows = [], {}, {}, [], {}, []
     approvals, ui = [], {}
-    permissions, named_credentials = [], []
+    permissions, named_credentials, custom_metadata = [], [], []
     for path, data in sorted(scan.files.items()):
         if lwc_bundle(path):
             lightning[path] = data
@@ -81,6 +85,14 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                                  {"path": path, "content_hash": scan.inputs[path]}, state="unresolved")
             else:
                 approvals.append(approval)
+        elif path.casefold().endswith(".md-meta.xml"):
+            try:
+                document = parse_xml(path, data)
+            except DataError as exc:
+                store.diagnostic("CUSTOM_METADATA_XML_UNRESOLVED", str(exc),
+                                 {"path": path, "content_hash": scan.inputs[path]}, state="unresolved")
+            else:
+                custom_metadata.append(document)
         elif path.casefold().endswith((".profile-meta.xml", ".permissionset-meta.xml", ".namedcredential-meta.xml")):
             is_credential = path.casefold().endswith(".namedcredential-meta.xml")
             try:
@@ -114,6 +126,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     index_definitions(documents, store)
     index_workflow(workflows, store)
     index_approval_processes(approvals, store)
+    index_custom_metadata(custom_metadata, store)
     index_permissions(permissions, store)
     index_named_credentials(named_credentials, store)
     apex_index = index_apex(apex, store)
@@ -123,6 +136,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     extract_workflow(workflows, store, excluded=excluded)
     extract_approval_processes(approvals, workflows, store, excluded=excluded)
     extract_apex(apex_index, store)
+    if accessor_rules:
+        extract_custom_metadata_accessors(apex_index, store, accessor_rules)
     extract_named_credential_endpoints(apex_index, store)
     extract_permissions(permissions, store)
     extract_triggers(trigger_index, apex_index, store, excluded=set(excluded))
@@ -138,6 +153,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                 extract_validation_rule(document, store)
     resolve_invocable_calls(store, apex_index)
     activity_policy = remove_inactive(store, excluded, include_inactive=include_inactive)
+    extract_custom_metadata(custom_metadata, store)
     facts = store.finish()
     diagnostics = sorted(store.diagnostics, key=lambda d: d["id"])
     observed_versions = {d.root.value("apiVersion") for d in [*documents, *trigger_metadata]
@@ -174,6 +190,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                                "Aura and Visualforce (bounded static Apex actions)",
                                "Profile and PermissionSet (explicit field, object and Apex class grants)",
                                "NamedCredential (local definitions and literal Apex HttpRequest endpoint references)",
+                               "CustomMetadata (local records, explicit values and exact inferred text mentions)",
                                "ApprovalProcess (bounded criteria, displayed fields and field updates)",
                                "Workflow (outbound messages, bounded rule criteria and declared same-object field updates)"],
         "flow_status_counts": dict(sorted(Counter(
@@ -197,7 +214,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     manifest = {
         "schema_version": SCHEMA_VERSION, "extractor_version": EXTRACTOR_VERSION,
         "upstream_revision": UPSTREAM_REVISION, "source_revision": scan.revision,
-        "dirty": scan.dirty, "input_mode": "working_tree", "scope": scan.scope,
+        "dirty": scan.dirty, "input_mode": "working_tree",
+        "scope": {**scan.scope, "custom_metadata_accessors": accessor_rules} if accessor_rules else scan.scope,
         "activity_policy": activity_policy,
         "inputs": scan.inputs, "coverage": coverage,
     }

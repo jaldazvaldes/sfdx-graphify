@@ -8,12 +8,13 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-SCHEMA_VERSION = 10
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
-EXTRACTOR_VERSION = "0.5.13"
+SCHEMA_VERSION = 11
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
+EXTRACTOR_VERSION = "0.5.14"
 UPSTREAM_REVISION = "5eedffa87476a063a05bed96f17275ed63f05c1a"
 TESTED_API_VERSIONS = ("64.0",)
-RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains", "grants"})
+CUSTOM_METADATA_RELATIONS = frozenset({"instance_of", "sets_value", "mentions"})
+RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains", "grants"}) | CUSTOM_METADATA_RELATIONS
 _SCHEMA_9_KINDS = frozenset({"approvalprocess", "aura", "visualforcepage", "visualforcecomponent"})
 _PERMISSION_KINDS = frozenset({"profile", "permissionset"})
 _SCHEMA_10_KINDS = _PERMISSION_KINDS | {"namedcredential"}
@@ -23,7 +24,8 @@ PERMISSIONS_BY_TARGET = {
     "apexclass": frozenset({"execute"}),
 }
 KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc",
-                   "outboundmessage", "validationrule", "workflowrule"}) | _SCHEMA_9_KINDS | _SCHEMA_10_KINDS
+                   "outboundmessage", "validationrule", "workflowrule", "custommetadatarecord"}) | _SCHEMA_9_KINDS | _SCHEMA_10_KINDS
+_QUALIFIED_KINDS = frozenset({"field", "outboundmessage", "validationrule", "approvalprocess", "custommetadatarecord"})
 API_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DISPATCH_CANDIDATE_INVOCATIONS = {"conditional_virtual_dispatch": "constructed_virtual_dispatch",
                                    "fflib_event_dispatch": "fflib_event_dispatch"}
@@ -38,6 +40,9 @@ class DataError(ValueError):
 
 def relationship_resolution(relationship: dict) -> dict:
     """Describe extraction certainty, never runtime execution or org validity."""
+    if relationship.get("relation") == "mentions":
+        return {"status": "inferred", "confidence": "INFERRED",
+                "reason": "exact_component_name", "missing_ancestors": []}
     qualifiers = relationship.get("qualifiers", {})
     reason = qualifiers.get("uncertainty") if qualifiers.get("resolution_status") == "candidate" else None
     # Earlier snapshots preserve this conditional dispatch in evidence, but
@@ -117,7 +122,7 @@ def component_id(kind: str, api_name: str) -> str:
         return f"sf:{kind}:" + quote(api_name.casefold(), safe="._")
     qualified, separator, signature = api_name.partition("(") if kind == "apexmethod" else (api_name, "", "")
     parts = qualified.split(".")
-    expected = {2, 3} if kind == "apexmethod" else {1, 2} if kind == "apexclass" else {2} if kind in {"field", "outboundmessage", "validationrule", "approvalprocess"} else {1}
+    expected = {2, 3} if kind == "apexmethod" else {1, 2} if kind == "apexclass" else {2} if kind in _QUALIFIED_KINDS else {1}
     signature_valid = not separator or (signature.endswith(")") and _method_types_valid(signature[:-1]))
     if len(parts) not in expected or not all(API_NAME.fullmatch(p) for p in parts) or not signature_valid:
         raise DataError(f"Invalid {kind} API name: {api_name}")
@@ -164,6 +169,7 @@ class FactStore:
         qualified_parts = api_name.partition("(")[0].split(".")
         namespace = (qualified_parts[0] if (kind == "apexclass" and len(qualified_parts) == 2)
                      or (kind == "apexmethod" and len(qualified_parts) == 3)
+                     else _namespace(qualified_parts[0] + "__mdt") if kind == "custommetadatarecord"
                      else _namespace(qualified_parts[0]) if kind == "workflowrule"
                      else _namespace(api_name.partition("(")[0]))
         current = self.components.setdefault(cid, {
@@ -266,6 +272,34 @@ def _relative_path(path):
         raise DataError("Source path escapes the snapshot root.")
 
 
+_CUSTOM_METADATA_VALUE_TYPES = {
+    "boolean": (bool,), "string": (str,), "null": (type(None),), "number": (int, float),
+}
+_CUSTOM_METADATA_RULES = {
+    "instance_of": "custom_metadata.type",
+    "sets_value": "custom_metadata.value",
+    "mentions": "custom_metadata.exact_text_mention",
+}
+
+
+def _validate_custom_metadata_relationship(version, relation, source, target, qualifiers):
+    if version < 11 or source["kind"] != "custommetadatarecord" or source["definition_status"] != "defined":
+        raise DataError("Invalid custom metadata relationship source.")
+    type_name = source["api_name"].split(".", 1)[0].casefold() + "__mdt"
+    if relation == "instance_of":
+        valid = target["kind"] == "object" and target["api_name"].casefold() == type_name and not qualifiers
+    elif relation == "sets_value":
+        kind = qualifiers.get("value_type")
+        valid = (target["kind"] == "field" and target["api_name"].casefold().split(".", 1)[0] == type_name
+                 and set(qualifiers) == {"value", "value_type"} and isinstance(kind, str)
+                 and type(qualifiers["value"]) in _CUSTOM_METADATA_VALUE_TYPES.get(kind, ()))
+    else:
+        valid = (target["kind"] in {"apexclass", "flow", "field"}
+                 and target["definition_status"] == "defined" and not qualifiers)
+    if not valid or target["definition_status"] == "ambiguous":
+        raise DataError("Invalid custom metadata relationship target or value.")
+
+
 def validate_bundle(bundle):
     """Validate loaded data as well as generated records; never trust a pointer alone."""
     try:
@@ -312,6 +346,8 @@ def validate_bundle(bundle):
                 raise DataError("Approval processes, Aura and Visualforce require snapshot schema version 9.")
             if manifest["schema_version"] < 10 and component["kind"] in _SCHEMA_10_KINDS:
                 raise DataError("Profiles, permission sets and Named Credentials require snapshot schema version 10.")
+            if manifest["schema_version"] < 11 and component["kind"] == "custommetadatarecord":
+                raise DataError("Custom metadata records require snapshot schema version 11.")
             if manifest["schema_version"] < 8 and component["kind"] == "workflowrule":
                 raise DataError("Workflow rules require snapshot schema version 8.")
             if manifest["schema_version"] < 4 and component["kind"] == "apexmethod" and "(" in component["api_name"]:
@@ -341,6 +377,9 @@ def validate_bundle(bundle):
             qualifiers = relationship["qualifiers"]
             if not isinstance(qualifiers, dict):
                 raise DataError("Invalid relationship qualifiers.")
+            if relation in CUSTOM_METADATA_RELATIONS:
+                _validate_custom_metadata_relationship(manifest["schema_version"], relation,
+                                                       components[source], components[target], qualifiers)
             if relation == "grants":
                 permission = qualifiers.get("permission")
                 if (manifest["schema_version"] < 10 or components[source]["kind"] not in _PERMISSION_KINDS
@@ -385,6 +424,27 @@ def validate_bundle(bundle):
                 if occurrence["relationship_id"] != rid or occurrence["source_component"] != source:
                     raise DataError("Evidence points to the wrong relationship.")
                 validate_location(occurrence)
+                if relation in CUSTOM_METADATA_RELATIONS or occurrence["rule"] in _CUSTOM_METADATA_RULES.values():
+                    if (_CUSTOM_METADATA_RULES.get(relation) != occurrence["rule"]
+                            or occurrence["path"] != components[source]["definitions"][0]["path"]
+                            or not occurrence["path"].casefold().endswith(".md-meta.xml")):
+                        raise DataError("Invalid custom metadata record evidence.")
+                if occurrence["rule"] == "apex.custom_metadata_accessor":
+                    proof = occurrence["resolution"]
+                    accessor = proof["accessor"]
+                    declaration = components.get(proof["accessor_method"], {})
+                    validate_location(proof["accessor_definition"])
+                    validate_location(proof["field_definition"])
+                    if (manifest["schema_version"] < 11 or relation != "reads"
+                            or qualifiers != {"context": "custom_metadata_accessor"}
+                            or components[source]["kind"] != "apexmethod" or components[target]["kind"] != "field"
+                            or proof.get("basis") != "configured_literal_custom_metadata_accessor"
+                            or accessor not in manifest["scope"].get("custom_metadata_accessors", ())
+                            or components[target]["api_name"].casefold().split(".", 1)[0] != accessor["type"]
+                            or declaration.get("kind") != "apexmethod"
+                            or proof["accessor_definition"] not in declaration["definitions"]
+                            or proof["field_definition"] not in components[target]["definitions"]):
+                        raise DataError("Invalid configured custom metadata accessor evidence.")
                 if relation == "grants" or occurrence["rule"] == "permission.declaration":
                     permission_proof = occurrence["resolution"]
                     declared = permission_proof.get("declared_target")

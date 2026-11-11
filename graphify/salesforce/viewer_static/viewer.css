@@ -4,3 +4,4 @@
 .component-diagnostics{margin-top:18px;border-top:1px solid var(--border);padding-top:14px;font-size:11px;overflow-wrap:anywhere}.component-diagnostics summary{cursor:pointer;font-weight:650}.component-diagnostics ul{padding-left:18px;max-height:350px;overflow:auto}.component-diagnostics li{margin:12px 0}.component-diagnostics li p{margin:4px 0}
 .edge-group.candidate .edge-path{stroke-dasharray:5 4}
 :root .legend-line.relation-grants{background:#90661a}
+:root .legend-line.relation-instance_of{background:#5867a8}:root .legend-line.relation-sets_value{background:#986336}:root .legend-line.relation-mentions{background:#7b6391}

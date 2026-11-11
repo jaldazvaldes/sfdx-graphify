@@ -70,6 +70,8 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--include-untracked", action="store_true")
     build.add_argument("--include-inactive", action="store_true",
                        help="Include explicitly inactive local components for historical analysis.")
+    build.add_argument("--custom-metadata-accessors", type=Path,
+                       help="Read optional JSON rules for literal Apex custom metadata field accessors.")
     build.add_argument("--format", choices=("json", "text"), default="json")
     commands.add_parser("guide", help="Print agent usage guidance without writing files.")
     install = commands.add_parser("install", help="Copy the Salesforce skill for an assistant.")
@@ -161,6 +163,11 @@ def _project_snapshot_id() -> str | None:
     return current_snapshot_id(snapshot) if snapshot is not None else None
 
 
+def _value_text(value, *, brief: bool) -> str:
+    text = json.dumps(value, ensure_ascii=False)
+    return text[:117] + "…" if brief and len(text) > 120 else text
+
+
 def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> str:
     lines = [f"Snapshot: {result.get('snapshot_id', 'unavailable')}"]
     if "freshness" in result:
@@ -187,10 +194,28 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
             for occurrence in edge.get("evidence", []):
                 lines.append(f"  {occurrence['path']}:{occurrence.get('line', '?')} "
                              f"{occurrence.get('locator', '')} [{occurrence['id']}]")
+    values = result.get("custom_metadata_values")
+    if values is not None:
+        lines.append(f"Custom metadata values: {values['record_count']} explicit records.")
+        groups = values["groups"]
+        for group in groups[:8] if brief else groups:
+            names = [name.split(".", 1)[1] for name in group["records"][:12]]
+            rest = group["record_count"] - len(names)
+            examples = ", ".join(names) + (f", +{rest} more" if rest else "")
+            lines.append(f"  {_value_text(group['value'], brief=brief)} in {group['record_count']} records ({examples}).")
+        if brief and len(groups) > 8:
+            lines.append(f"  {len(groups) - 8} more value groups. Use JSON or detailed text for the full summary.")
     for item in result.get("results", []):
         if "relation" in item:
-            permission = item.get("qualifiers", {}).get("permission")
+            qualifiers = item.get("qualifiers", {})
+            permission = qualifiers.get("permission")
             relation = item["relation"] + (f" {permission.replace('_', ' ')}" if permission else "")
+            if item["relation"] == "sets_value":
+                if brief and values is not None:
+                    continue
+                relation += " " + _value_text(qualifiers["value"], brief=brief)
+            if item["relation"] == "mentions":
+                relation += " (inferred)"
             relationship = f"{item['source']} --{relation}--> {item['target']}"
             lines.append(relationship if brief else f"{relationship} [{item['id']}]")
             resolution = item.get("resolution", {})
@@ -351,9 +376,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "build":
             from .service import build_project
             from .snapshot import default_output
+            accessors = None
+            if args.custom_metadata_accessors is not None:
+                with args.custom_metadata_accessors.open("rb") as handle:
+                    accessors = handle.read(1024 * 1024 + 1)
             bundle = build_project(args.project_root, out=args.out,
                                    include_untracked=args.include_untracked,
-                                   include_inactive=args.include_inactive)
+                                   include_inactive=args.include_inactive,
+                                   custom_metadata_accessors=accessors)
             result = query.envelope(bundle, [])
             result["output"] = str(args.out or default_output(args.project_root))
         elif getattr(args, "server", None) is not None:

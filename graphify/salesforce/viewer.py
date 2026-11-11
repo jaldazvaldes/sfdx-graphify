@@ -215,6 +215,10 @@ class SnapshotView:
             return kind == "grants"
         if kind == "grants":
             return False
+        if kind in {"instance_of", "sets_value"}:
+            return mode == "schema"
+        if kind == "mentions":
+            return mode == "automation"
         if mode == "schema":
             return (all(self.components[relation[key]]["kind"] in {"object", "field"}
                         for key in ("source", "target"))
@@ -324,18 +328,20 @@ class SnapshotView:
                 for eid in relation["evidence_ids"][:max(0, 12 - len(preview))]:
                     preview.append({**evidence_index[eid], "qualifiers": relation.get("qualifiers", {}),
                                     "relationship_resolution": relationship_resolution(relation)})
-            candidate_count = sum(record["resolution"]["status"] == "candidate" for record in records)
+            statuses = Counter(record["resolution"]["status"] for record in records)
+            resolution_counts = {"candidate": statuses["candidate"], "extracted": statuses["extracted"]}
+            if statuses["inferred"]:
+                resolution_counts["inferred"] = statuses["inferred"]
             edges.append({"id": stable_id("view", key), "source": source, "target": target,
                           "relation": kind, "change": change, "relationships": records,
-                          "resolution_counts": {"candidate": candidate_count, "extracted": len(records) - candidate_count},
-                          "resolution_status": ("mixed" if 0 < candidate_count < len(records)
-                                                else "candidate" if candidate_count else "extracted"),
+                          "resolution_counts": resolution_counts,
+                          "resolution_status": "mixed" if len(statuses) > 1 else next(iter(statuses)),
                           "relationship_count": len(records), "evidence_count": total_evidence,
                           "evidence": preview, "evidence_truncated": total_evidence > len(preview)})
         note = {
             "impact": "Incoming dependencies identify candidates to inspect, not proven runtime effects.",
             "automation": "References around the selected component; contains gives membership context, not execution order or causality.",
-            "schema": "Declared field ownership and lookup references only.",
+            "schema": "Declared field ownership, lookup references, and explicit custom metadata record values.",
             "permissions": "Explicit grants in local Profile and PermissionSet XML. Effective access depends on assignments and org configuration.",
         }[mode]
         return {"snapshot_id": self.manifest_id, "focus": self._node(component),

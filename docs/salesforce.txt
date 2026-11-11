@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.13 (unreleased)
+sfdx-graphify 0.5.14 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -191,6 +191,35 @@ The extractor links a literal callout endpoint on a proven Apex HttpRequest
 receiver to its Named Credential. Query its references by API name. Evidence
 records the credential name and source location. Dynamic endpoints and
 integration execution remain outside coverage.
+
+CUSTOM METADATA RECORDS
+
+  sfdx-graphify deps Sample_Settings.North --format text
+  sfdx-graphify refs Sample_Settings__mdt.Enabled__c --format brief
+
+A local .md-meta.xml file defines a custom metadata record. An instance_of
+edge identifies its type. Each sets_value edge carries the explicit typed
+value and XML source location. The brief field query groups these values by
+record count. Detailed text and JSON include individual edges. Explicit
+false, null and empty text are preserved. Omitted fields have no value edge.
+
+An exact text match to a unique locally defined Apex class, Flow or qualified
+field appears as an inferred mentions edge. The default impact traversal
+focuses on dependency edges and excludes record values and text mentions.
+Use the Schema view for the declared record and field edges.
+
+To extract literal field references from local Apex wrappers, pass an
+external UTF-8 JSON array to build with --custom-metadata-accessors <file>.
+Each rule names a local class, static method, arity, one-based field_argument
+and custom metadata type. For example:
+
+  [{"class":"SampleSettings","method":"getEnabled","arity":2,
+    "field_argument":2,"type":"Sample_Settings__mdt"}]
+
+The snapshot records the normalized rules. The extractor checks the local
+static declaration, class-qualified call and exact field argument in an Apex
+method or constructor. A variable argument produces a source diagnostic on
+the caller. Inspect the caller's deps with --diagnostics full.
 
 The optional --expect-snapshot rejects a mismatched initial snapshot. Once
 started, the session stays pinned even if a build replaces CURRENT.json. Restart
@@ -570,9 +599,9 @@ option pages through all file diagnostics without discarding canonical records.
 With --before, the viewer compares canonical facts and their evidence. It also
 discloses extractor/schema/scope/source-input differences: added edges after an
 extractor upgrade can mean expanded coverage, not a source or runtime change.
-Version stamps alone do not mark evidence as changed. Schema versions 1 through 9
-remain readable. New builds emit schema 10, which adds profiles, permission sets,
-declared permission grants and Named Credential components. Rebuild from source
+Version stamps alone do not mark evidence as changed. Schema versions 1 through 10
+remain readable. New builds emit schema 11, which adds custom metadata records,
+typed values and inferred mentions. Rebuild from source
 and restart pinned sessions and viewers to load the
 new generation. Verify source freshness separately with status --source. Record
 the extractor revision with the snapshot ID. Start the query server with

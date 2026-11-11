@@ -45,17 +45,20 @@ def projection_graph(bundle: dict):
         details = []
         for item in sorted(relationships, key=lambda item: item["id"]):
             context = item.get("qualifiers", {}).get("context")
-            structural = (item["relation"] == "contains"
+            structural = (item["relation"] in {"contains", "instance_of", "sets_value"}
                           or (item["relation"] == "references" and context == "lookup_declaration"))
+            layer = "schema" if structural else "mentions" if item["relation"] == "mentions" else "dependencies"
             details.append({"id": item["id"], "relation": item["relation"],
-                            "layer": "schema" if structural else "dependencies", "context": context,
+                            "layer": layer, "context": context,
                             "resolution": relationship_resolution(item)})
-        candidate_count = sum(item["resolution"]["status"] == "candidate" for item in details)
+        statuses = Counter(item["resolution"]["status"] for item in details)
+        resolution_counts = {"candidate": statuses["candidate"], "extracted": statuses["extracted"]}
+        if statuses["inferred"]:
+            resolution_counts["inferred"] = statuses["inferred"]
+        confidence = "AMBIGUOUS" if statuses["candidate"] else "INFERRED" if statuses["inferred"] else "EXTRACTED"
         graph.add_edge(source, target, relation=", ".join(verbs),
-                       confidence="AMBIGUOUS" if candidate_count else "EXTRACTED",
-                       resolution_counts={"candidate": candidate_count, "extracted": len(details) - candidate_count},
-                       resolution_status=("mixed" if 0 < candidate_count < len(details)
-                                          else "candidate" if candidate_count else "extracted"),
+                       confidence=confidence, resolution_counts=resolution_counts,
+                       resolution_status="mixed" if len(statuses) > 1 else next(iter(statuses)),
                        canonical_relationship_ids=sorted(item["id"] for item in relationships),
                        relationship_details=details,
                        relation_counts=dict(sorted(Counter(item["relation"]

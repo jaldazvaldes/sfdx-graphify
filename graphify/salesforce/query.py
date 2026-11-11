@@ -5,7 +5,8 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
-from .schema import RELATED_EVIDENCE_SITES, SCHEMA_VERSION, DataError, relationship_resolution, shared_activity_field
+from .schema import (CUSTOM_METADATA_RELATIONS, RELATED_EVIDENCE_SITES, SCHEMA_VERSION, DataError,
+                     relationship_resolution, shared_activity_field)
 
 
 class QueryError(DataError):
@@ -35,7 +36,9 @@ def freshness(bundle: dict, source: str | Path | None = None) -> dict:
     added = sorted(set(new) - set(old))
     deleted = sorted(set(old) - set(new))
     changed = sorted(path for path in old.keys() & new.keys() if old[path] != new[path])
-    scope_changed = scan.scope != scope
+    # The snapshot pins externally supplied extraction rules. Freshness checks
+    # compare the selected project inputs and source selection settings.
+    scope_changed = scan.scope != {key: value for key, value in scope.items() if key != "custom_metadata_accessors"}
     return {
         "state": "stale" if added or deleted or changed or scope_changed else "current",
         "added": added, "deleted": deleted, "changed": changed,
@@ -246,7 +249,8 @@ def _scope(bundle: dict, exclude_tests: bool) -> tuple[dict, list, dict]:
 
 def _relationship_key(item: dict, components: dict) -> tuple:
     source, target = components[item["source"]], components[item["target"]]
-    order = {"calls": 0, "writes": 1, "filters": 2, "reads": 3, "references": 4, "contains": 5, "grants": 6}
+    order = {"calls": 0, "writes": 1, "filters": 2, "reads": 3, "references": 4, "contains": 5, "grants": 6,
+             "instance_of": 7, "sets_value": 8, "mentions": 9}
     return (source.get("is_test") is True or target.get("is_test") is True,
             order.get(item["relation"], 6), str(source.get("api_name", source["id"])).casefold(),
             str(target.get("api_name", target["id"])).casefold(), item["id"])
@@ -257,6 +261,22 @@ def _scoped_target(bundle: dict, name: str, exclude_tests: bool) -> dict:
     if exclude_tests and target.get("is_test") is True:
         raise QueryError(f"Component is excluded by the test filter: {name}", 4)
     return target
+
+
+def _custom_metadata_value_summary(matches: list[dict], components: dict) -> dict:
+    groups = defaultdict(set)
+    records = set()
+    for item in matches:
+        if item["relation"] != "sets_value":
+            continue
+        record = components[item["source"]]["api_name"]
+        qualifiers = item["qualifiers"]
+        groups[qualifiers["value_type"], qualifiers["value"]].add(record)
+        records.add(record)
+    ordered = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0][0], repr(item[0][1])))
+    return {"record_count": len(records),
+            "groups": [{"value_type": kind, "value": value, "record_count": len(names),
+                        "records": sorted(names, key=str.casefold)} for (kind, value), names in ordered]}
 
 
 def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None = None,
@@ -275,6 +295,10 @@ def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None 
     result["component"] = target
     result["total"] = len(matches)
     result["test_filter"] = filtering
+    if (endpoint == "target" and relation in {None, "sets_value"} and target["kind"] == "field"
+            and target["api_name"].split(".", 1)[0].casefold().endswith("__mdt")
+            and bundle["manifest"]["schema_version"] >= 11):
+        result["custom_metadata_values"] = _custom_metadata_value_summary(matches, indexed)
     result["diagnostic_context"] = diagnostic_context(bundle, target, result["results"], mode=diagnostics)
     return result
 
@@ -311,6 +335,8 @@ def impact(bundle: dict, name: str, *, depth: int = 2, limit: int = 1000,
     incoming = defaultdict(list)
     for item in relationships:
         if item["relation"] == "contains" or (item["relation"] == "grants" and relation != "grants"):
+            continue
+        if relation is None and item["relation"] in CUSTOM_METADATA_RELATIONS:
             continue
         if relation is None or item["relation"] == relation:
             incoming[item["target"]].append(item)

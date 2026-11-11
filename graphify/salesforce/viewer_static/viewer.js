@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const colors = {reads:'#2563b7',writes:'#a85a16',filters:'#7b48b6',calls:'#087d78',references:'#68768a',contains:'#84939d',grants:'#90661a'};
+const colors = {reads:'#2563b7',writes:'#a85a16',filters:'#7b48b6',calls:'#087d78',references:'#68768a',contains:'#84939d',grants:'#90661a',instance_of:'#5867a8',sets_value:'#986336',mentions:'#7b6391'};
 const kindNames = {object:'Object',field:'Field',flow:'Flow',apexclass:'Apex class',apexmethod:'Apex method',apextrigger:'Trigger',lwc:'Lightning component',outboundmessage:'Outbound message',validationrule:'Validation rule',workflowrule:'Workflow rule',approvalprocess:'Approval process',aura:'Aura component',visualforcepage:'Visualforce page',visualforcecomponent:'Visualforce component'};
 const state = {meta:null,focus:null,mode:'impact',depth:1,status:'all',history:[],view:null,edge:null,evidenceSnapshot:'after',evidenceOffset:0,request:0,searchRequest:0,diagnosticsRequest:0,evidenceRequest:0};
 const positions = new Map();
@@ -28,10 +28,12 @@ function showError(message) { $('error').textContent=message; $('error').hidden=
 function shortId(value) { return value ? value.split(':').pop().slice(0,12) : 'No Git revision'; }
 function count(value) { return Number(value || 0).toLocaleString(); }
 function candidateSummary(edge) {
+  if(edge.resolution_counts?.inferred) return `${count(edge.resolution_counts.inferred)} inferred text mentions`;
   const candidates=edge.resolution_counts?.candidate || 0;
   return candidates ? `${count(candidates)} candidate, ${count(edge.resolution_counts.extracted)} extracted relationships` : '';
 }
 function candidateDescription(resolution) {
+  if(resolution?.status==='inferred') return 'Inferred mention from an exact text value';
   if(resolution?.status!=='candidate') return '';
   const missing=resolution.missing_ancestors || [];
   const reason=({external_hierarchy:'external hierarchy not verified',
