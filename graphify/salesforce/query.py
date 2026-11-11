@@ -246,7 +246,7 @@ def _scope(bundle: dict, exclude_tests: bool) -> tuple[dict, list, dict]:
 
 def _relationship_key(item: dict, components: dict) -> tuple:
     source, target = components[item["source"]], components[item["target"]]
-    order = {"calls": 0, "writes": 1, "filters": 2, "reads": 3, "references": 4, "contains": 5}
+    order = {"calls": 0, "writes": 1, "filters": 2, "reads": 3, "references": 4, "contains": 5, "grants": 6}
     return (source.get("is_test") is True or target.get("is_test") is True,
             order.get(item["relation"], 6), str(source.get("api_name", source["id"])).casefold(),
             str(target.get("api_name", target["id"])).casefold(), item["id"])
@@ -310,7 +310,7 @@ def impact(bundle: dict, name: str, *, depth: int = 2, limit: int = 1000,
     evidence = {item["id"]: item for item in bundle["facts"]["evidence"]}
     incoming = defaultdict(list)
     for item in relationships:
-        if item["relation"] == "contains":
+        if item["relation"] == "contains" or (item["relation"] == "grants" and relation != "grants"):
             continue
         if relation is None or item["relation"] == relation:
             incoming[item["target"]].append(item)
@@ -358,7 +358,7 @@ def impact(bundle: dict, name: str, *, depth: int = 2, limit: int = 1000,
             break
     result = envelope(bundle, results, source=source,
                       truncated=depth_limited or limit_limited)
-    result.update({"component": target, "interpretation": "candidate_impact",
+    result.update({"component": target, "interpretation": "declared_permissions" if relation == "grants" else "candidate_impact",
                    "max_depth": depth, "depth_limited": depth_limited,
                    "limit_limited": limit_limited, "test_filter": filtering,
                    "returned_count": len(results)})

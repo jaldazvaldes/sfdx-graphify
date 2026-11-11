@@ -13,6 +13,8 @@ from .triggers import index_triggers, extract_triggers
 from .lwc import extract_lwc
 from .workflow import index_workflow, extract_workflow
 from .approval import index_approval_processes, extract_approval_processes
+from .permissions import index_permissions, extract_permissions
+from .named_credentials import index_named_credentials, extract_named_credential_endpoints
 from .ui_apex import ui_source, extract_ui_apex
 from .validation_rules import extract_validation_rule
 from .inventory import extract_inventory, index_definitions, identity
@@ -25,12 +27,14 @@ LIMITATIONS = [
     "Dependency evidence is incomplete; missing edges do not prove missing dependencies.",
     "Verify consequential conclusions against current source; no deployed org was inspected.",
     "A dependency graph does not describe Flow execution order or approved requirements.",
-    "Formula references and declared parent relationship paths have bounded support; formula evaluation, arbitrary aliases, layouts and permissions remain outside coverage.",
+    "Formula references and declared parent relationship paths have bounded support; formula evaluation, arbitrary aliases and layouts remain outside coverage.",
     "Apex analysis is bounded and static; dynamic queries, unknown types and runtime data flow remain unresolved.",
     "Candidate static calls through an external caller hierarchy are explicitly marked; verify the missing base before treating dispatch as resolved.",
     "Flow, trigger, validation rule and workflow rule activation metadata describe local XML, not deployed or active org behavior.",
     "Workflow reads cover bounded criterion and field update expressions. Cross-object updates remain diagnostic; expressions, action values and execution order are not evaluated.",
     "Literal metadata mentions are review hints and do not establish dependency edges.",
+    "Permission edges record explicit grants in local profiles and permission sets. Assignments, groups, muting, sharing and effective access are outside coverage.",
+    "Named Credential references cover proven HttpRequest receivers with a literal callout endpoint; dynamic destinations and integration execution are outside coverage.",
     "Referenced-only targets have not been validated against a complete Salesforce schema.",
 ]
 
@@ -63,6 +67,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         store.diagnostic(**entry)
     documents, apex, triggers, trigger_metadata, lightning, workflows = [], {}, {}, [], {}, []
     approvals, ui = [], {}
+    permissions, named_credentials = [], []
     for path, data in sorted(scan.files.items()):
         if lwc_bundle(path):
             lightning[path] = data
@@ -76,6 +81,15 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                                  {"path": path, "content_hash": scan.inputs[path]}, state="unresolved")
             else:
                 approvals.append(approval)
+        elif path.casefold().endswith((".profile-meta.xml", ".permissionset-meta.xml", ".namedcredential-meta.xml")):
+            is_credential = path.casefold().endswith(".namedcredential-meta.xml")
+            try:
+                document = parse_xml(path, data)
+            except DataError as exc:
+                code = "NAMED_CREDENTIAL_METADATA_UNRESOLVED" if is_credential else "PERMISSION_METADATA_UNRESOLVED"
+                store.diagnostic(code, str(exc), {"path": path, "content_hash": scan.inputs[path]}, state="unresolved")
+            else:
+                (named_credentials if is_credential else permissions).append(document)
         elif path.endswith(".workflow-meta.xml"):
             workflows.append(parse_xml(path, data))
         elif path.endswith(".cls"):
@@ -100,6 +114,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     index_definitions(documents, store)
     index_workflow(workflows, store)
     index_approval_processes(approvals, store)
+    index_permissions(permissions, store)
+    index_named_credentials(named_credentials, store)
     apex_index = index_apex(apex, store)
     trigger_index = index_triggers(triggers, trigger_metadata, apex_index, store)
     excluded = inactive_components(store.components.values(), include_inactive=include_inactive)
@@ -107,6 +123,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     extract_workflow(workflows, store, excluded=excluded)
     extract_approval_processes(approvals, workflows, store, excluded=excluded)
     extract_apex(apex_index, store)
+    extract_named_credential_endpoints(apex_index, store)
+    extract_permissions(permissions, store)
     extract_triggers(trigger_index, apex_index, store, excluded=set(excluded))
     extract_lwc(lightning, apex_index, store)
     extract_ui_apex(ui, apex_index, store)
@@ -154,6 +172,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                                "ApexClass/ApexMethod (bounded AST, invocable methods and static SOQL/DML)",
                                "LightningComponentBundle (literal field and Apex imports, imperative and wire calls)",
                                "Aura and Visualforce (bounded static Apex actions)",
+                               "Profile and PermissionSet (explicit field, object and Apex class grants)",
+                               "NamedCredential (local definitions and literal Apex HttpRequest endpoint references)",
                                "ApprovalProcess (bounded criteria, displayed fields and field updates)",
                                "Workflow (outbound messages, bounded rule criteria and declared same-object field updates)"],
         "flow_status_counts": dict(sorted(Counter(

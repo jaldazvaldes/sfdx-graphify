@@ -19,7 +19,7 @@ NODE_LIMIT = 100
 EDGE_LIMIT = 200
 SEARCH_LIMIT = 25
 EVIDENCE_LIMIT = 100
-MODES = frozenset({"impact", "automation", "schema"})
+MODES = frozenset({"impact", "automation", "schema", "permissions"})
 _RULE_KINDS = frozenset({"validationrule", "workflowrule", "approvalprocess"})
 AUTOMATION_KINDS = frozenset({"flow", "apexclass", "apexmethod", "apextrigger", "lwc", "outboundmessage",
                               "aura", "visualforcepage", "visualforcecomponent"}) | _RULE_KINDS
@@ -211,6 +211,10 @@ class SnapshotView:
 
     def _allowed(self, relation: dict, mode: str) -> bool:
         kind = relation["relation"]
+        if mode == "permissions":
+            return kind == "grants"
+        if kind == "grants":
+            return False
         if mode == "schema":
             return (all(self.components[relation[key]]["kind"] in {"object", "field"}
                         for key in ("source", "target"))
@@ -228,7 +232,7 @@ class SnapshotView:
     def view(self, component: str, *, mode: str = "impact", depth: int = 1,
              status: str = "all") -> dict:
         if mode not in MODES:
-            raise DataError("Mode must be impact, automation, or schema.")
+            raise DataError("Mode must be impact, automation, schema, or permissions.")
         if not 1 <= depth <= 3:
             raise DataError("Depth must be between 1 and 3.")
         if status != "all" and status not in self.statuses:
@@ -236,10 +240,11 @@ class SnapshotView:
         if component not in self.components:
             raise DataError("No matching component in the loaded snapshots.")
         focus = self.components[component]
-        fields = self.fields.get(component, set()) if mode != "schema" and focus["kind"] == "object" else set()
-        methods = self.methods.get(component, {}) if mode != "schema" and focus["kind"] == "apexclass" else {}
-        members = {**methods, **self.rule_members.get(component, {})} if mode != "schema" else {}
-        owners = self.rule_owners.get(component, {}) if mode != "schema" else {}
+        dependency_view = mode in {"impact", "automation"}
+        fields = self.fields.get(component, set()) if dependency_view and focus["kind"] == "object" else set()
+        methods = self.methods.get(component, {}) if dependency_view and focus["kind"] == "apexclass" else {}
+        members = {**methods, **self.rule_members.get(component, {})} if dependency_view else {}
+        owners = self.rule_owners.get(component, {}) if dependency_view else {}
         owned = fields | methods.keys()
         seeds = {component, *owned}
         levels = {component: 0}
@@ -327,10 +332,12 @@ class SnapshotView:
                                                 else "candidate" if candidate_count else "extracted"),
                           "relationship_count": len(records), "evidence_count": total_evidence,
                           "evidence": preview, "evidence_truncated": total_evidence > len(preview)})
-        note = ("Incoming dependencies identify candidates to inspect, not proven runtime effects."
-                if mode == "impact" else
-                "References around the selected component; contains gives membership context, not execution order or causality."
-                if mode == "automation" else "Declared field ownership and lookup references only.")
+        note = {
+            "impact": "Incoming dependencies identify candidates to inspect, not proven runtime effects.",
+            "automation": "References around the selected component; contains gives membership context, not execution order or causality.",
+            "schema": "Declared field ownership and lookup references only.",
+            "permissions": "Explicit grants in local Profile and PermissionSet XML. Effective access depends on assignments and org configuration.",
+        }[mode]
         return {"snapshot_id": self.manifest_id, "focus": self._node(component),
                 "mode": mode, "depth": depth, "status_filter": status,
                 "nodes": [self._node(cid, levels[cid]) for cid in sorted(shown, key=lambda cid: (levels[cid], cid))],

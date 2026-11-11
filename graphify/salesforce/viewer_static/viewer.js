@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const colors = {reads:'#2563b7',writes:'#a85a16',filters:'#7b48b6',calls:'#087d78',references:'#68768a',contains:'#84939d'};
+const colors = {reads:'#2563b7',writes:'#a85a16',filters:'#7b48b6',calls:'#087d78',references:'#68768a',contains:'#84939d',grants:'#90661a'};
 const kindNames = {object:'Object',field:'Field',flow:'Flow',apexclass:'Apex class',apexmethod:'Apex method',apextrigger:'Trigger',lwc:'Lightning component',outboundmessage:'Outbound message',validationrule:'Validation rule',workflowrule:'Workflow rule',approvalprocess:'Approval process',aura:'Aura component',visualforcepage:'Visualforce page',visualforcecomponent:'Visualforce component'};
 const state = {meta:null,focus:null,mode:'impact',depth:1,status:'all',history:[],view:null,edge:null,evidenceSnapshot:'after',evidenceOffset:0,request:0,searchRequest:0,diagnosticsRequest:0,evidenceRequest:0};
 const positions = new Map();
@@ -236,7 +236,11 @@ async function selectEdge(edge) {
   const uncertainty=candidateSummary(edge);
   $('evidence-count').textContent=`${count(edge.evidence_count)} source occurrences${uncertainty?' · '+uncertainty:''}`;
   const choices=$('canonical-relation'); choices.replaceChildren();
-  for(const relation of edge.relationships) choices.append(new Option(`${relation.source_label} · ${edge.relation} · ${relation.target_label}${relation.resolution?.status==='candidate'?' · candidate':''}`,relation.id));
+  for(const relation of edge.relationships) {
+    const access=relation.qualifiers?.permission;
+    const label=access?`${edge.relation} ${access.replaceAll('_',' ')}`:edge.relation;
+    choices.append(new Option(`${relation.source_label} · ${label} · ${relation.target_label}${relation.resolution?.status==='candidate'?' · candidate':''}`,relation.id));
+  }
   $('evidence-snapshot').hidden=edge.change!=='evidence_changed';
   await showEvidence();
 }

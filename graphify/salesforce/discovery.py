@@ -28,6 +28,7 @@ EXCLUDED_DIRS = frozenset({
 _CONFIG_FILES = ("sfdx-project.json", ".forceignore", ".gitignore")
 _SUPPORTED = (".flow-meta.xml", ".object-meta.xml", ".field-meta.xml", ".validationrule-meta.xml",
               ".recordtype-meta.xml", ".workflow-meta.xml", ".approvalprocess-meta.xml",
+              ".profile-meta.xml", ".permissionset-meta.xml", ".namedcredential-meta.xml",
               ".cls", ".trigger", ".trigger-meta.xml")
 _MAX_FILE_BYTES = 32 * 1024 * 1024
 _GIT_TIMEOUT_ENV = "SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS"

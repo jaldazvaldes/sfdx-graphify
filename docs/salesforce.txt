@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.12 (unreleased)
+sfdx-graphify 0.5.13 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -172,6 +172,25 @@ These weaker matches can refer to a different object or to unrelated text.
 Both counts are review hints outside the extracted dependency graph. Older
 snapshots report the index as unavailable. A zero count covers the scanned
 files and literal matching rules.
+
+DECLARED PERMISSIONS AND CALLOUT DESTINATIONS
+
+  sfdx-graphify refs Account.Description --relation grants --format brief
+  sfdx-graphify deps SampleSupport --relation grants --format brief
+  sfdx-graphify view Account.Description --mode permissions
+
+Profile and PermissionSet metadata contributes grants for explicit true values
+in fieldPermissions, objectPermissions, and classAccesses. Each grant carries
+the permission operation and XML source line. False and omitted flags produce
+no grant. Conflicting declarations for the same operation are diagnosed.
+The permissions view follows these grants. The default impact traversal
+excludes them. Permission assignments, groups, muting, sharing and live org
+configuration determine effective access.
+
+The extractor links a literal callout endpoint on a proven Apex HttpRequest
+receiver to its Named Credential. Query its references by API name. Evidence
+records the credential name and source location. Dynamic endpoints and
+integration execution remain outside coverage.
 
 The optional --expect-snapshot rejects a mismatched initial snapshot. Once
 started, the session stays pinned even if a build replaces CURRENT.json. Restart
@@ -551,9 +570,10 @@ option pages through all file diagnostics without discarding canonical records.
 With --before, the viewer compares canonical facts and their evidence. It also
 discloses extractor/schema/scope/source-input differences: added edges after an
 extractor upgrade can mean expanded coverage, not a source or runtime change.
-Version stamps alone do not mark evidence as changed. Schema versions 1 through 8
-remain readable. New builds emit schema 9, which adds approval, Aura and Visualforce
-component kinds. Rebuild from source and restart pinned sessions and viewers to load the
+Version stamps alone do not mark evidence as changed. Schema versions 1 through 9
+remain readable. New builds emit schema 10, which adds profiles, permission sets,
+declared permission grants and Named Credential components. Rebuild from source
+and restart pinned sessions and viewers to load the
 new generation. Verify source freshness separately with status --source. Record
 the extractor revision with the snapshot ID. Start the query server with
 --expect-snapshot and check the viewer's /api/meta for the same ID.

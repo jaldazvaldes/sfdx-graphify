@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-from .schema import RELATED_EVIDENCE_SITES, DataError, EXTRACTOR_VERSION, SCHEMA_VERSION
+from .schema import RELATED_EVIDENCE_SITES, RELATIONS, DataError, EXTRACTOR_VERSION, SCHEMA_VERSION
 from . import query
 
 
@@ -102,8 +102,7 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--limit", type=int, default=1000)
             command.add_argument("--exclude-tests", action="store_true")
         if name in ("refs", "deps", "impact"):
-            command.add_argument("--relation", choices=("reads", "writes", "filters", "calls",
-                                                         "references", "contains"))
+            command.add_argument("--relation", choices=sorted(RELATIONS))
             command.add_argument("--diagnostics", choices=("summary", "full"), default="summary",
                                  help="Summary counts and up to 20 focused records (default), or every consulted-file diagnostic.")
         if name == "impact":
@@ -122,7 +121,7 @@ def parser() -> argparse.ArgumentParser:
     view.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
     view.add_argument("--expect-snapshot")
     view.add_argument("--before", type=Path)
-    view.add_argument("--mode", choices=("impact", "automation", "schema"), default="impact")
+    view.add_argument("--mode", choices=("impact", "automation", "schema", "permissions"), default="impact")
     view.add_argument("--depth", type=int, default=1)
     view.add_argument("--status", default="all", help="Filter by status declared in local Flow XML.")
     view.add_argument("--format", choices=("json", "text"), default="json")
@@ -190,7 +189,9 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                              f"{occurrence.get('locator', '')} [{occurrence['id']}]")
     for item in result.get("results", []):
         if "relation" in item:
-            relationship = f"{item['source']} --{item['relation']}--> {item['target']}"
+            permission = item.get("qualifiers", {}).get("permission")
+            relation = item["relation"] + (f" {permission.replace('_', ' ')}" if permission else "")
+            relationship = f"{item['source']} --{relation}--> {item['target']}"
             lines.append(relationship if brief else f"{relationship} [{item['id']}]")
             resolution = item.get("resolution", {})
             if resolution.get("status") == "candidate":

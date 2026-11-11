@@ -8,15 +8,22 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-SCHEMA_VERSION = 9
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
-EXTRACTOR_VERSION = "0.5.12"
+SCHEMA_VERSION = 10
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+EXTRACTOR_VERSION = "0.5.13"
 UPSTREAM_REVISION = "5eedffa87476a063a05bed96f17275ed63f05c1a"
 TESTED_API_VERSIONS = ("64.0",)
-RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
+RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains", "grants"})
 _SCHEMA_9_KINDS = frozenset({"approvalprocess", "aura", "visualforcepage", "visualforcecomponent"})
+_PERMISSION_KINDS = frozenset({"profile", "permissionset"})
+_SCHEMA_10_KINDS = _PERMISSION_KINDS | {"namedcredential"}
+PERMISSIONS_BY_TARGET = {
+    "field": frozenset({"read", "edit"}),
+    "object": frozenset({"read", "create", "edit", "delete", "view_all_records", "modify_all_records", "view_all_fields"}),
+    "apexclass": frozenset({"execute"}),
+}
 KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc",
-                   "outboundmessage", "validationrule", "workflowrule"}) | _SCHEMA_9_KINDS
+                   "outboundmessage", "validationrule", "workflowrule"}) | _SCHEMA_9_KINDS | _SCHEMA_10_KINDS
 API_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DISPATCH_CANDIDATE_INVOCATIONS = {"conditional_virtual_dispatch": "constructed_virtual_dispatch",
                                    "fflib_event_dispatch": "fflib_event_dispatch"}
@@ -98,6 +105,10 @@ def _method_types_valid(text: str) -> bool:
 def component_id(kind: str, api_name: str) -> str:
     if kind not in KINDS:
         raise DataError(f"Unsupported component kind: {kind}")
+    if kind == "profile":
+        if not api_name.isprintable() or api_name != api_name.strip():
+            raise DataError(f"Invalid {kind} API name: {api_name}")
+        return f"sf:{kind}:" + quote(api_name.casefold(), safe="._")
     if kind == "workflowrule":
         # Legacy rule fullName values can contain spaces and punctuation.
         owner, _, name = api_name.partition(".")
@@ -299,6 +310,8 @@ def validate_bundle(bundle):
                 raise DataError("Validation rules require snapshot schema version 5.")
             if manifest["schema_version"] < 9 and component["kind"] in _SCHEMA_9_KINDS:
                 raise DataError("Approval processes, Aura and Visualforce require snapshot schema version 9.")
+            if manifest["schema_version"] < 10 and component["kind"] in _SCHEMA_10_KINDS:
+                raise DataError("Profiles, permission sets and Named Credentials require snapshot schema version 10.")
             if manifest["schema_version"] < 8 and component["kind"] == "workflowrule":
                 raise DataError("Workflow rules require snapshot schema version 8.")
             if manifest["schema_version"] < 4 and component["kind"] == "apexmethod" and "(" in component["api_name"]:
@@ -328,6 +341,14 @@ def validate_bundle(bundle):
             qualifiers = relationship["qualifiers"]
             if not isinstance(qualifiers, dict):
                 raise DataError("Invalid relationship qualifiers.")
+            if relation == "grants":
+                permission = qualifiers.get("permission")
+                if (manifest["schema_version"] < 10 or components[source]["kind"] not in _PERMISSION_KINDS
+                        or components[source]["definition_status"] != "defined"
+                        or set(qualifiers) != {"permission"} or not isinstance(permission, str)
+                        or permission not in PERMISSIONS_BY_TARGET.get(components[target]["kind"], ())
+                        or components[target]["definition_status"] == "ambiguous"):
+                    raise DataError("Invalid declared permission relationship.")
             dispatch_reason = None
             if "resolution_status" in qualifiers:
                 if manifest["schema_version"] < 6:
@@ -364,6 +385,20 @@ def validate_bundle(bundle):
                 if occurrence["relationship_id"] != rid or occurrence["source_component"] != source:
                     raise DataError("Evidence points to the wrong relationship.")
                 validate_location(occurrence)
+                if relation == "grants" or occurrence["rule"] == "permission.declaration":
+                    permission_proof = occurrence["resolution"]
+                    declared = permission_proof.get("declared_target")
+                    if (relation != "grants" or occurrence["rule"] != "permission.declaration"
+                            or permission_proof.get("basis") != "explicit_permission_boolean"
+                            or not isinstance(declared, str)
+                            or declared.casefold() != components[target]["api_name"].casefold()
+                            or occurrence["path"] != components[source]["definitions"][0]["path"]):
+                        raise DataError("Invalid permission declaration evidence.")
+                if occurrence["rule"] == "apex.named_credential_endpoint":
+                    if (relation != "references" or components[source]["kind"] not in {"apexmethod", "apextrigger"}
+                            or components[target]["kind"] != "namedcredential"
+                            or qualifiers != {"context": "named_credential_endpoint"}):
+                        raise DataError("Invalid Named Credential endpoint evidence.")
                 if occurrence["rule"] == "workflow.rule_field_update":
                     field_definition = occurrence["resolution"]["field_definition"]
                     validate_location(field_definition)
