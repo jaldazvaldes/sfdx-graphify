@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.10 (unreleased)
+sfdx-graphify 0.5.11 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -243,7 +243,11 @@ a local declaration or cast can prove an exact match for built-in types and
 typed collections of those types. The extractor requires verified local
 dispatch and reports candidate signatures for unresolved overloads.
 Declared local inheritance, unqualified/this calls and explicitly constructed
-instances support bounded method dispatch. Literal class references and locally
+instances support bounded method dispatch. Calls through a directly named or
+this-qualified member can use its declared Apex type when the local hierarchy,
+visibility and nonvirtual target are verified. A class-qualified static field
+access can reference the class declaring the field. Both include the member's
+declaration as evidence. Literal class references and locally
 corroborated managed namespace calls retain referenced-only external targets.
 Classes with a fully resolved local superclass chain also resolve static class
 calls, Database operations and corroborated namespace calls when local or

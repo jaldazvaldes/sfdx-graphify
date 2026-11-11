@@ -255,7 +255,7 @@ async function showEvidence() {
     for(const occurrence of data.results) {
       const row=element('tr');
        const locator=element('td',occurrence.locator||'Unavailable');
-       for(const [key,label] of [['dispatch_site','Dispatch'],['class_literal','Domain literal'],['construct_site','Factory construction'],['constructor','Domain constructor'],['hook','Hook']]) {
+       for(const [key,label] of [['dispatch_site','Dispatch'],['class_literal','Domain literal'],['construct_site','Factory construction'],['constructor','Domain constructor'],['hook','Hook'],['member_declaration','Member declaration']]) {
          const site=occurrence.resolution?.[key];
          if(typeof site?.path==='string') locator.append(element('div',`${label} ${site.path}:${site.line}`));
        }

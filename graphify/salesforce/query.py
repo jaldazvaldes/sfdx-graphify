@@ -5,7 +5,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
-from .schema import DISPATCH_EVIDENCE_SITES, SCHEMA_VERSION, DataError, relationship_resolution, shared_activity_field
+from .schema import RELATED_EVIDENCE_SITES, SCHEMA_VERSION, DataError, relationship_resolution, shared_activity_field
 
 
 class QueryError(DataError):
@@ -145,7 +145,7 @@ def diagnostic_context(bundle: dict, target: dict, results: list, *, mode: str =
             proof = occurrence.get("resolution")
             if not isinstance(proof, dict):
                 continue  # Older snapshots can store the resolution as text.
-            for key, _ in DISPATCH_EVIDENCE_SITES:
+            for key, _ in RELATED_EVIDENCE_SITES:
                 site = proof.get(key)
                 if isinstance(site, dict) and isinstance(site.get("path"), str):
                     locations.append(site)

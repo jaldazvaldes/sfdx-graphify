@@ -112,6 +112,7 @@ class Unit:
     superclass_name: str | None = None
     is_test: bool = False
     parse_error: bool = False
+    member_declarations: dict[str, list[Member]] = field(default_factory=dict)
 
     def text(self, node):
         return _text(self.data, node)
@@ -138,6 +139,14 @@ class Unit:
         }
 
 
+@dataclass(frozen=True, eq=False, slots=True)
+class Member:
+    unit: Unit
+    node: Node
+    type_node: Node
+    modifiers: frozenset[str]
+
+
 @dataclass
 class Method:
     unit: Unit
@@ -160,6 +169,7 @@ class Method:
 @dataclass
 class ApexIndex:
     units: list[Unit] = field(default_factory=list)
+    units_by_class: dict[str, Unit] = field(default_factory=dict)
     methods: dict[str, list[Method]] = field(default_factory=lambda: defaultdict(list))
     apex_types: set[str] = field(default_factory=set)
     object_names: set[str] = field(default_factory=set)
@@ -278,9 +288,15 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
                 unit.superclass_name = parent_name
         for member in body.named_children:
             if member.type == "field_declaration":
+                type_node = member.child_by_field_name("type")
+                flags = frozenset(_modifiers(data, member)[0])
                 for declaration in member.named_children:
                     if declaration.type == "variable_declarator":
-                        unit.declared_members.add(unit.text(declaration.child_by_field_name("name")).casefold())
+                        member_name = unit.text(declaration.child_by_field_name("name")).casefold()
+                        unit.declared_members.add(member_name)
+                        if type_node is not None:
+                            unit.member_declarations.setdefault(member_name, []).append(
+                                Member(unit, declaration, type_node, flags))
         for node in body.named_children:
             if node.type in _IGNORED:
                 continue
@@ -315,6 +331,7 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
             store.diagnostic("APEX_INVOCABLE_AMBIGUOUS", "More than one local invocable declaration names this class.", unit.location(cls), state="ambiguous")
     # Class names from failed/unsupported files also prevent object-type guessing.
     index.apex_types.update(PurePosixPath(path).name.removesuffix(".cls").casefold() for path in apex)
+    index.units_by_class = {unit.class_id: unit for unit in index.units if not store.is_ambiguous(unit.class_id)}
     for component in list(store.components.values()):
         if component["kind"] == "apexclass" and component["definition_status"] == "ambiguous":
             component["is_test"] = None
@@ -358,10 +375,9 @@ def _class_hierarchy(index, store, class_id):
         if class_id in seen or class_id not in store.components or store.is_ambiguous(class_id):
             return None
         seen.add(class_id)
-        units = [unit for unit in index.units if unit.class_id == class_id]
-        if len(units) != 1:
+        unit = index.units_by_class.get(class_id)
+        if unit is None:
             return None
-        unit = units[0]
         hierarchy.append(unit)
         if not unit.has_superclass:
             return hierarchy
@@ -386,15 +402,14 @@ def _external_hierarchy(index, store, class_id):
         component = store.components.get(class_id)
         if component and store.is_ambiguous(class_id):
             return None
-        units = [unit for unit in index.units if unit.class_id == class_id]
-        if not units:
+        unit = index.units_by_class.get(class_id)
+        if unit is None:
             if (not hierarchy or (component and component.get("definitions"))
                     or (component and component["api_name"].casefold() in index.apex_types)):
                 return None
             return hierarchy, [hierarchy[-1].superclass_name]
-        if len(units) != 1 or units[0].parse_error:
+        if unit.parse_error:
             return None
-        unit = units[0]
         hierarchy.append(unit)
         if not unit.has_superclass or not unit.superclass_name:
             return None
@@ -528,6 +543,12 @@ class _MethodExtractor:
             parent = parent.parent
         return any(b.name.casefold() == name.casefold() and b.scope.id in ancestors
                    and b.available_from <= node.start_byte for b in self.bindings)
+
+    def _initializing_binding(self, name, node):
+        folded = name.casefold()
+        return any(binding.name.casefold() == folded
+                   and binding.node.start_byte <= node.start_byte < binding.available_from
+                   for binding in self.bindings)
 
     def unshadowed_qualifier(self, name, node, *, allow_external=False):
         """Prove a class/namespace receiver is not a lexical or inherited member.
@@ -722,6 +743,67 @@ class _MethodExtractor:
             return None
         return owner, binding, f"{family}_{access}", selector
 
+    def _visible_static_member(self, member, node, relation):
+        modifiers = member.modifiers
+        if "static" not in modifiers or "protected" in modifiers:
+            return False
+        same_class = member.unit.class_id == self.unit.class_id
+        visible = {"public", "global"}
+        if not same_class and (not modifiers & visible
+                               or not _modifiers(member.unit.data, member.unit.class_node)[0] & visible):
+            return False
+        access = {"set" if relation == "writes" else "get"}
+        parent = node.parent
+        if parent is not None and (parent.type == "update_expression" or (
+                parent.type == "assignment_expression" and node == parent.child_by_field_name("left")
+                and self.unit.text(parent.child_by_field_name("operator")) != "=")):
+            access = {"get", "set"}
+        if "set" in access and "final" in modifiers:
+            return False
+        declaration = member.node.parent
+        accessors = _child(declaration, "accessor_list") if declaration is not None else None
+        if accessors is None:
+            return True
+        for accessor in _significant(accessors):
+            accessor_modifiers, _ = _modifiers(member.unit.data, accessor)
+            if same_class or not accessor_modifiers or accessor_modifiers & visible:
+                access.difference_update(child.type for child in accessor.children if child.type in {"get", "set"})
+        return not access
+
+    def _static_member_reference(self, node, relation):
+        receiver, name_node = node.child_by_field_name("object"), node.child_by_field_name("field")
+        if (receiver is None or receiver.type != "identifier" or name_node is None or name_node.type != "identifier"
+                or _child(node, "safe_navigation_operator") is not None):
+            return False
+        owner, name = self.unit.text(receiver), self.unit.text(name_node)
+        folded = owner.casefold()
+        if (folded not in self.index.apex_types or not API_NAME.fullmatch(owner)
+                or not API_NAME.fullmatch(name) or name.casefold() == "class"
+                or folded in _RESERVED_RECEIVERS or folded in _PRIMITIVES or folded in _BUILTIN_COLLECTION_ARITY
+                or folded in _STANDARD_OBJECTS or folded in self.index.object_names):
+            return False
+        class_id = component_id("apexclass", owner)
+        component = self.store.components.get(class_id)
+        if (not component or not component["definitions"] or not self.unshadowed_qualifier(owner, receiver)
+                or self._initializing_binding(owner, receiver)):
+            return False
+        unit = self.index.units_by_class.get(class_id)
+        declarations = unit.member_declarations.get(name.casefold(), []) if unit is not None else []
+        ambiguous = self.store.is_ambiguous(class_id) or len(declarations) > 1
+        if ambiguous or len(declarations) != 1 or not self._visible_static_member(declarations[0], node, relation):
+            self.diagnostic("APEX_STATIC_MEMBER_UNRESOLVED",
+                            "A unique, visible static member declared by this local class is required.", node,
+                            "ambiguous" if ambiguous else "unresolved")
+            return True
+        member = declarations[0]
+        self.store.relation(
+            self.method.id, class_id, "references", self.unit.location(node), "apex.static_member_reference",
+            resolution={"basis": "unique_local_static_member", "member": member.unit.text(member.node.child_by_field_name("name")),
+                        "member_declaration": member.unit.location(member.node), "parser": PARSER_VERSION},
+            qualifiers={"context": "static_member_access"},
+        )
+        return True
+
     def field_access(self, node, relation="reads", *, operation="field_access"):
         resource, field_node = node.child_by_field_name("object"), node.child_by_field_name("field")
         if field_node is not None and self.unit.text(field_node).casefold() == "class":
@@ -735,6 +817,8 @@ class _MethodExtractor:
                                         "apex.class_literal", qualifiers={"context": "class_literal"},
                                         resolution={"basis": "literal_class_token", "parser": PARSER_VERSION})
                 return
+        if self._static_member_reference(node, relation):
+            return
         if resource is not None and resource.type != "identifier" and field_node is not None:
             setting = self._setting_owner(resource)
             if setting is not None and API_NAME.fullmatch(self.unit.text(field_node)):
@@ -759,6 +843,8 @@ class _MethodExtractor:
             # shorter, misleading field path from the unsupported chain.
             receiver = resource
             while receiver is not None and receiver.type == "field_access":
+                if self._static_member_reference(receiver, "reads"):
+                    return
                 receiver = receiver.child_by_field_name("object")
             if receiver is not None and receiver.type != "identifier":
                 self.visit(receiver)
@@ -933,6 +1019,10 @@ class _MethodExtractor:
             for arg in args:
                 self.visit(arg)
             return
+        if self._member_invocation(node, object_node, name, args):
+            for arg in args:
+                self.visit(arg)
+            return
         if object_node is not None and object_node.type != "identifier":
             self.visit(object_node)
         setting = self._setting_owner(node)
@@ -1082,6 +1172,82 @@ class _MethodExtractor:
         cid = component_id("apexclass", name)
         return cid if cid in self.store.components and not self.store.is_ambiguous(cid) else None
 
+    def _member_invocation(self, node, receiver, method_name, arguments):
+        hierarchy = self.qualifier_hierarchy
+        receiver = _without_parentheses(receiver)
+        if receiver is None or hierarchy is None:
+            return False
+        explicit = receiver.type == "field_access"
+        if explicit:
+            if self.unit.text(receiver.child_by_field_name("object")).casefold() != "this":
+                return False
+            receiver = receiver.child_by_field_name("field")
+        if receiver is None or receiver.type != "identifier":
+            return False
+        member_name = self.unit.text(receiver)
+        key = member_name.casefold()
+        for depth, unit in enumerate(hierarchy):
+            if key not in unit.declared_members:
+                continue
+            if not explicit and (self.has_binding(member_name, receiver) or self._initializing_binding(member_name, receiver)):
+                return False
+            declarations = unit.member_declarations.get(key, ())
+            if len(declarations) != 1:
+                self.diagnostic("APEX_MEMBER_CALL_UNRESOLVED", "Expected one receiver member declaration.",
+                                receiver, "ambiguous" if declarations else "unresolved")
+            else:
+                self._call_declared_member(node, receiver, declarations[0], hierarchy[depth:],
+                                           explicit, method_name, arguments)
+            return True
+        return False
+
+    def _call_declared_member(self, node, receiver, member, declaring_hierarchy, explicit, method_name, arguments):
+        static_member = "static" in member.modifiers
+        if ((explicit and (self.method.static or static_member))
+                or (self.method.static and not static_member)
+                or (member.unit.class_id != self.unit.class_id
+                    and not member.modifiers & {"public", "global", "protected"})):
+            self.diagnostic("APEX_MEMBER_CALL_UNRESOLVED", "The receiver member is unavailable in this context.",
+                            receiver, "unresolved")
+            return
+        declaration = member.node.parent
+        if declaration is not None and _child(declaration, "accessor_list") is not None:
+            self.diagnostic("APEX_MEMBER_CALL_UNRESOLVED", "The receiver is a property with unverified getter access.",
+                            receiver, "unresolved")
+            return
+        declared_type = member.unit.text(member.type_node)
+        folded = declared_type.casefold()
+        class_id = (component_id("apexclass", declared_type)
+                    if member.type_node.type == "type_identifier" and API_NAME.fullmatch(declared_type) else None)
+        if (class_id is None or class_id not in self.index.units_by_class or folded in _STANDARD_OBJECTS
+                or folded in self.index.object_names or folded in _PRIMITIVES or folded in _BUILTIN_COLLECTION_ARITY
+                or any(folded in unit.declared_types for unit in declaring_hierarchy)):
+            self.diagnostic("APEX_MEMBER_CALL_UNRESOLVED", "The receiver member type is not a unique local Apex class.",
+                            receiver, "unresolved")
+            return
+        candidates = _method_candidates(self.index, self.store, class_id, method_name, len(arguments), include_ambiguous=True)
+        target, overload = self._select_method(candidates, arguments)
+        if target is None:
+            if not self._ambiguous_call(node, candidates, code="APEX_MEMBER_CALL_UNRESOLVED"):
+                self.diagnostic("APEX_MEMBER_CALL_UNRESOLVED", "The declared receiver type has no unique supported local method.",
+                                node, "unresolved")
+            return
+        flags, _ = _modifiers(target.unit.data, target.node)
+        if target.static or not flags & {"public", "global"}:
+            self.diagnostic("APEX_MEMBER_CALL_UNRESOLVED", "The declared receiver type has no accessible instance method.",
+                            node, "unresolved")
+            return
+        if flags & {"virtual", "abstract", "override"} or target.node.child_by_field_name("body") is None:
+            self.diagnostic("APEX_MEMBER_CALL_VIRTUAL_UNRESOLVED",
+                            "The declared member type does not establish which virtual method implementation is called.",
+                            node, "unresolved")
+            return
+        self.store.relation(self.method.id, target.id, "calls", self.unit.location(node),
+                            "apex.declared_member_call", qualifiers={"invocation": "declared_member_method"},
+                            resolution={"basis": "unique_local_declared_member_method", "receiver_type": class_id,
+                                        "member_declaration": member.unit.location(member.node),
+                                        "parser": PARSER_VERSION, **overload})
+
     def _instance_invocation(self, node):
         cid = self._constructed_class(node.child_by_field_name("object"), node)
         if not cid:
@@ -1130,7 +1296,12 @@ class _MethodExtractor:
                 self.field_access(target, "reads", operation="assignment")
                 self.field_access(target, "writes", operation="assignment")
             else:
-                self.diagnostic("APEX_ASSIGNMENT_TARGET_UNSUPPORTED", "Increment/decrement target is outside direct-field coverage.", node)
+                # The prefix form has the operator before the operand in this
+                # grammar. Keep the existing record-field traversal bounded.
+                operand = node.child_by_field_name("operand")
+                if (operand is None or operand.type != "field_access"
+                        or not self._static_member_reference(operand, "writes")):
+                    self.diagnostic("APEX_ASSIGNMENT_TARGET_UNSUPPORTED", "Increment/decrement target is outside direct-field coverage.", node)
         else:
             for child in node.named_children:
                 self.visit(child)

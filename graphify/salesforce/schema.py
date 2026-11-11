@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 SCHEMA_VERSION = 9
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
-EXTRACTOR_VERSION = "0.5.10"
+EXTRACTOR_VERSION = "0.5.11"
 UPSTREAM_REVISION = "5eedffa87476a063a05bed96f17275ed63f05c1a"
 TESTED_API_VERSIONS = ("64.0",)
 RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains"})
@@ -20,9 +20,9 @@ KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextr
 API_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DISPATCH_CANDIDATE_INVOCATIONS = {"conditional_virtual_dispatch": "constructed_virtual_dispatch",
                                    "fflib_event_dispatch": "fflib_event_dispatch"}
-DISPATCH_EVIDENCE_SITES = (("dispatch_site", "Dispatch"), ("class_literal", "Domain literal"),
-                           ("construct_site", "Factory construction"), ("constructor", "Domain constructor"),
-                           ("hook", "Hook"))
+RELATED_EVIDENCE_SITES = (("dispatch_site", "Dispatch"), ("class_literal", "Domain literal"),
+                          ("construct_site", "Factory construction"), ("constructor", "Domain constructor"),
+                          ("hook", "Hook"), ("member_declaration", "Member declaration"))
 
 
 class DataError(ValueError):
@@ -379,6 +379,19 @@ def validate_bundle(bundle):
                             or not occurrence["path"].casefold().endswith(".approvalprocess-meta.xml")
                             or not field_definition["path"].casefold().endswith(".workflow-meta.xml")):
                         raise DataError("Invalid approval process field update evidence.")
+                if occurrence["rule"] in {"apex.declared_member_call", "apex.static_member_reference"}:
+                    declaration = occurrence["resolution"]["member_declaration"]
+                    validate_location(declaration)
+                    if occurrence["rule"] == "apex.declared_member_call":
+                        receiver = components.get(occurrence["resolution"]["receiver_type"], {})
+                        if (relation != "calls" or components[source]["kind"] != "apexmethod"
+                                or components[target]["kind"] != "apexmethod"
+                                or receiver.get("kind") != "apexclass" or receiver.get("definition_status") != "defined"):
+                            raise DataError("Invalid Apex member call evidence.")
+                    elif (relation != "references" or components[source]["kind"] not in {"apexmethod", "apextrigger"}
+                          or components[target]["kind"] != "apexclass"
+                          or declaration["path"] not in {site["path"] for site in components[target]["definitions"]}):
+                        raise DataError("Invalid Apex static member evidence.")
                 if dispatch_reason:
                     resolution = occurrence["resolution"]
                     if resolution.get("conditional") is not True or resolution.get("hook") not in components[target]["definitions"]:

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-from .schema import DISPATCH_EVIDENCE_SITES, DataError, EXTRACTOR_VERSION, SCHEMA_VERSION
+from .schema import RELATED_EVIDENCE_SITES, DataError, EXTRACTOR_VERSION, SCHEMA_VERSION
 from . import query
 
 
@@ -219,7 +219,7 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                 proof = occurrence.get("resolution")
                 if not isinstance(proof, dict):
                     continue
-                for key, label in DISPATCH_EVIDENCE_SITES:
+                for key, label in RELATED_EVIDENCE_SITES:
                     site = proof.get(key)
                     if isinstance(site, dict) and site.get("path"):
                         lines.append(f"    {label}: {site['path']}:{site.get('line', '?')} {site.get('locator', '')}")
