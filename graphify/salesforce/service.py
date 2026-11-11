@@ -182,7 +182,9 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         "inputs": scan.inputs, "coverage": coverage,
     }
     from .blind_spots import build_literal_index
-    manifest["literal_blind_spots"] = build_literal_index(scan, facts["components"])
+    manifest["literal_blind_spots"] = build_literal_index(
+        scan, facts["components"], apex_units=[*apex_index.units, *trigger_index.units],
+    )
     bundle = {"manifest": manifest, "facts": facts, "diagnostics": diagnostics}
     manifest["snapshot_id"] = stable_id("snapshot", bundle)
     validate_bundle(bundle)

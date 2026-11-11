@@ -1,14 +1,16 @@
-"""Index literal field and method mentions in selected Salesforce metadata."""
+"""Index literal review hints in selected metadata and parsed Apex strings."""
 
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection
 import re
 from typing import TYPE_CHECKING
 
 from .schema import DataError
 
 if TYPE_CHECKING:
+    from .apex import Unit
     from .discovery import Scan
 
 
@@ -33,13 +35,56 @@ def _interface(path: str) -> bool:
             or ("/lwc/" in f"/{path}" and path.endswith(_LWC_SUFFIXES)))
 
 
-def build_literal_index(scan: Scan, components: list[dict]) -> dict:
+def _count_field(counts, token, qualified_fields, field_names):
+    if token in qualified_fields:
+        counts["qualified", token] += 1
+    else:
+        leaf = token.rsplit(b".", 1)[-1]
+        if leaf in field_names:
+            counts["field_name", leaf] += 1
+
+
+def _record_counts(summaries, counts, relative):
+    for (kind, name), count in counts.items():
+        summary = summaries[kind].setdefault(name.decode("utf-8"), {
+            "occurrence_count": 0, "file_count": 0, "example_paths": [],
+        })
+        summary["occurrence_count"] += count
+        summary["file_count"] += 1
+        if len(summary["example_paths"]) < _EXAMPLE_LIMIT:
+            summary["example_paths"].append(relative)
+
+
+def _apex_string_index(scan, units, qualified_fields, field_names):
+    from .apex import _walk
+
+    summaries = {"qualified": {}, "field_name": {}}
+    scanned = scanned_bytes = 0
+    for unit in sorted(units, key=lambda unit: unit.path):
+        if unit.parse_error or len(unit.data) > min(_MAX_FILE_BYTES, _MAX_SCAN_BYTES - scanned_bytes):
+            continue
+        scanned += 1
+        scanned_bytes += len(unit.data)
+        counts = Counter()
+        for node in _walk(unit.tree.root_node):
+            if node.type in {"string_literal", "multi_line_string_literal"}:
+                for match in _TOKEN.finditer(unit.data, node.start_byte, node.end_byte):
+                    _count_field(counts, match[0].lower(), qualified_fields, field_names)
+        _record_counts(summaries, counts, unit.path)
+    return {
+        "eligible_file_count": sum(path.casefold().endswith((".cls", ".trigger")) for path in scan.inputs),
+        "scanned_file_count": scanned,
+        **summaries,
+    }
+
+
+def build_literal_index(scan: Scan, components: list[dict], *, apex_units: list[Unit]) -> dict:
     from .discovery import _capture, _safe_path
 
     qualified_fields = {c["api_name"].casefold().encode("utf-8")
                         for c in components if c["kind"] == "field"}
     qualified_methods = {c["api_name"].partition("(")[0].casefold().encode("utf-8")
-                         for c in components if c["kind"] == "apexmethod"}
+                         for c in components if c["kind"] == "apexmethod" and not c.get("is_constructor")}
     field_names = {name.rsplit(b".", 1)[-1] for name in qualified_fields}
     method_names = {name.rsplit(b".", 1)[-1] for name in qualified_methods}
     summaries: dict[str, dict[str, dict]] = {
@@ -73,24 +118,14 @@ def build_literal_index(scan: Scan, components: list[dict]) -> dict:
         counts: Counter[tuple[str, bytes]] = Counter()
         for match in _TOKEN.finditer(data):
             token = match[0].lower()
-            leaf = token.rsplit(b".", 1)[-1]
-            if token in qualified_fields:
-                counts["qualified", token] += 1
-            elif leaf in field_names:
-                counts["field_name", leaf] += 1
+            _count_field(counts, token, qualified_fields, field_names)
             if interface:
+                leaf = token.rsplit(b".", 1)[-1]
                 if token in qualified_methods:
                     counts["qualified_method", token] += 1
                 elif leaf in method_names:
                     counts["method_name", leaf] += 1
-        for (kind, name), count in counts.items():
-            summary = summaries[kind].setdefault(name.decode("utf-8"), {
-                "occurrence_count": 0, "file_count": 0, "example_paths": [],
-            })
-            summary["occurrence_count"] += count
-            summary["file_count"] += 1
-            if len(summary["example_paths"]) < _EXAMPLE_LIMIT:
-                summary["example_paths"].append(relative)
+        _record_counts(summaries, counts, relative)
     return {
         "eligible_file_count": len(eligible),
         "scanned_file_count": scanned,
@@ -102,13 +137,29 @@ def build_literal_index(scan: Scan, components: list[dict]) -> dict:
             "qualified": summaries["qualified_method"],
             "method_name": summaries["method_name"],
         },
+        "apex_strings": _apex_string_index(scan, apex_units, qualified_fields, field_names),
+    }
+
+
+def _mentions(index, literal, short_key):
+    scanned = index["scanned_file_count"]
+    leaf = literal.rsplit(".", 1)[-1]
+    empty = {"occurrence_count": 0, "file_count": 0, "example_paths": []}
+    return {
+        "scanned_file_count": scanned,
+        "skipped_file_count": index["eligible_file_count"] - scanned,
+        "qualified": {"literal": literal, **index["qualified"].get(literal.casefold(), empty)},
+        short_key: {"literal": leaf, **index[short_key].get(leaf.casefold(), empty)},
     }
 
 
 def literal_mentions(manifest: dict, component: dict) -> dict:
     index = manifest.get("literal_blind_spots")
+    apex_strings = None
     literal = component["api_name"]
     if component["kind"] == "apexmethod":
+        if component.get("is_constructor"):
+            return {"state": "unavailable", "reason": "Literal method hints cover ordinary methods."}
         index = index.get("methods") if index is not None else None
         literal = literal.partition("(")[0]
         short_key = "method_name"
@@ -118,27 +169,21 @@ def literal_mentions(manifest: dict, component: dict) -> dict:
         )
     else:
         short_key = "field_name"
+        apex_strings = index.get("apex_strings") if index is not None else None
         interpretation = (
-            "Literal matches are review hints. The scan excludes Apex class and trigger source. "
-            "Field-name matches include standalone names and "
+            "Literal matches are review hints. Field-name matches include standalone names and "
             "suffixes of other dotted tokens, which may refer to another object, markup, or unrelated text."
         )
     if index is None:
         return {"state": "unavailable", "reason": "This snapshot has no literal index for this component kind."}
-    scanned = index["scanned_file_count"]
-    leaf = literal.rsplit(".", 1)[-1]
-    empty = {"occurrence_count": 0, "file_count": 0, "example_paths": []}
-    return {
-        "state": "indexed",
-        "scanned_file_count": scanned,
-        "skipped_file_count": index["eligible_file_count"] - scanned,
-        "qualified": {"literal": literal, **index["qualified"].get(literal.casefold(), empty)},
-        short_key: {"literal": leaf, **index[short_key].get(leaf.casefold(), empty)},
-        "interpretation": interpretation + " A zero count covers only the scanned metadata.",
-    }
+    result = {"state": "indexed", **_mentions(index, literal, short_key),
+              "interpretation": interpretation + " A zero count covers only scanned files."}
+    if apex_strings is not None:
+        result["apex_strings"] = _mentions(apex_strings, literal, short_key)
+    return result
 
 
-def _validate_group(index: dict, inputs: dict, short_key: str) -> None:
+def _validate_group(index: dict, inputs: Collection[str], short_key: str) -> None:
     eligible = index["eligible_file_count"]
     scanned = index["scanned_file_count"]
     if type(eligible) is not int or type(scanned) is not int or not 0 <= scanned <= eligible <= len(inputs):
@@ -162,3 +207,6 @@ def validate_literal_index(index: dict, inputs: dict) -> None:
         if (methods["eligible_file_count"] > index["eligible_file_count"]
                 or methods["scanned_file_count"] > index["scanned_file_count"]):
             raise DataError("Invalid literal method scan counts.")
+    if "apex_strings" in index:
+        apex_inputs = {path for path in inputs if path.casefold().endswith((".cls", ".trigger"))}
+        _validate_group(index["apex_strings"], apex_inputs, "field_name")

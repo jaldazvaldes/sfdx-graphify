@@ -267,6 +267,13 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                 examples = match["example_paths"]
                 lines.extend(f"    {path}" for path in (examples[:1] if brief else examples))
             lines.append(mentions["interpretation"])
+            if apex := mentions.get("apex_strings"):
+                qualified, field_name = apex["qualified"], apex["field_name"]
+                lines.append(f"Apex string hints: {qualified['occurrence_count']} qualified, "
+                             f"{field_name['occurrence_count']} field-name matches "
+                             f"({apex['scanned_file_count']} files scanned, {apex['skipped_file_count']} skipped).")
+                examples = sorted(set(qualified["example_paths"] + field_name["example_paths"]))
+                lines.extend(f"    {path}" for path in (examples[:1] if brief else examples))
         else:
             lines.append(f"Literal search unavailable: {mentions['reason']}")
     lines.extend(result.get("limitations", []))

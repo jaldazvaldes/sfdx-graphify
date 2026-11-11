@@ -1,4 +1,4 @@
-sfdx-graphify 0.5.11 (unreleased)
+sfdx-graphify 0.5.12 (unreleased)
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -159,8 +159,11 @@ scans cover layouts, FlexiPages, quick actions, permissions, reports, approvals,
 email templates, list views, custom metadata records, web links, sharing rules,
 field sets, and selected Aura, Visualforce and LWC sources. Method scans cover
 those interface sources and count Class.Method and method-name matches.
-Overloads share their literal hints. Scans use up to 8 MiB per file and 64 MiB
-total, report skipped files, and keep up to three example paths per name.
+Overloads share their literal hints. Field queries also report a separate
+index for literal strings in parsed Apex classes and triggers. Those matches
+are review hints for dynamic access, with counts and example file paths.
+Each scan uses up to 8 MiB per file and 64 MiB in total, reports skipped files,
+and keeps up to three example paths per name.
 
 The qualified count matches a complete Object.Field token case-insensitively.
 The field-name count covers the standalone name and matching suffixes in other
@@ -262,7 +265,9 @@ record fields. Their arguments still contribute dependencies and diagnostics.
 In classes and triggers, literal custom setting accessors can establish
 record and field reads from a unique local setting declaration. A literal
 new expression for a unique local Apex class creates a reference to that
-class. It does not infer which method a platform scheduler runs.
+class. Direct outer constructor bodies are searchable as Class.new(Type,...).
+They use the same bounded analysis as ordinary method bodies and report
+unresolved constructor delegation with evidence for its arguments.
 An enhanced for loop with an explicitly declared single-record element type
 supports direct reads, memory assignments and explicit DML in its body. The
 element binding never leaks into the iterable expression or outside the loop.
@@ -317,8 +322,8 @@ this convention remain diagnostic.
 Call edges are static candidates, not execution traces. Unknown receiver types,
 unresolved overloads, external hierarchies, query aliases, dynamic queries,
 polymorphic/unresolved paths and remaining parse failures are diagnosed rather
-than guessed. General collection/map aliases, constructor/initializer bodies and
-inner-class analysis remain outside this bounded implementation.
+than guessed. General collection/map aliases, initializer blocks, constructor
+delegation and inner-class bodies remain outside this bounded implementation.
 
 Queries expose candidates as resolution.status=candidate with confidence
 AMBIGUOUS, a reason and source evidence. Reasons distinguish external caller

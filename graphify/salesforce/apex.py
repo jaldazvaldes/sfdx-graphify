@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from tree_sitter import Node, Tree
 
-from .schema import API_NAME, FactStore, component_id
+from .schema import API_NAME, DataError, FactStore, component_id
 from .relationship_paths import add_navigation_reads, resolve_source_field_path
 
 
@@ -171,6 +171,7 @@ class ApexIndex:
     units: list[Unit] = field(default_factory=list)
     units_by_class: dict[str, Unit] = field(default_factory=dict)
     methods: dict[str, list[Method]] = field(default_factory=lambda: defaultdict(list))
+    constructors: dict[str, list[Method]] = field(default_factory=lambda: defaultdict(list))
     apex_types: set[str] = field(default_factory=set)
     object_names: set[str] = field(default_factory=set)
     namespaces: set[str] = field(default_factory=set)
@@ -210,8 +211,40 @@ def _query_owner(unit, query):
     return name if storage.type == "storage_identifier" and API_NAME.fullmatch(name) else None
 
 
+def _parameter_type(unit, parameter):
+    source = unit.text(parameter.child_by_field_name("type"))
+    return re.sub(r"\s+", "", re.sub(r"/\*[\s\S]*?\*/|//[^\r\n]*", "", source))
+
+
+def _constructor_definition(unit, node, store):
+    name = unit.text(node.child_by_field_name("name"))
+    body = node.child_by_field_name("body")
+    flags, _ = _modifiers(unit.data, node)
+    parameters = _significant(node.child_by_field_name("parameters"))
+    if (name.casefold() != unit.name.casefold() or body is None or body.type != "constructor_body"
+            or flags & {"static", "abstract", "virtual", "override"}
+            or any(item.type != "formal_parameter" for item in parameters)):
+        store.diagnostic("APEX_CONSTRUCTOR_DECLARATION_UNSUPPORTED",
+                         "Expected a non-static constructor matching its outer class.",
+                         unit.location(node), state="unresolved")
+        return None
+    types = tuple(_parameter_type(unit, parameter) for parameter in parameters)
+    api_name = f"{unit.name}.new({','.join(types)})"
+    try:
+        if not all(types):
+            raise DataError("Constructor parameters require declared types.")
+        constructor_id = component_id("apexmethod", api_name)
+    except DataError:
+        store.diagnostic("APEX_CONSTRUCTOR_SIGNATURE_UNSUPPORTED",
+                         "Constructor parameters do not have a supported canonical signature.",
+                         unit.location(node), state="unresolved")
+        return None
+    return Method(unit, node, constructor_id, "new", static=False, invocable=False, invocable_valid=False,
+                  parameter_count=len(parameters), is_test=unit.is_test, parameter_types=types, api_name=api_name)
+
+
 def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
-    """Index outer methods; parser errors never produce recovered dependency facts."""
+    """Index outer methods and constructors from complete class parses."""
     index = ApexIndex(object_names={c["api_name"].casefold() for c in store.components.values() if c["kind"] == "object"})
     index.namespaces.update(str(c["namespace"]).casefold() for c in store.components.values()
                             if c.get("namespace") and c.get("definition_status") == "defined")
@@ -300,8 +333,21 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
         for node in body.named_children:
             if node.type in _IGNORED:
                 continue
+            if node.type == "constructor_declaration":
+                constructor = _constructor_definition(unit, node, store)
+                if constructor is not None:
+                    index.constructors[unit.class_id].append(constructor)
+                continue
+            if node.type in {"static_initializer", "block"}:
+                store.diagnostic("APEX_CLASS_INITIALIZER_UNSUPPORTED", "Class initializer blocks are outside coverage.",
+                                 unit.location(node), construct=node.type)
+                continue
+            if node.type in {"class_declaration", "interface_declaration", "enum_declaration"}:
+                store.diagnostic("APEX_INNER_TYPE_UNSUPPORTED", "Inner Apex type bodies are outside coverage.",
+                                 unit.location(node), construct=node.type)
+                continue
             if node.type != "method_declaration":
-                store.diagnostic("APEX_CLASS_MEMBER_UNSUPPORTED", "Only outer method bodies are analyzed; this class member is outside coverage.",
+                store.diagnostic("APEX_CLASS_MEMBER_UNSUPPORTED", "This outer class member body is outside dependency coverage.",
                                  unit.location(node), construct=node.type)
                 continue
             method_name = unit.text(node.child_by_field_name("name"))
@@ -321,8 +367,7 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
             method_id = component_id("apexmethod", name + "." + method_name)
             method = Method(unit, node, method_id, method_name, "static" in modifiers, invocable, valid, len(parameters),
                             is_test=unit.is_test or "istest" in annotations or "testmethod" in modifiers,
-                            parameter_types=tuple(re.sub(r"\s+", "", re.sub(r"/\*[\s\S]*?\*/|//[^\r\n]*", "",
-                                                  unit.text(p.child_by_field_name("type")))) for p in parameters))
+                            parameter_types=tuple(_parameter_type(unit, p) for p in parameters))
             index.methods[unit.class_id].append(method)
             if invocable and not valid:
                 store.diagnostic("APEX_INVOCABLE_SIGNATURE_UNSUPPORTED", "The invocable declaration does not satisfy the supported outer static public/global list signature.", unit.location(node))
@@ -355,6 +400,27 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
                 store.components[method.id]["is_test"] = None
                 store.diagnostic("APEX_METHOD_AMBIGUOUS", "Duplicate method signatures share this identity; no target is selected.",
                                  method.unit.location(method.node), state="ambiguous", candidates=[method.id])
+    for class_id, constructors in index.constructors.items():
+        if store.is_ambiguous(class_id):
+            continue
+        if any(method.name.casefold() == "new" for method in index.methods.get(class_id, ())):
+            for constructor in constructors:
+                store.diagnostic("APEX_CONSTRUCTOR_ID_AMBIGUOUS",
+                                 "An ordinary method uses the reserved constructor name.",
+                                 constructor.unit.location(constructor.node), state="ambiguous")
+            constructors.clear()
+            continue
+        for constructor in constructors:
+            store.ensure_component("apexmethod", constructor.api_name, constructor.unit.location(constructor.node),
+                                   is_constructor=True, invocable=False, invocable_signature_supported=False,
+                                   static=False, parser=PARSER_VERSION, is_test=constructor.is_test,
+                                   qualified_name=constructor.qualified_name, arity=constructor.parameter_count,
+                                   parameter_types=list(constructor.parameter_types))
+        for constructor in constructors:
+            if store.is_ambiguous(constructor.id):
+                store.components[constructor.id]["is_test"] = None
+                store.diagnostic("APEX_CONSTRUCTOR_AMBIGUOUS", "Multiple constructors share this signature.",
+                                 constructor.unit.location(constructor.node), state="ambiguous", candidates=[constructor.id])
     return index
 
 
@@ -485,7 +551,7 @@ class _MethodExtractor:
         for node in _walk(body):
             if node.type == "local_variable_declaration":
                 scope = node.parent
-                while scope is not None and scope.type not in {"block", "for_statement", "enhanced_for_statement"}:
+                while scope is not None and scope.type not in {"block", "constructor_body", "for_statement", "enhanced_for_statement"}:
                     scope = scope.parent
                 owner, collection = self.record_type(node.child_by_field_name("type"))
                 for declaration in node.named_children:
@@ -1278,6 +1344,11 @@ class _MethodExtractor:
                 self.diagnostic("APEX_DML_KEY_UNSUPPORTED", "Upsert external-key semantics are outside bounded DML coverage.", extra)
         elif node.type == "method_invocation":
             self.invocation(node)
+        elif node.type == "explicit_constructor_invocation":
+            self.diagnostic("APEX_CONSTRUCTOR_DELEGATION_UNSUPPORTED",
+                            "Constructor delegation is outside dependency coverage.", node)
+            for argument in _significant(node.child_by_field_name("arguments")):
+                self.visit(argument)
         elif node.type == "assignment_expression":
             left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
             if left is not None and left.type == "field_access":
@@ -1317,7 +1388,7 @@ class _MethodExtractor:
 
 
 def extract_apex(index: ApexIndex, store: FactStore) -> None:
-    """Extract supported static method effects; duplicate definitions stay unresolved."""
+    """Extract source dependencies of outer Apex methods and constructors."""
     for unit in index.units:
         if unit.superclass_name and not store.is_ambiguous(unit.class_id):
             node = unit.class_node.child_by_field_name("superclass")
@@ -1333,6 +1404,15 @@ def extract_apex(index: ApexIndex, store: FactStore) -> None:
                 continue
             store.relation(class_id, method.id, "contains", method.unit.location(method.node), "apex.method_owner")
             _MethodExtractor(method, index, store).run()
+    for class_id, constructors in index.constructors.items():
+        if store.is_ambiguous(class_id):
+            continue
+        for constructor in constructors:
+            if store.is_ambiguous(constructor.id):
+                continue
+            store.relation(class_id, constructor.id, "contains", constructor.unit.location(constructor.node),
+                           "apex.constructor_owner")
+            _MethodExtractor(constructor, index, store).run()
 
 
 def resolve_invocable_calls(store: FactStore, index: ApexIndex) -> None:

@@ -104,3 +104,47 @@ def test_literal_mentions_cover_additional_metadata_and_methods(tmp_path):
     legacy = deepcopy(bundle)
     del legacy["manifest"]["literal_blind_spots"]["methods"]
     assert query.refs(legacy, "DemoController.save")["literal_blind_spots"]["state"] == "unavailable"
+
+
+def test_apex_string_hints_exclude_comments_and_remain_separate_from_graph_facts(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "sfdx-project.json").write_text(
+        '{"packageDirectories":[{"path":"force-app"}]}', encoding="utf-8")
+
+    def put(relative, text):
+        path = source / "force-app" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    put("objects/Account/fields/Code__c.field-meta.xml",
+        "<CustomField><fullName>Code__c</fullName><type>Text</type></CustomField>")
+    put("classes/DynamicFields.cls", """public class DynamicFields {
+        public static void lookup() {
+            // Account.Code__c Code__c
+            String qualified = 'Account.Code__c';
+            String unrelated = 'Code__c_Extra';
+        }
+    }""")
+    put("triggers/Example.trigger",
+        "trigger Example on Account (before insert) { String fieldName = 'Code__c'; }")
+    put("classes/Unparsed.cls", "public class Unparsed { String x = 'Account.Code__c';")
+
+    output = tmp_path / "snapshot"
+    build_project(source, out=output)
+    bundle = load(output)
+    result = query.refs(bundle, "Account.Code__c", relation="reads")
+    assert result["results"] == []
+    hints = result["literal_blind_spots"]
+    assert hints["qualified"]["occurrence_count"] == 0
+    assert hints["apex_strings"] == {
+        "scanned_file_count": 2,
+        "skipped_file_count": 1,
+        "qualified": {"literal": "Account.Code__c", "occurrence_count": 1, "file_count": 1,
+                      "example_paths": ["force-app/classes/DynamicFields.cls"]},
+        "field_name": {"literal": "Code__c", "occurrence_count": 1, "file_count": 1,
+                       "example_paths": ["force-app/triggers/Example.trigger"]},
+    }
+    assert "Apex string hints: 1 qualified, 1 field-name matches" in cli._text(result, brief=True)
+    del bundle["manifest"]["literal_blind_spots"]["apex_strings"]
+    assert "apex_strings" not in query.refs(bundle, "Account.Code__c")["literal_blind_spots"]
