@@ -11,7 +11,7 @@ import subprocess
 import pytest
 
 from graphify.salesforce.graphify_adapter import projection_graph
-from graphify.salesforce.standard_graph import standard_assets
+from graphify.salesforce.standard_graph import ProcessGraphContext, standard_assets
 
 
 def layered_bundle():
@@ -92,6 +92,26 @@ def test_standard_renderer_retains_all_layer_details_and_reverse_pairs():
     assert bundle == original
 
 
+def test_process_renderer_reuses_the_canvas_and_scopes_its_assets():
+    bundle = layered_bundle()
+    bundle["process_graph"] = {"truncated": True}
+    context = ProcessGraphContext("Configure & inspect", "/processes#country=IT&process=sample",
+                                  "country=IT&process=sample", "Look up fields")
+    assets = standard_assets(bundle, process_graph=context)
+    html = assets["/"][0].decode()
+    assert "Process dependencies · Configure &amp; inspect" in html
+    assert "Step · Look up fields" in html
+    assert "outside this view’s size limit" in html
+    assert 'href="/processes#country=IT&amp;process=sample"' in html
+    for route in assets.keys() - {"/"}:
+        assert f'/process-graph{route}?country=IT&amp;process=sample' in html
+    assert 'src="/vis-network.min.js"' in html
+    full_html = standard_assets(bundle)["/"][0].decode()
+    for relation in ("reads", "writes", "filters", "calls"):
+        assert f'value="{relation}"' in html
+        assert f'value="{relation}"' not in full_html
+
+
 @pytest.mark.parametrize("scenario", [
     "layers", "direction", "combined_filters", "focus_styles", "focus_filters", "validation_empty", "validation_rules", "candidates",
 ])
@@ -101,11 +121,14 @@ def test_browser_layer_filter_behavior(scenario):
         pytest.skip("Node.js is needed for the browser filter regression harness")
     bundle = layered_bundle()
     if scenario == "candidates":
-        bundle["facts"]["relationships"].append({
+        bundle["facts"]["relationships"].extend([{
             "id": "candidate", "source": "owner", "target": "field", "relation": "calls",
             "qualifiers": {"resolution_status": "candidate", "uncertainty": "external_hierarchy",
                            "missing_ancestors": ["ExternalBase"]}, "evidence_ids": [],
-        })
+        }, {
+            "id": "flow_filter", "source": "flow", "target": "field", "relation": "filters",
+            "qualifiers": {}, "evidence_ids": [],
+        }])
     if scenario == "validation_rules":
         bundle["facts"]["components"].append({
             "id": "rule", "api_name": "owner.Require_Name", "kind": "validationrule",

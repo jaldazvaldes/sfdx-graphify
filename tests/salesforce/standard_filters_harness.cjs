@@ -112,6 +112,18 @@ if (scenario === 'candidates') {
   chooseLayer('dependencies');
   assert.match(edgesDS.get(mixedId).title, /1 candidate, 1 extracted/);
   assert.equal(edgesDS.get(mixedId).dashes, true);
+  chooseLayer('reads');
+  assert.deepEqual(visiblePairs(), ['flow>field', 'owner>field', 'test>field', 'unknown>field']);
+  assert.deepEqual(neighborDescriptions('owner'), {field: ['Outgoing: reads']});
+  chooseLayer('writes');
+  assert.deepEqual(visiblePairs(), ['field>owner']);
+  chooseLayer('filters');
+  assert.deepEqual(visiblePairs(), ['flow>field']);
+  assert.deepEqual(neighborDescriptions('flow'), {field: ['Outgoing: filters']});
+  chooseLayer('calls');
+  assert.deepEqual(visiblePairs(), ['owner>field']);
+  assert.equal(edgesDS.get(mixedId).dashes, true);
+  assert.doesNotMatch(edgesDS.get(mixedId).title, /reads|contains/);
   chooseLayer('all');
   assert.deepEqual(visibleNodes(), allNodes);
   assert.deepEqual(visiblePairs(), allPairs);

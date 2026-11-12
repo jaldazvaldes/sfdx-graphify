@@ -6,13 +6,13 @@ This independent fork builds on Graphify. The Salesforce workflow uses the `sfdx
 
 ## 1. Install the tool
 
-Install the published **0.5.21** wheel from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
+Install the published **0.6.0** wheel from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
 
 ```powershell
-uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.21/sfdx_graphify-0.5.21-py3-none-any.whl'
+uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.6.0/sfdx_graphify-0.6.0-py3-none-any.whl'
 ```
 
-After installation succeeds, `sfdx-graphify --version` should print `sfdx-graphify 0.5.21`.
+After installation succeeds, `sfdx-graphify --version` should print `sfdx-graphify 0.6.0`.
 
 <details>
 <summary>PowerShell setup without a command on PATH</summary>
@@ -27,12 +27,12 @@ $cli = Join-Path (uv tool dir --bin) 'sfdx-graphify.exe'
 **Without `uv`.** With Python 3.10+ installed, use a dedicated virtual environment.
 
 ```powershell
-$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.5.21'
+$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.6.0'
 python -m venv $venv
 if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
 $python = Join-Path $venv 'Scripts\python.exe'
 $cli = Join-Path $venv 'Scripts\sfdx-graphify.exe'
-& $python -m pip install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.5.21/sfdx_graphify-0.5.21-py3-none-any.whl'
+& $python -m pip install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.6.0/sfdx_graphify-0.6.0-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Wheel installation failed.' }
 & $cli --version
 ```
@@ -98,6 +98,18 @@ sfdx-graphify serve
 The cache is private and specific to the checkout path. Rebuild when you want to incorporate changes or a new branch in that checkout. If you built with a custom `--out`, pass that directory as `--snapshot`.
 
 On a Git checkout, the default build reads the current working-tree bytes of tracked Salesforce files. To build a baseline for a specification, use a clean checkout of the intended branch and record `git branch --show-current` and `git rev-parse HEAD`. Use `sfdx-graphify status --source . --require-current` when you need to verify that the snapshot still matches the source.
+
+### Explore a documented process
+
+From the Salesforce project root, start the viewer with the snapshot and catalog already registered for that project.
+
+```powershell
+sfdx-graphify serve --registered-process-maps
+```
+
+Open the URL printed by the command. Choose **Process maps**, select a country, feature, and process, then choose **Open dependency graph**. Select an object, field, Flow, or Apex node to see its connections and evidence. Use the relationship filters to focus on reads, writes, filters, or calls. From the process path, select a step and choose **Graph for this step** to see the components and relationships supported by that step's citations.
+
+If the project has a catalog but has never registered it, run `sfdx-graphify processes register --snapshot <snapshot> --catalog <catalog.json>` once. The [Salesforce guide](docs/salesforce.txt) describes catalog setup and evidence.
 
 ### Existing Graphify installations
 

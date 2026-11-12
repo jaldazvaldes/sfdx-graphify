@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import copy
+from html import unescape
 import http.client
 import json
 from pathlib import Path
+import re
 import socket
 from threading import Thread
 from urllib.parse import urlencode
@@ -388,6 +390,8 @@ def test_registered_http_routes_integrity_and_host_isolation(bundle, tmp_path, m
         assert meta["coverage"]["unsupported_inventory_files"] == 1
         assert meta["processes_available"] is with_processes
         assert request("/processes")[0] == (200 if with_processes else 404)
+        graph_route = "/process-graph?" + urlencode({"country": "XX", "process": "example"})
+        assert request(graph_route)[0] == (200 if with_processes else 404)
         code, _, body = request("/api/processes")
         assert code == (200 if with_processes else 404)
         if with_processes:
@@ -406,6 +410,28 @@ def test_registered_http_routes_integrity_and_host_isolation(bundle, tmp_path, m
             assert request("/api/evidence?" + urlencode({"relationship": match["relationship"]}))[0] == 200
             assert request("/api/processes", {"Origin": "https://attacker.invalid"})[0] == 403
             assert request("/processes.css")[0] == request("/processes.js")[0] == 200
+            code, headers, graph_page = request(graph_route + "&step=inspect")
+            assert code == 200
+            assert "script-src 'self';" in headers["Content-Security-Policy"]
+            graph_assets = [
+                unescape(url) for url in re.findall(r'(?:href|src)="([^"]+)"', graph_page.decode())
+                if url.startswith("/process-graph/standard")
+            ]
+            assert graph_assets
+            scripts = []
+            for asset in graph_assets:
+                status, _, content = request(asset)
+                assert status == 200
+                scripts.append(content.decode())
+            graph_data = next(script for script in scripts if "const RAW_NODES = " in script)
+            nodes = json.loads(re.search(r"const RAW_NODES = (.*);\n", graph_data)[1])
+            assert {node["id"] for node in nodes} == {
+                cid("flow", "Update_Account"), field, cid("object", "Account"),
+            }
+            assert b"/processes#country=XX&amp;process=example&amp;step=inspect" in graph_page
+            assert request(graph_route + "&step=missing")[0] == 400
+            assert request("/process-graph?country=XX&process=incomplete")[0] == 400
+            assert request(graph_route, {"Origin": "https://attacker.invalid"})[0] == 403
             registration = {key: result[key] for key in ("source_revision", "snapshot_id", "catalog_digest")}
             registration.update({"snapshot": str(output), "catalog": str(catalog_path), "port": server.server_port})
             monkeypatch.setattr(process_registration, "load_process_registration", lambda _: registration)

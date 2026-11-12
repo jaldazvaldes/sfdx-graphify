@@ -78,7 +78,7 @@ function relationshipTitle(details, confidence) {
 
 function activeRelationshipDetails(edge) {
   return relationshipLayer === 'all' ? edge.relationship_details
-    : edge.relationship_details.filter(detail => detail.layer === relationshipLayer);
+    : edge.relationship_details.filter(detail => detail.layer === relationshipLayer || detail.relation === relationshipLayer);
 }
 
 const displayedEdgeTitles = RAW_EDGES.map(edge => relationshipTitle(edge.relationship_details, edge.confidence));

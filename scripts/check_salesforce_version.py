@@ -13,7 +13,8 @@ SCHEMA = PACKAGE + "schema.py"
 VERSION = re.compile(r'^EXTRACTOR_VERSION = "(\d+)\.(\d+)\.(\d+)"$', re.MULTILINE)
 READ_SIDE_MODULES = frozenset({
     "__init__.py", "__main__.py", "cli.py", "graphify_adapter.py", "grouping.py",
-    "listener.py", "orbital_layout.py", "query.py", "query_server.py", "session.py", "skill_install.py", "snapshot.py",
+    "listener.py", "orbital_layout.py", "process_graph.py", "query.py", "query_server.py", "session.py",
+    "skill_install.py", "snapshot.py",
     "standard_graph.py", "viewer.py",
 })
 

@@ -33,6 +33,8 @@
           <div>
             <h2 id="process-title"></h2>
             <p class="subtitle" id="process-summary"></p>
+            <a id="process-dependency-graph" class="process-graph-link" hidden>Open dependency graph</a>
+            <p id="process-graph-unavailable" class="hint process-graph-hint" hidden>The catalog links this process to no components available in the selected snapshot.</p>
             <p class="process-message" id="process-review" hidden>Some components in this process need review.</p>
           </div>
           <div class="process-revision">
@@ -60,6 +62,8 @@
               <p class="meta-label" id="step-kind"></p>
               <h3 id="step-title" tabindex="-1"></h3>
               <p id="step-description"></p>
+              <a id="step-dependency-graph" class="secondary process-step-graph-link" hidden>Graph for this step</a>
+              <p id="step-graph-unavailable" class="hint process-graph-hint" hidden>The catalog links this step to no components available in the selected snapshot.</p>
               <button type="button" id="back-to-step" class="secondary">Back to process path</button>
             </div>
             <div id="step-body"></div>

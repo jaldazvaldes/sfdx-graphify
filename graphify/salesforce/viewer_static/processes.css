@@ -53,6 +53,32 @@
   max-width: 68ch;
 }
 
+.process-graph-link {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 6px 11px;
+  border-radius: 6px;
+  background: #255899;
+  color: white;
+  font-size: 13px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.process-graph-link:hover {
+  background: #1b467d;
+}
+
+.process-step-graph-link {
+  display: inline-block;
+  margin: 9px 8px 0 0;
+  text-decoration: none;
+}
+
+.process-graph-hint {
+  margin-top: 8px;
+}
+
 .process-revision {
   display: grid;
   gap: 3px;

@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 SCHEMA_VERSION = 13
 SUPPORTED_SCHEMA_VERSIONS = frozenset(range(1, SCHEMA_VERSION + 1))
-EXTRACTOR_VERSION = "0.5.21"
+EXTRACTOR_VERSION = "0.6.0"
 UPSTREAM_REVISION = "06aa51be050170675912781ad8a2be2b20439d39"
 TESTED_API_VERSIONS = ("64.0",)
 CUSTOM_METADATA_RELATIONS = frozenset({"instance_of", "sets_value", "mentions"})

@@ -44,6 +44,18 @@ function routeTo(values) {
   return "#" + params.toString();
 }
 
+function setDependencyGraphLink(link, hasComponents, step) {
+  link.hidden = !hasComponents;
+  if (!hasComponents) {
+    link.removeAttribute("href");
+    return;
+  }
+  const params = new URLSearchParams({country: state.country.id, process: state.process.id});
+  if (state.feature?.id) params.set("feature", state.feature.id);
+  if (step) params.set("step", step.id);
+  link.href = "/process-graph?" + params.toString();
+}
+
 function setOptions(menu, items, selected, labelKey) {
   const options = items.map((item) => new Option(item[labelKey], item.id));
   menu.replaceChildren(...options);
@@ -276,6 +288,9 @@ function renderStep(step) {
   get("step-kind").textContent = stepKinds[step.kind] || "Step";
   get("step-title").textContent = step.label;
   get("step-description").textContent = step.description;
+  const hasComponents = step.components.length > 0;
+  setDependencyGraphLink(get("step-dependency-graph"), hasComponents, step);
+  get("step-graph-unavailable").hidden = hasComponents;
   const body = get("step-body");
   body.replaceChildren();
   if (step.effects.length) body.append(stepSection("Effects", effectList(step.effects)));
@@ -330,6 +345,9 @@ function render() {
   if (changed) {
     get("process-title").textContent = process.title;
     get("process-summary").textContent = process.summary;
+    const hasComponents = process.steps.some((item) => item.components.length > 0);
+    setDependencyGraphLink(get("process-dependency-graph"), !process.catalog_error && hasComponents);
+    get("process-graph-unavailable").hidden = Boolean(process.catalog_error) || hasComponents;
     const review = get("process-review");
     review.hidden = process.review_status !== "needs_review";
     review.textContent = process.catalog_error || "Some components in this process need review.";

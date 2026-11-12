@@ -27,6 +27,8 @@ On 0.5.16 or newer, use the registered catalog from the folder containing `sfdx-
 2. Run `sfdx-graphify processes show "<process-id>"` with the relevant country and feature. This returns the process, its steps, and `viewer_path`. For a question about a specific step, add `--step "<step-id-or-label>"` for effects, components, and source evidence.
 3. When the user asks to open a map, join the returned `viewer_url` and `viewer_path` if a matching viewer is running. Otherwise start `sfdx-graphify serve --registered-process-maps` in the background from the same project. Wait for `Local Salesforce viewer:` and append `viewer_path` to the printed URL. Open that link or give it to the user and keep the viewer running. Use the registered snapshot for these actions.
 
+On 0.6.0 or newer, choose **Open dependency graph** on the process map to see its objects, fields, and automation on the interactive graph. Choose a step and select **Graph for this step** to focus on the components and relationships supported by its citations. Select a node to inspect its connections, or filter the graph to reads, writes, filters, or calls.
+
 On 0.5.17 or newer, use `processes list --component "<id-or-api-name>"` to find
 the process steps that use a component. Use `processes show "<process-id>" --format brief`
 for a compact outline with connections, effects, and one source location per effect.

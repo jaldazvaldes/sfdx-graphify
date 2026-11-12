@@ -1,6 +1,8 @@
 """The upstream Graphify canvas, adapted to an offline complete Salesforce graph."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from html import escape
 import json
 from importlib.resources import files
 from pathlib import Path
@@ -11,6 +13,14 @@ from .graphify_adapter import projection_graph
 from .grouping import grouping
 from .orbital_layout import orbital_positions
 from .schema import DataError
+
+
+@dataclass(frozen=True)
+class ProcessGraphContext:
+    process_title: str
+    return_href: str
+    asset_query: str
+    step_title: str | None = None
 
 
 def _communities(graph):
@@ -54,9 +64,14 @@ def _replace_once(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
-def _component_filters(html: str) -> str:
+def _component_filters(html: str, *, process_graph: bool = False) -> str:
     """Compose navigation filters without changing upstream templates or facts."""
-    controls = """<section id="component-filters" aria-labelledby="component-types-heading">
+    process_options = """
+        <option value="reads">Reads</option>
+        <option value="writes">Writes</option>
+        <option value="filters">Filters</option>
+        <option value="calls">Calls</option>""" if process_graph else ""
+    controls = f"""<section id="component-filters" aria-labelledby="component-types-heading">
     <label class="relationship-layer-control grouping-control" for="grouping-mode">Group by
       <select id="grouping-mode" aria-describedby="grouping-help">
         <option value="structure" selected>Salesforce structure</option>
@@ -73,7 +88,7 @@ def _component_filters(html: str) -> str:
       <select id="relationship-layer" aria-describedby="relationship-layer-help">
         <option value="all" selected>All</option>
         <option value="schema">Schema</option>
-        <option value="dependencies">Dependencies</option>
+        <option value="dependencies">Dependencies</option>{process_options}
       </select></label>
     <p id="relationship-layer-help" class="graph-explanation">Schema: membership and lookups. Dependencies: usage in code and automation. Select a component to highlight its connections. Filters keep positions and groups fixed.</p>
     <p id="visible-count" role="status" aria-live="polite"></p>
@@ -133,8 +148,9 @@ def _component_filters(html: str) -> str:
     return html
 
 
-def standard_assets(bundle: dict, *, processes_available: bool = False) -> dict[str, tuple[bytes, str]]:
-    """Render all current components with the actual standard Graphify renderer.
+def standard_assets(bundle: dict, *, processes_available: bool = False,
+                    process_graph: ProcessGraphContext | None = None) -> dict[str, tuple[bytes, str]]:
+    """Render the supplied components with the standard Graphify renderer.
 
     The only aggregation is one directed link per ordered pair. Its individual
     canonical relationships remain available through the evidence explorer.
@@ -206,19 +222,40 @@ def standard_assets(bundle: dict, *, processes_available: bool = False) -> dict[
     else:
         activity_label = "All local statuses included"
     processes_link = '<a href="/processes">Process maps</a>' if processes_available else ""
-    toolbar = ("<nav id=\"full-graph-toolbar\" aria-label=\"Complete graph controls\">"
-               "<strong>Salesforce · complete graph</strong>"
-               "<span>Orbital layout · select a component to highlight its connections</span>"
-               f"<span>{len(graph):,} components · {graph.number_of_edges():,} grouped links "
-               f"· {relationship_count:,} relationships · all nodes included</span>"
-               f"<span>{activity_label}</span>"
+    counts = f"{len(graph):,} components · {graph.number_of_edges():,} grouped links · {relationship_count:,} relationships"
+    heading = "Salesforce · complete graph"
+    label = "Complete graph controls"
+    help_text = "<span>Orbital layout · select a component to highlight its connections</span>"
+    extra = f"<span>{activity_label}</span>"
+    if process_graph is not None:
+        title = escape(process_graph.process_title)
+        heading = f"Process dependencies · {title}"
+        label = "Process dependency graph controls"
+        help_text = "<span>Select a component to inspect reads, writes, filters and calls.</span>"
+        extra = (f"<span>Step · {escape(process_graph.step_title)} · cited source</span>"
+                 if process_graph.step_title else "<span>Source dependencies · conditional paths included</span>")
+        if bundle.get("process_graph", {}).get("truncated"):
+            extra += "<span>Some dependencies are outside this view’s size limit.</span>"
+        processes_link = (f'<a href="{escape(process_graph.return_href)}">Back to process map</a>'
+                          '<a href="/">Full project graph</a>')
+        html = re.sub(r"<title>[^<]*</title>", lambda _: f"<title>{heading}</title>", html, count=1)
+    else:
+        counts += " · all nodes included"
+    toolbar = (f"<nav id=\"full-graph-toolbar\" aria-label=\"{label}\">"
+               f"<strong>{heading}</strong>{extra}{help_text}<span>{counts}</span>"
                "<div><button id=\"fit-all\" type=\"button\">Fit all</button>"
                f"<a href=\"/explorer\">Detailed explorer</a>{processes_link}</div></nav>")
     html = _replace_once(html, '<div id="graph"></div>', toolbar + '\n<div id="graph"></div>')
-    html = _component_filters(html)
+    html = _component_filters(html, process_graph=process_graph is not None)
 
     assets: dict[str, tuple[bytes, str]] = {}
     scripts = []
+
+    def asset_href(route: str) -> str:
+        if process_graph is None:
+            return route
+        return f"/process-graph{route}?{escape(process_graph.asset_query)}"
+
     def externalize_script(match):
         attributes, content = match.groups()
         if re.search(r"\bsrc\s*=", attributes):
@@ -226,19 +263,19 @@ def standard_assets(bundle: dict, *, processes_available: bool = False) -> dict[
         route = f"/standard-{len(scripts)}.js"
         scripts.append(route)
         assets[route] = (content.encode("utf-8"), "text/javascript; charset=utf-8")
-        return f'<script src="{route}"></script>'
+        return f'<script src="{asset_href(route)}"></script>'
     html = re.sub(r"<script([^>]*)>(.*?)</script>", externalize_script, html, flags=re.DOTALL)
     styles = []
     def externalize_style(match):
         styles.append(match.group(1))
-        return '<link rel="stylesheet" href="/standard.css">'
+        return f'<link rel="stylesheet" href="{asset_href("/standard.css")}">'
     html = re.sub(r"<style>(.*?)</style>", externalize_style, html, flags=re.DOTALL)
     css = "\n".join(styles) + """
 #full-graph-toolbar {position:absolute;top:14px;left:14px;z-index:2;max-width:calc(100% - 312px);padding:10px 13px;background:var(--panel);border:1px solid var(--border);border-radius:8px;box-shadow:0 2px 8px #0003}
 #full-graph-toolbar strong,#full-graph-toolbar span {display:block}
 #full-graph-toolbar strong {font-size:14px;margin-bottom:4px}
 #full-graph-toolbar span {font-size:11px;color:var(--text-2)}
-#full-graph-toolbar div {display:flex;gap:12px;align-items:center;margin-top:8px}
+#full-graph-toolbar div {display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:8px}
 #full-graph-toolbar button {background:var(--bg);color:var(--text);border:1px solid var(--input-border);border-radius:4px;padding:4px 9px;cursor:pointer}
 #full-graph-toolbar a,.evidence-link {font-size:12px;color:#77b6ed}
 .evidence-link {display:block;margin-top:8px}

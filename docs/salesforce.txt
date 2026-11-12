@@ -1,14 +1,14 @@
-sfdx-graphify 0.5.21
+sfdx-graphify 0.6.0
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
 endorsed by Graphify Labs or Salesforce. Preserve LICENSE, LICENSE-MIT and NOTICE.
 
-From the fork checkout, build the 0.5.21 standalone wheel and install it in
+From the fork checkout, build the 0.6.0 standalone wheel and install it in
 its own Python 3.10+ environment with uv:
 
   uv run --no-project --with build python scripts/build_salesforce_wheel.py --out-dir dist
-  uv tool install ./dist/sfdx_graphify-0.5.21-py3-none-any.whl
+  uv tool install ./dist/sfdx_graphify-0.6.0-py3-none-any.whl
   sfdx-graphify --version
   sfdx-graphify install --platform claude
 
@@ -153,11 +153,20 @@ For a one-off viewer, supply both paths directly.
 
   sfdx-graphify serve --snapshot <snapshot> --process-maps <catalog.json>
 
-Select Processes, then choose a country, feature, and process. Steps show their
+Select Process maps, then choose a country, feature, and process. Steps show their
 selected components, effects and source references. Links to graph evidence
 appear when a cited line matches a relationship in that step. The catalog pins
 the source revision of a clean snapshot. Keep project catalogs with the local
 project documentation.
+
+Choose Open dependency graph for the selected process to see its components and
+relationships in the standard Graphify canvas. Choose Graph for this step for
+the relationships tied to the selected step's source references. Select a node
+to inspect its connections, or filter by Reads, Writes, Filters, or Calls.
+The process graph follows a bounded slice of the pinned snapshot. It keeps
+referenced fields with their owning objects and preserves candidate labels.
+The viewer explains when a selection has no catalogued components available in
+the snapshot.
 
 For SDD, build from a clean checkout of the intended source branch, omit
 --include-untracked, and place the snapshot outside that checkout. Record the

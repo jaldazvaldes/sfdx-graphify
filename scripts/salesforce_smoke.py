@@ -3,23 +3,64 @@
 from __future__ import annotations
 
 import argparse
+from html import unescape
 from http.client import HTTPConnection
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+from socket import create_server
 import subprocess
 import tempfile
 import time
 
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "salesforce"
+SAMPLE_FLOW = "sf:flow:sampleaccount"
+SAMPLE_ACTION = "sf:apexmethod:sampleaction.run"
+SAMPLE_READ = "sf:field:contact.lastname"
+SAMPLE_WRITE = "sf:field:account.description"
 
 
-def query(cli: Path, directory: Path, *args: str) -> dict:
+def prepare_example(directory: Path) -> tuple[Path, Path]:
+    example = directory / "example"
+    shutil.copytree(EXAMPLE, example)
+    git = ["git", "-C", str(example), "-c", "core.autocrlf=false"]
+    subprocess.run([*git, "init", "--quiet", "--template="], check=True, timeout=30)
+    subprocess.run([*git, "add", "--force", "--", "."], check=True, timeout=30)
+    hooks = directory / "empty-hooks"
+    hooks.mkdir()
+    subprocess.run([
+        *git, "-c", f"core.hooksPath={hooks}", "-c", "commit.gpgSign=false", "-c",
+        "user.name=Salesforce wheel smoke", "-c", "user.email=smoke@example.invalid",
+        "commit", "--quiet", "-m", "Add synthetic Salesforce fixture",
+    ], check=True, timeout=30)
+    revision = subprocess.check_output([*git, "rev-parse", "HEAD"], encoding="utf-8", timeout=30).strip()
+    flow_path = "force-app/main/default/flows/SampleAccount.flow-meta.xml"
+    lines = (example / flow_path).read_text(encoding="utf-8").splitlines()
+    citations = [
+        {"path": flow_path, "line": next(i for i, line in enumerate(lines, 1) if marker in line), "label": label}
+        for marker, label in (("GetContact.LastName", "Read the contact name"),
+                              ("<field>Description</field>", "Write the account description"))
+    ]
+    step = {
+        "id": "copy-name", "label": "Copy the contact name", "kind": "action",
+        "description": "Copy the contact name to the account description.",
+        "components": [SAMPLE_FLOW, SAMPLE_READ, SAMPLE_WRITE], "effects": [], "evidence": citations,
+    }
+    process = {"id": "sample-account", "title": "Sample account update", "summary": step["description"],
+               "steps": [step], "edges": []}
+    feature = {"id": "sample", "name": "Sample feature", "processes": [process]}
+    country = {"id": "XX", "name": "Sample country", "features": [feature]}
+    catalog = directory / "processes.json"
+    catalog.write_text(json.dumps({"source_revision": revision, "countries": [country]}), encoding="utf-8")
+    return example, catalog
+
+
+def query(cli: Path, directory: Path, *args: str, env: dict[str, str] | None = None) -> dict:
     result = subprocess.run(
-        [str(cli), *args], cwd=directory, capture_output=True, encoding="utf-8", timeout=30,
+        [str(cli), *args], cwd=directory, env=env, capture_output=True, encoding="utf-8", timeout=30,
     )
     if result.returncode:
         raise RuntimeError(f"{args[0]} failed ({result.returncode}): {result.stderr or result.stdout}")
@@ -39,11 +80,47 @@ def viewer_port(log_path: Path, process: subprocess.Popen) -> int:
     raise RuntimeError(f"Viewer did not start:\n{log_path.read_text(encoding='utf-8', errors='replace')}")
 
 
-def check_viewer(cli: Path, directory: Path, snapshot_args: tuple[str, str], snapshot_id: str) -> None:
+def viewer_get(connection: HTTPConnection, path: str) -> bytes:
+    connection.request("GET", path)
+    response = connection.getresponse()
+    body = response.read()
+    assert response.status == 200, (path, response.status, body[:300])
+    return body
+
+
+def check_process_graph(connection: HTTPConnection, path: str, *, step: bool) -> None:
+    page = viewer_get(connection, path).decode("utf-8")
+    assert "Process dependencies · Sample account update" in page, path
+    if step:
+        assert "Step · Copy the contact name · cited source" in page, path
+    assets = [
+        unescape(url) for url in re.findall(r'(?:href|src)="([^"]+)"', page)
+        if url.startswith("/process-graph/standard")
+    ]
+    assert assets, path
+    scripts = [viewer_get(connection, asset).decode("utf-8") for asset in assets]
+    graph = next(script for script in scripts if "const RAW_EDGES = " in script)
+    edges = json.loads(re.search(r"^const RAW_EDGES = (.*);$", graph, re.M)[1])
+    relations = {(edge["from"], edge["to"], detail["relation"])
+                 for edge in edges for detail in edge["relationship_details"]}
+    assert (SAMPLE_FLOW, SAMPLE_READ, "reads") in relations, path
+    assert (SAMPLE_FLOW, SAMPLE_WRITE, "writes") in relations, path
+    assert ((SAMPLE_FLOW, SAMPLE_ACTION, "calls") in relations) is (not step), path
+
+
+def check_viewer(cli: Path, directory: Path, example: Path, snapshot_args: tuple[str, str],
+                 snapshot_id: str, catalog: Path) -> None:
+    cache_key = "LOCALAPPDATA" if os.name == "nt" else "XDG_CACHE_HOME"
+    env = {**os.environ, cache_key: str(directory / "cache")}
+    with create_server(("127.0.0.1", 0)) as listener:
+        port = str(listener.getsockname()[1])
+        registration = query(
+            cli, example, "processes", "register", *snapshot_args, "--catalog", str(catalog), "--port", port, env=env,
+        )
+        assert registration["snapshot_id"] == snapshot_id, registration
     log_path = directory / "viewer.log"
     with log_path.open("w", encoding="utf-8") as log, subprocess.Popen(
-        [str(cli), "serve", *snapshot_args, "--port", "0"], cwd=directory,
-        stdout=log, stderr=subprocess.STDOUT,
+        [str(cli), "serve", "--registered-process-maps"], cwd=example, env=env, stdout=log, stderr=subprocess.STDOUT,
     ) as process:
         try:
             connection = HTTPConnection("127.0.0.1", viewer_port(log_path, process), timeout=10)
@@ -52,10 +129,12 @@ def check_viewer(cli: Path, directory: Path, snapshot_args: tuple[str, str], sna
                     ("/", b"complete graph"),
                     ("/explorer", b"Salesforce dependency explorer"),
                     ("/api/meta", snapshot_id.encode("ascii")),
+                    ("/api/processes", b"Sample account update"),
                 ):
-                    connection.request("GET", path)
-                    response = connection.getresponse()
-                    assert response.status == 200 and marker in response.read(), path
+                    assert marker in viewer_get(connection, path), path
+                route = "/process-graph?country=XX&feature=sample&process=sample-account"
+                check_process_graph(connection, route, step=False)
+                check_process_graph(connection, route + "&step=copy-name", step=True)
             finally:
                 connection.close()
         finally:
@@ -86,15 +165,14 @@ def main() -> None:
                            cwd=directory, check=True, timeout=30)
             skill = directory / config_dir / "skills" / "sfdx-graphify" / "SKILL.md"
             assert "name: sfdx-graphify" in skill.read_text(encoding="utf-8"), skill
-        example = directory / "example"
-        shutil.copytree(EXAMPLE, example)
+        example, catalog = prepare_example(directory)
         snapshot = str(directory / "snapshot")
         snapshot_args = ("--snapshot", snapshot)
         build = query(cli, directory, "build", str(example), "--include-inactive", "--out", snapshot)
         refs = query(cli, directory, "refs", "Contact.LastName", *snapshot_args)
-        assert any(row["source"] == "sf:flow:sampleaccount" for row in refs["results"]), refs
+        assert any(row["source"] == SAMPLE_FLOW for row in refs["results"]), refs
         deps = query(cli, directory, "deps", "SampleAccount", *snapshot_args, "--relation", "calls")
-        action = next(row for row in deps["results"] if row["target"] == "sf:apexmethod:sampleaction.run")
+        action = next(row for row in deps["results"] if row["target"] == SAMPLE_ACTION)
         evidence = query(cli, directory, "explain", action["id"], *snapshot_args)
         assert any(row["path"].endswith("/SampleAccount.flow-meta.xml")
                    for row in evidence["results"][0]["evidence"]), evidence
@@ -107,8 +185,9 @@ def main() -> None:
         projected = directory / "projection"
         query(cli, directory, "export", "graphify", *snapshot_args, "--out", str(projected))
         assert (projected / "graph.json").is_file()
-        check_viewer(cli, directory, snapshot_args, build["snapshot_id"])
-    print("Salesforce wheel smoke passed: install, build, refs, deps, explain, candidate impact, export and viewer.")
+        check_viewer(cli, directory, example, snapshot_args, build["snapshot_id"], catalog)
+    print("Salesforce wheel smoke passed: install, build, refs, deps, explain, candidate impact, export, "
+          "viewer and process graphs.")
 
 
 if __name__ == "__main__":

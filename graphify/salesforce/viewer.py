@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
+from functools import lru_cache
 from importlib.resources import files
 import ipaddress
 from pathlib import Path
 import socket
 from typing import TYPE_CHECKING, cast
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .schema import DataError, canonical_json, component_id, relationship_resolution, stable_id
 from .snapshot import load
@@ -442,7 +443,7 @@ def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
             require_process_identity(catalog, expected_process_identity)
     model.metadata["processes_available"] = catalog is not None
     resources = files("graphify.salesforce").joinpath("viewer_static")
-    from .standard_graph import standard_assets
+    from .standard_graph import ProcessGraphContext, standard_assets
 
     graph_assets = standard_assets(model.bundle, processes_available=catalog is not None)
     assets = {**graph_assets,
@@ -457,6 +458,39 @@ def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
             "/processes.css": (resources.joinpath("processes.css").read_bytes(), "text/css; charset=utf-8"),
             "/processes.js": (resources.joinpath("processes.js").read_bytes(), "text/javascript; charset=utf-8"),
         })
+
+    @lru_cache(maxsize=16)
+    def process_graph_assets(country: str, process_id: str, feature: str | None, step_id: str | None):
+        from .process_graph import process_dependency_bundle
+        from .process_queries import _records
+
+        if catalog is None or not country or not process_id:
+            raise DataError("A country and process are required for this graph.")
+        record = next((row for row in _records(catalog, country, feature)
+                       if row["process"]["id"] == process_id), None)
+        if record is None:
+            raise DataError("No matching process for this country and feature.")
+        process = record["process"]
+        if process.get("catalog_error"):
+            raise DataError("This process is unavailable. Review the process catalog.")
+        params = {"country": record["country"]["id"], "process": process_id}
+        if record["feature"] is not None:
+            params["feature"] = record["feature"]["id"]
+        step_title = None
+        if step_id is not None:
+            step = next((item for item in process["steps"] if item["id"] == step_id), None)
+            if step is None:
+                raise DataError("No matching step for this process.")
+            params["step"] = step_id
+            step_title = step["label"]
+        query = urlencode(params)
+        subset = process_dependency_bundle(model, process, step_id=step_id)
+        if not subset["facts"]["components"]:
+            raise DataError("No indexed components are available for this selection.")
+        return standard_assets(subset, process_graph=ProcessGraphContext(
+            process_title=process["title"], step_title=step_title,
+            return_href="/processes#" + query, asset_query=query,
+        ))
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -502,6 +536,15 @@ def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
                     return self.respond(200, model.metadata)
                 if target.path == "/api/processes" and catalog is not None and not params:
                     return self.respond(200, catalog)
+                if (catalog is not None
+                        and (target.path == "/process-graph" or target.path.startswith("/process-graph/standard"))
+                        and set(params) <= {"country", "process", "feature", "step"}):
+                    scoped = process_graph_assets(params.get("country", ""), params.get("process", ""),
+                                                  params.get("feature"), params.get("step"))
+                    asset = scoped.get(target.path.removeprefix("/process-graph") or "/")
+                    if asset is not None:
+                        content, media = asset
+                        return self.respond(200, content, media, csp=GRAPH_CSP)
                 if target.path == "/api/search" and set(params) <= {"query"}:
                     return self.respond(200, model.search(params.get("query", "")))
                 if target.path == "/api/view" and set(params) <= {"component", "mode", "depth", "status"}:
