@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from http.client import HTTPConnection
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -59,7 +60,19 @@ def check_viewer(cli: Path, directory: Path, snapshot_args: tuple[str, str], sna
                 connection.close()
         finally:
             if process.poll() is None:
-                process.terminate()
+                if os.name == "nt":
+                    # The installed launcher can spawn a viewer process that
+                    # inherits the log handle. Stop both before cleaning up.
+                    stopped = subprocess.run(
+                        ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                        capture_output=True, timeout=10,
+                    )
+                    if stopped.returncode and process.poll() is None:
+                        process.kill()
+                        raise RuntimeError("Could not stop the Windows viewer process tree")
+                else:
+                    process.terminate()
+                process.wait(timeout=10)
 
 
 def main() -> None:
