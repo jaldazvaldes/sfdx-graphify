@@ -103,6 +103,23 @@ def test_assignment_is_memory_write_and_same_named_fields_stay_distinct():
     assert not diagnostics
 
 
+def test_literal_write_evidence_keeps_memory_and_database_effects():
+    facts, _ = analyze(variable("Current", "Account") + """
+        <assignments><name>Prepare</name><assignmentItems>
+          <assignToReference>Current.Stage__c</assignToReference><operator>Assign</operator>
+          <value><stringValue>Ready</stringValue></value>
+        </assignmentItems></assignments>
+        <recordUpdates><name>Persist</name><object>Account</object><inputAssignments>
+          <field>Stage__c</field><value><stringValue>Saved</stringValue></value>
+        </inputAssignments></recordUpdates>""")
+    evidence = {item["id"]: item for item in facts["evidence"]}
+    writes = [edge for edge in facts["relationships"] if edge["target"] == "sf:field:account.stage__c"]
+    values = {edge["qualifiers"]["effect"]: evidence[edge["evidence_ids"][0]]["resolution"]["assigned_value"]
+              for edge in writes}
+    assert values == {"memory": {"type": "string", "value": "Ready"},
+                      "database": {"type": "string", "value": "Saved"}}
+
+
 def test_calls_use_literal_targets_and_keep_missing_targets_referenced_only():
     facts, diagnostics = analyze('''
       <subflows><name>RunChild</name><flowName>ChildFlow</flowName></subflows>

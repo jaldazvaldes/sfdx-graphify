@@ -47,11 +47,14 @@ def test_custom_metadata_cli_pins_accessor_and_summarizes_values_before_query_li
                                  "field_argument": 1, "type": "Sample_Settings__mdt"}]), encoding="utf-8")
     sources = {
         "sfdx-project.json": '{"packageDirectories":[{"path":"force-app"}],"sourceApiVersion":"64.0"}',
+        f"{_BASE}/objects/Account/Account.object-meta.xml": f'<CustomObject xmlns="{METADATA_NS}"/>',
         f"{_BASE}/objects/Sample_Settings__mdt/Sample_Settings__mdt.object-meta.xml":
             '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata"/>',
         f"{_BASE}/objects/Sample_Settings__mdt/fields/Enabled__c.field-meta.xml":
             '<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">'
-            '<fullName>Enabled__c</fullName><type>Checkbox</type></CustomField>',
+            '<fullName>Enabled__c</fullName><type>Checkbox</type><defaultValue>false</defaultValue></CustomField>',
+        f"{_BASE}/objects/Sample_Settings__mdt/fields/Target__c.field-meta.xml":
+            f'<CustomField xmlns="{METADATA_NS}"><fullName>Target__c</fullName><type>Text</type></CustomField>',
         f"{_BASE}/classes/SampleSettings.cls":
             "public class SampleSettings { public static Boolean enabled(String field) { return false; } }",
         f"{_BASE}/classes/Reader.cls":
@@ -61,8 +64,13 @@ def test_custom_metadata_cli_pins_accessor_and_summarizes_values_before_query_li
         sources[f"{_BASE}/customMetadata/Sample_Settings.{record}.md-meta.xml"] = (
             f'<CustomMetadata xmlns="{METADATA_NS}" xmlns:i="{XML_SCHEMA_INSTANCE_NS}" '
             f'xmlns:s="http://www.w3.org/2001/XMLSchema"><values><field>Enabled__c</field>'
-            f'<value i:type="s:boolean">{value}</value></values></CustomMetadata>'
+            f'<value i:type="s:boolean">{value}</value></values>'
+            '<values><field>Target__c</field><value i:type="s:string">Account</value></values></CustomMetadata>'
         )
+    sources[f"{_BASE}/customMetadata/Sample_Settings.West.md-meta.xml"] = '<CustomMetadata/>'
+    sources[f"{_BASE}/customMetadata/Sample_Settings.East.md-meta.xml"] = (
+        '<CustomMetadata><values><field>Enabled__c</field><value>invalid</value></values></CustomMetadata>'
+    )
     for name, content in sources.items():
         path = project / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,11 +86,19 @@ def test_custom_metadata_cli_pins_accessor_and_summarizes_values_before_query_li
     assert result["results"][0]["evidence"][0]["rule"] == "apex.custom_metadata_accessor"
     summary = result["custom_metadata_values"]
     assert summary["record_count"] == 2
+    assert summary["omitted_record_count"] == 1
+    assert summary["unresolved_record_count"] == 1
+    assert summary["declared_default"]["value"] is False
+    assert summary["declared_default"]["location"]["locator"].endswith("/defaultValue")
     assert {group["value"]: group["records"] for group in summary["groups"]} == {
         True: ["Sample_Settings.North"], False: ["Sample_Settings.South"],
     }
     assert main(["deps", "Sample_Settings.North", "--snapshot", str(snapshot), "--format", "brief"]) == 0
     assert "--sets_value true-->" in capsys.readouterr().out
+    assert main(["deps", "Sample_Settings.North", "--snapshot", str(snapshot), "--relation", "mentions"]) == 0
+    mention, = json.loads(capsys.readouterr().out)["results"]
+    assert mention["target"] == "sf:object:account"
+    assert mention["evidence"][0]["rule"] == "custom_metadata.exact_text_mention"
 
 
 def test_typed_custom_metadata_preserves_false_nil_empty_omission_and_lexical_text():
@@ -138,19 +154,22 @@ def test_exact_string_mentions_require_a_unique_defined_target():
     store = FactStore()
     _define(store, "object", "ExampleSettings__mdt")
     expected = {_define(store, "apexclass", "UsePolicy"), _define(store, "flow", "RunPolicy"),
-                _define(store, "field", "Account.Region__c")}
+                _define(store, "field", "Account.Region__c"), _define(store, "object", "Account")}
     _define(store, "apexclass", "AmbiguousName")
     _define(store, "flow", "AmbiguousName")
+    lead_candidates = sorted((_define(store, "object", "Lead"), _define(store, "flow", "Lead")))
     store.ensure_component("apexclass", "ExternalPolicy")
+    store.ensure_component("object", "UnverifiedObject")
     strings = ["UsePolicy", "RunPolicy", "Account.Region__c", "prefix UsePolicy", " RunPolicy ",
-               "AmbiguousName", "ExternalPolicy", "Region__c"]
+               "AmbiguousName", "ExternalPolicy", "Region__c", "Account", "Lead", "UnverifiedObject"]
     rows = []
     for number, value in enumerate(strings):
         name = f"Reference{number}__c"
         _define(store, "field", f"ExampleSettings__mdt.{name}", data_type="Text")
         rows.append(_field(name, f'<value i:type="s:string">{value}</value>'))
 
-    _extract(store, _record("\n".join(rows)))
+    document = _record("\n".join(rows))
+    _extract(store, document)
 
     edges = _relationships(store, "mentions")
     assert {edge["target"] for edge in edges} == expected
@@ -158,7 +177,10 @@ def test_exact_string_mentions_require_a_unique_defined_target():
         evidence, = [store.evidence[eid] for eid in edge["evidence_ids"]]
         assert edge["qualifiers"] == {}
         assert evidence["rule"] == "custom_metadata.exact_text_mention"
-    assert Counter(d["code"] for d in store.diagnostics) == {"CUSTOM_METADATA_MENTION_AMBIGUOUS": 1}
+    assert Counter(d["code"] for d in store.diagnostics) == {"CUSTOM_METADATA_MENTION_AMBIGUOUS": 2}
+    lead_diagnostic, = [d for d in store.diagnostics if d["candidates"] == lead_candidates]
+    lead_value = next(row.child("value") for row in document.root.all("values") if row.value("value") == "Lead")
+    assert lead_diagnostic["location"] == document.location(lead_value)
 
 
 def test_malformed_and_duplicate_values_stay_diagnostic_without_guessing():

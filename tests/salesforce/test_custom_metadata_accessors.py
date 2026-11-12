@@ -136,7 +136,27 @@ def test_missing_instance_private_or_ambiguous_accessor_declaration_is_not_prove
 
 def test_unknown_caller_hierarchy_is_not_proof_of_an_unshadowed_qualifier():
     _, edges = analyze("RegionConfig.enabledRegions('Enable_Orders__c');", inheritance="extends MissingBase")
-    assert not edges
+    edge, = edges
+    assert edge["target"] == TARGET
+    assert edge["qualifiers"]["resolution_status"] == "candidate"
+    assert edge["qualifiers"]["missing_ancestors"] == ["MissingBase"]
+
+
+@pytest.mark.parametrize("assignment,expected", [("", True), ("field = 'Other__c';", False)])
+def test_infers_typed_metadata_get_from_source_and_checks_parameter_reassignment(assignment, expected):
+    accessor = f"""public class RegionConfig {{
+        public static Boolean enabledRegions(String field) {{
+            Region_Options__mdt settings = Region_Options__mdt.getInstance('sample');
+            {assignment}
+            return (Boolean)settings?.get(field);
+        }}
+    }}"""
+    store, edges = analyze("RegionConfig.enabledRegions('Enable_Orders__c');", rules=[], accessor=accessor)
+    assert bool(edges) == expected
+    if expected:
+        evidence = store.evidence[edges[0]["evidence_ids"][0]]
+        assert evidence["resolution"]["basis"] == "inferred_literal_custom_metadata_accessor"
+        assert evidence["resolution"]["accessor_read"]["path"] == "classes/RegionConfig.cls"
 
 
 @pytest.mark.parametrize("include_field,duplicate_field", [(False, False), (True, True)])

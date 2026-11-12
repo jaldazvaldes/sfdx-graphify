@@ -9,12 +9,22 @@ from collections import defaultdict
 from pathlib import PurePosixPath
 
 from .formula_refs import formula_field_context, formula_references
-from .relationship_paths import add_navigation_reads, resolve_source_field_path
+from .relationship_paths import add_navigation_reads, declared_lookup_targets, resolve_source_field_path
 from .schema import API_NAME, DataError, component_id
+from .write_values import workflow_write_value
 
 _DESCRIPTIVE = {"fullName", "apiVersion", "description", "endpointUrl", "fields", "includeSessionId",
                 "integrationUser", "name", "protected", "useDeadLetterQueue"}
 _FIELD_UPDATE_OPERATIONS = {"Formula", "Literal", "LookupValue", "NextValue", "Null", "PreviousValue"}
+# The Metadata API uses the child's foreign key in targetObject. Salesforce
+# Help lists these standard-to-standard cross-object Workflow field updates.
+# https://help.salesforce.com/s/articleView?id=workflow_cross_object_field_updates.htm&type=5
+_STANDARD_UPDATE_PARENTS = {
+    ("casecomment", "parentid"): "Case",
+    ("emailmessage", "parentid"): "Case",
+    ("opportunitylineitem", "opportunityid"): "Opportunity",
+    ("opportunity", "accountid"): "Account",
+}
 
 
 def _workflow_documents(documents, store):
@@ -221,8 +231,42 @@ def _extract_rule_updates(document, owner, store, definitions, excluded):
             extract_field_update(document, owner, store, definitions, source, local_status, action, timing)
 
 
+def _field_update_parent(store, owner, foreign_key):
+    if not API_NAME.fullmatch(foreign_key):
+        return None
+    child = component_id("object", owner)
+    lookup = component_id("field", f"{owner}.{foreign_key}")
+    if child in store.components and store.is_ambiguous(child):
+        return None
+    declaration = store.components.get(lookup)
+    if declaration is not None and declaration["definition_status"] != "referenced_only":
+        if store.is_ambiguous(lookup) or declaration.get("data_type") not in {"Lookup", "MasterDetail"}:
+            return None
+
+    standard = _STANDARD_UPDATE_PARENTS.get((owner.casefold(), foreign_key.casefold()))
+    targets = declared_lookup_targets(store).get(lookup, ())
+    raw_targets = store.raw_lookup_targets.get(lookup, ())
+    if len(targets) > 1 or (raw_targets and (len(raw_targets) != 1 or not targets)):
+        return None
+    if targets:
+        parent = next(iter(targets))
+        if store.is_ambiguous(parent) or (standard and parent != component_id("object", standard)):
+            return None
+        step = {"field": lookup, "target": parent, "basis": "declared_lookup"}
+        if declaration and declaration["definitions"]:
+            step["schema_source"] = declaration["definitions"][0]
+        return store.components[parent]["api_name"], step
+
+    if standard is None:
+        return None
+    parent = component_id("object", standard)
+    if parent in store.components and store.is_ambiguous(parent):
+        return None
+    return standard, {"field": lookup, "target": parent, "basis": "standard_schema"}
+
+
 def extract_field_update(document, owner, store, definitions, source, local_status, action, timing):
-    """Resolve an action to one same-object Workflow field update."""
+    """Resolve a Workflow action to a direct field on the record or its parent."""
     location = document.location(action)
     approval = store.components[source]["kind"] == "approvalprocess"
     feature = "APPROVAL" if approval else "WORKFLOW"
@@ -239,13 +283,21 @@ def extract_field_update(document, owner, store, definitions, source, local_stat
                          location, state="ambiguous" if len(candidates) > 1 else "unresolved")
         return
     definition_document, definition = candidates[0]
+    target_owner = owner
+    parent_step = None
+    target_object = _single_leaf(definition, "targetObject")
     target_objects = definition.all("targetObject")
     if target_objects:
-        for node in target_objects:
-            store.diagnostic(f"{feature}_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED",
-                             "Field update targetObject requires an independently resolved parent target.",
-                             definition_document.location(node), state="unresolved")
-        return
+        # Approval field updates retain their existing same-object policy.
+        parent = _field_update_parent(store, owner, target_object.text) if target_object and not approval else None
+        if parent is None:
+            for node in target_objects:
+                store.diagnostic(f"{feature}_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED",
+                                 "Field update targetObject needs one supported, unambiguous parent foreign key.",
+                                 definition_document.location(node),
+                                 state="ambiguous" if len(target_objects) > 1 else "unresolved")
+            return
+        target_owner, parent_step = parent
     field = _single_leaf(definition, "field")
     operation = _single_leaf(definition, "operation")
     if operation is None or operation.text not in _FIELD_UPDATE_OPERATIONS:
@@ -253,22 +305,31 @@ def extract_field_update(document, owner, store, definitions, source, local_stat
                          "Field update definition needs one recognized operation.",
                          definition_document.location(definition))
         return
-    target_name = _relative_field(owner, field.text) if field is not None else ""
+    target_name = _relative_field(target_owner, field.text) if field is not None else ""
     if (not API_NAME.fullmatch(target_name) or definition.all("sourceObject") or definition.all("sourceField")):
-        owner_description = "approval process" if approval else "rule"
+        owner_description = ("the resolved parent object" if parent_step else
+                             "the approval process's object" if approval else "the rule's object")
         store.diagnostic(f"{feature}_FIELD_UPDATE_TARGET_UNSUPPORTED",
-                         f"Field update must declare one direct field on the {owner_description}'s object.",
+                         f"Field update must declare one direct field on {owner_description}.",
                          definition_document.location(field if field is not None else definition))
         return
     field_location = definition_document.location(field)
-    target = store.field(owner, target_name, field_location)
+    target = store.field(target_owner, target_name, field_location)
     qualifiers = {"action_kind": "FieldUpdate", "action_timing": timing,
                   "operation": operation.text, "local_status": local_status}
     if target:
+        resolution = {"basis": "workflow_field_update_definition", "action": name.text,
+                      "field_definition": field_location}
+        if parent_step and target_object is not None:
+            target_location = definition_document.location(target_object)
+            resolution.update(target_object=target_location, steps=[parent_step])
+            add_navigation_reads(store, source, target_location, resolution,
+                                 rule="workflow.field_update_parent_navigation",
+                                 qualifiers={**qualifiers, "context": "workflow_field_update_parent_navigation"})
         store.relation(
             source, target, "writes", location, "approval.field_update" if approval else "workflow.rule_field_update",
-            resolution={"basis": "workflow_field_update_definition", "action": name.text,
-                        "field_definition": field_location},
+            resolution={**resolution, **workflow_write_value(definition_document, definition, operation,
+                                                             store.components[target].get("data_type"))},
             qualifiers=qualifiers,
         )
     if operation.text == "Formula":

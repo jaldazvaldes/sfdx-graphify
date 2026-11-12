@@ -7,13 +7,14 @@ from pathlib import Path
 
 from .discovery import discover, lwc_bundle, supported_source
 from .activity import inactive_components, remove_inactive
+from .automation import extract_entry_points
 from .flow import extract_flow
 from .apex import index_apex, extract_apex, resolve_invocable_calls
 from .triggers import index_triggers, extract_triggers
 from .lwc import extract_lwc
 from .workflow import index_workflow, extract_workflow
 from .approval import index_approval_processes, extract_approval_processes
-from .custom_metadata import extract_custom_metadata, index_custom_metadata
+from .custom_metadata import extract_custom_metadata, index_custom_metadata, index_custom_metadata_defaults
 from .custom_metadata_accessors import extract_custom_metadata_accessors, parse_accessor_rules
 from .permissions import index_permissions, extract_permissions
 from .named_credentials import index_named_credentials, extract_named_credential_endpoints
@@ -33,16 +34,17 @@ LIMITATIONS = [
     "Apex analysis is bounded and static; dynamic queries, unknown types and runtime data flow remain unresolved.",
     "Candidate static calls through an external caller hierarchy are explicitly marked; verify the missing base before treating dispatch as resolved.",
     "Flow, trigger, validation rule and workflow rule activation metadata describe local XML, not deployed or active org behavior.",
-    "Workflow reads cover bounded criterion and field update expressions. Cross-object updates remain diagnostic; expressions, action values and execution order are not evaluated.",
+    "Workflow covers bounded criterion reads, resolved parent updates and declared literal values. Execution order and formula results require runtime evidence.",
     "Literal metadata mentions are review hints and do not establish dependency edges.",
-    "Permission edges record explicit grants in local profiles and permission sets. Assignments, groups, muting, sharing and effective access are outside coverage.",
+    "When included, permission edges record explicit grants in local profiles and permission sets. Assignments, groups, muting, sharing and effective access are outside coverage.",
     "Named Credential references cover proven HttpRequest receivers with a literal callout endpoint; dynamic destinations and integration execution are outside coverage.",
-    "Custom metadata record values are explicit local declarations. Exact text mentions are inferred; configured Apex accessors require a literal field argument.",
+    "Custom metadata record values and supported defaults come from local declarations. Apex accessor reads require a literal field argument and source evidence or an explicit rule.",
     "Referenced-only targets have not been validated against a complete Salesforce schema.",
 ]
 
 
-def build_project(root, *, out=None, include_untracked=False, include_inactive=False, custom_metadata_accessors=None):
+def build_project(root, *, out=None, include_untracked=False, include_inactive=False,
+                  include_permissions=False, custom_metadata_accessors=None):
     accessor_rules = parse_accessor_rules(custom_metadata_accessors) if custom_metadata_accessors is not None else []
     root = Path(root).expanduser().absolute()
     output = validate_output(Path(out) if out is not None else default_output(root), source_root=root)
@@ -72,6 +74,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     documents, apex, triggers, trigger_metadata, lightning, workflows = [], {}, {}, [], {}, []
     approvals, ui = [], {}
     permissions, named_credentials, custom_metadata = [], [], []
+    permission_file_count = 0
     for path, data in sorted(scan.files.items()):
         if lwc_bundle(path):
             lightning[path] = data
@@ -95,6 +98,10 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                 custom_metadata.append(document)
         elif path.casefold().endswith((".profile-meta.xml", ".permissionset-meta.xml", ".namedcredential-meta.xml")):
             is_credential = path.casefold().endswith(".namedcredential-meta.xml")
+            if not is_credential:
+                permission_file_count += 1
+                if not include_permissions:
+                    continue
             try:
                 document = parse_xml(path, data)
             except DataError as exc:
@@ -127,7 +134,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     index_workflow(workflows, store)
     index_approval_processes(approvals, store)
     index_custom_metadata(custom_metadata, store)
-    index_permissions(permissions, store)
+    if include_permissions:
+        index_permissions(permissions, store)
     index_named_credentials(named_credentials, store)
     apex_index = index_apex(apex, store)
     trigger_index = index_triggers(triggers, trigger_metadata, apex_index, store)
@@ -136,10 +144,10 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     extract_workflow(workflows, store, excluded=excluded)
     extract_approval_processes(approvals, workflows, store, excluded=excluded)
     extract_apex(apex_index, store)
-    if accessor_rules:
-        extract_custom_metadata_accessors(apex_index, store, accessor_rules)
+    extract_custom_metadata_accessors(apex_index, store, accessor_rules)
     extract_named_credential_endpoints(apex_index, store)
-    extract_permissions(permissions, store)
+    if include_permissions:
+        extract_permissions(permissions, store)
     extract_triggers(trigger_index, apex_index, store, excluded=set(excluded))
     extract_lwc(lightning, apex_index, store)
     extract_ui_apex(ui, apex_index, store)
@@ -152,7 +160,9 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
             else:
                 extract_validation_rule(document, store)
     resolve_invocable_calls(store, apex_index)
+    extract_entry_points(documents, store, excluded=excluded)
     activity_policy = remove_inactive(store, excluded, include_inactive=include_inactive)
+    index_custom_metadata_defaults(documents, store)
     extract_custom_metadata(custom_metadata, store)
     facts = store.finish()
     diagnostics = sorted(store.diagnostics, key=lambda d: d["id"])
@@ -167,10 +177,19 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                              {"path": "sfdx-project.json"}, version=project_version)
             diagnostics = sorted(store.diagnostics, key=lambda d: d["id"])
     versions = sorted(observed_versions)
+    permission_selection = {
+        "included": bool(include_permissions),
+        "selected_file_count": permission_file_count,
+        "analyzed_file_count": len(permissions),
+        "skipped_file_count": permission_file_count if not include_permissions else 0,
+        "failed_file_count": permission_file_count - len(permissions) if include_permissions else 0,
+    }
     coverage = {
         "status": "partial" if diagnostics else "bounded",
-        "analyzed_files": len(scan.files) - activity_policy["skipped_definition_files"],
+        "analyzed_files": len(scan.files) - activity_policy["skipped_definition_files"]
+                          - (permission_file_count - len(permissions)),
         "activity_policy": activity_policy,
+        "permission_selection": permission_selection,
         "component_counts": dict(sorted(Counter(c["kind"] for c in facts["components"]).items())),
         "relationship_counts": dict(sorted(Counter(r["relation"] for r in facts["relationships"]).items())),
         "candidate_call_count": sum(r.get("qualifiers", {}).get("resolution_status") == "candidate"
@@ -188,7 +207,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                                "ApexClass/ApexMethod (bounded AST, invocable methods and static SOQL/DML)",
                                "LightningComponentBundle (literal field and Apex imports, imperative and wire calls)",
                                "Aura and Visualforce (bounded static Apex actions)",
-                               "Profile and PermissionSet (explicit field, object and Apex class grants)",
+                               *(["Profile and PermissionSet (explicit field, object and Apex class grants)"]
+                                 if include_permissions else []),
                                "NamedCredential (local definitions and literal Apex HttpRequest endpoint references)",
                                "CustomMetadata (local records, explicit values and exact inferred text mentions)",
                                "ApprovalProcess (bounded criteria, displayed fields and field updates)",
@@ -211,11 +231,16 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         ).items())),
         "limitations": LIMITATIONS,
     }
+    scope = dict(scan.scope)
+    if accessor_rules:
+        scope["custom_metadata_accessors"] = accessor_rules
+    if include_permissions:
+        scope["include_permissions"] = True
     manifest = {
         "schema_version": SCHEMA_VERSION, "extractor_version": EXTRACTOR_VERSION,
         "upstream_revision": UPSTREAM_REVISION, "source_revision": scan.revision,
         "dirty": scan.dirty, "input_mode": "working_tree",
-        "scope": {**scan.scope, "custom_metadata_accessors": accessor_rules} if accessor_rules else scan.scope,
+        "scope": scope,
         "activity_policy": activity_policy,
         "inputs": scan.inputs, "coverage": coverage,
     }

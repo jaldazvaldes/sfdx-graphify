@@ -46,6 +46,7 @@ def create_query_server(directory: Path, host: str = "127.0.0.1", port: int = 87
     bundle = (snapshot.load(directory, expect_snapshot=expect_snapshot) if expect_snapshot is not None
               else snapshot.load(directory))
     snapshot_id = bundle["manifest"]["snapshot_id"]
+    index = query.QueryIndex.build(bundle)
 
     class QueryServer(LoopbackHTTPServer):
         address_family = socket.AF_INET6 if version == 6 else socket.AF_INET
@@ -100,7 +101,7 @@ def create_query_server(directory: Path, host: str = "127.0.0.1", port: int = 87
                 return
             if self.path != "/status":
                 return self.respond(404, _error(bundle, "Route not found."))
-            return self.respond(200, answer_request(bundle, {"command": "status"}))
+            return self.respond(200, answer_request(bundle, {"command": "status"}, index=index))
 
         def do_POST(self):
             if not self.authorize():
@@ -127,7 +128,7 @@ def create_query_server(directory: Path, host: str = "127.0.0.1", port: int = 87
                 request = parse_request(body.decode("utf-8"))
             except (ValueError, TimeoutError) as exc:
                 return self.respond(400, _error(bundle, f"Invalid JSON request: {exc}"))
-            return self.respond(200, answer_request(bundle, request))
+            return self.respond(200, answer_request(bundle, request, index=index))
 
     return QueryServer((address, port), Handler)
 

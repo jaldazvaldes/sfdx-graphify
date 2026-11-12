@@ -1,4 +1,4 @@
-"""Opt-in field reads through explicitly configured local Apex accessors.
+"""Literal field reads through configured or source-proven local Apex accessors.
 
 Configuration supplies accessor semantics, never a substitute for source proof.
 A call must resolve to one local static declaration and its field argument must
@@ -85,17 +85,81 @@ class _AccessorBindings(_MethodExtractor):
 
 def _unresolved(store, method, node, reason):
     store.diagnostic("APEX_CUSTOM_METADATA_ACCESSOR_UNRESOLVED",
-                     "The configured accessor needs a proven local static call and a literal locally defined metadata field.",
+                     "The accessor needs an eligible local static call and a literal locally defined metadata field.",
                      method.unit.location(node), state="unresolved", reason=reason)
 
 
+def _inferred_accessor(visitor):
+    """Recognize one String parameter passed unchanged to a typed CMDT get."""
+    method, unit = visitor.method, visitor.unit
+    parameters = _significant(method.node.child_by_field_name("parameters"))
+    positions = {parameter.id: position for position, parameter in enumerate(parameters, 1)
+                 if unit.text(parameter.child_by_field_name("type")).casefold() == "string"}
+    if not positions:
+        return None
+    visitor.index_bindings()
+    nodes = list(_walk(visitor.body))
+    reassigned = set()
+    for node in nodes:
+        left = node.child_by_field_name("left") if node.type == "assignment_expression" else None
+        if left is not None and left.type == "identifier":
+            binding = visitor.binding(unit.text(left), left, report=False)
+            if binding is not None:
+                reassigned.add(binding.node.id)
+    patterns = {}
+    for node in nodes:
+        if node.type != "method_invocation" or unit.text(node.child_by_field_name("name")).casefold() != "get":
+            continue
+        receiver = node.child_by_field_name("object")
+        args = _significant(node.child_by_field_name("arguments"))
+        if receiver is None or receiver.type != "identifier" or len(args) != 1 or args[0].type != "identifier":
+            continue
+        parameter = visitor.binding(unit.text(args[0]), args[0], report=False)
+        record = visitor.binding(unit.text(receiver), receiver, report=False)
+        if (parameter is None or parameter.node.id not in positions or parameter.node.id in reassigned
+                or record is None or record.collection or not record.owner or not record.owner.casefold().endswith("__mdt")):
+            continue
+        owner = record.owner.casefold()
+        definition = visitor.store.components.get(component_id("object", owner), {})
+        if definition.get("definition_status") == "defined":
+            patterns.setdefault((positions[parameter.node.id], owner), unit.location(node))
+    if len(patterns) != 1:
+        return None
+    (position, owner), location = next(iter(patterns.items()))
+    return {"class": unit.name.casefold(), "method": method.name.casefold(), "arity": method.parameter_count,
+            "field_argument": position, "type": owner}, location
+
+
+def _inferred_rules(index, store, configured):
+    inferred = {}
+    for methods in index.methods.values():
+        for method in methods:
+            unit = method.unit
+            key = unit.name.casefold(), method.name.casefold(), method.parameter_count
+            if (key in configured or not method.static or not API_NAME.fullmatch(unit.name)
+                    or not any(name.casefold() == "string" for name in method.parameter_types)
+                    or store.is_ambiguous(unit.class_id) or store.is_ambiguous(method.id)):
+                continue
+            body = method.node.child_by_field_name("body")
+            if body is None:
+                continue
+            text = unit.data[body.start_byte:body.end_byte].lower()
+            if b"__mdt" not in text or b"get" not in text:
+                continue
+            proof = _inferred_accessor(_AccessorBindings(method, index, store))
+            if proof is not None:
+                inferred[key] = proof
+    return inferred
+
+
 def extract_custom_metadata_accessors(index: ApexIndex, store: FactStore, rules: list[dict]) -> None:
-    """Extract configured class-qualified static calls in methods/constructors."""
+    """Extract class-qualified static calls in methods and constructors."""
     normalized = parse_accessor_rules(rules)
-    if not normalized:
+    by_call = {(rule["class"], rule["method"], rule["arity"]): (rule, None) for rule in normalized}
+    by_call.update(_inferred_rules(index, store, by_call))
+    if not by_call:
         return
-    by_call = {(rule["class"], rule["method"], rule["arity"]): rule for rule in normalized}
-    method_tokens = {rule["method"].encode("ascii") for rule in normalized}
+    method_tokens = {key[1].encode("ascii") for key in by_call}
     eligible_paths = set()
     for unit in index.units:
         source = unit.data.lower()
@@ -125,10 +189,11 @@ def extract_custom_metadata_accessors(index: ApexIndex, store: FactStore, rules:
                     receiver_name = method.unit.text(receiver)
                     method_name = method.unit.text(node.child_by_field_name("name"))
                     arguments = _significant(node.child_by_field_name("arguments"))
-                    rule = by_call.get((receiver_name.casefold(), method_name.casefold(), len(arguments)))
-                    if rule is None:
+                    entry = by_call.get((receiver_name.casefold(), method_name.casefold(), len(arguments)))
+                    if entry is None:
                         continue
-                    if (not visitor.unshadowed_qualifier(receiver_name, receiver)
+                    rule, inferred_read = entry
+                    if (not visitor.unshadowed_qualifier(receiver_name, receiver, allow_external=True)
                             or visitor._initializing_binding(receiver_name, receiver)
                             or _child(node, "safe_navigation_operator") is not None):
                         _unresolved(store, method, node, "receiver_not_proven")
@@ -155,10 +220,17 @@ def extract_custom_metadata_accessors(index: ApexIndex, store: FactStore, rules:
                         _unresolved(store, method, node, "local_field_not_proven")
                         continue
                     target = candidates[0]
+                    qualifiers: dict = {"context": "custom_metadata_accessor"}
+                    if visitor.external_hierarchy is not None:
+                        qualifiers.update(resolution_status="candidate", uncertainty="external_hierarchy",
+                                          missing_ancestors=visitor.external_hierarchy[1])
+                    resolution = {"basis": "configured_literal_custom_metadata_accessor",
+                                  "accessor": dict(rule), "accessor_method": target.id,
+                                  "accessor_definition": target.unit.location(target.node),
+                                  "field_definition": dict(field["definitions"][0])}
+                    if inferred_read is not None:
+                        resolution.update(basis="inferred_literal_custom_metadata_accessor", accessor_read=inferred_read)
                     store.relation(method.id, field_id, "reads", method.unit.location(node),
                                    "apex.custom_metadata_accessor",
-                                   qualifiers={"context": "custom_metadata_accessor"},
-                                   resolution={"basis": "configured_literal_custom_metadata_accessor",
-                                               "accessor": dict(rule), "accessor_method": target.id,
-                                               "accessor_definition": target.unit.location(target.node),
-                                               "field_definition": dict(field["definitions"][0])})
+                                   qualifiers=qualifiers,
+                                   resolution=resolution)

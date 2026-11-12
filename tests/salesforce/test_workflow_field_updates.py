@@ -7,6 +7,7 @@ import json
 import pytest
 
 from graphify.salesforce import query
+from graphify.salesforce.inventory import extract_inventory, index_definitions
 from graphify.salesforce.schema import SCHEMA_VERSION, DataError, FactStore, stable_id, validate_bundle
 from graphify.salesforce.service import build_project
 from graphify.salesforce.snapshot import load
@@ -79,6 +80,9 @@ def test_active_workflow_field_updates_survive_query_snapshot_and_view(tmp_path)
         assert occurrence["content_hash"] == occurrence["resolution"]["field_definition"]["content_hash"]
         assert "/actions" in occurrence["locator"]
         assert occurrence["resolution"]["field_definition"]["locator"].endswith("/field")
+        if edge["qualifiers"]["operation"] == "Literal":
+            assert occurrence["resolution"]["assigned_value"] == {"type": "string", "value": "Do not copy me"}
+            assert occurrence["resolution"]["assigned_value_location"]["locator"].endswith("/literalValue")
     criteria_read, = query.refs(bundle, "Account.Stage__c", relation="reads")["results"]
     assert criteria_read["qualifiers"]["context"] == "workflow_criteria_formula"
     update_read, = query.refs(bundle, "Account.InternalValue__c", relation="reads")["results"]
@@ -91,7 +95,7 @@ def test_active_workflow_field_updates_survive_query_snapshot_and_view(tmp_path)
     graph = SnapshotView(bundle).view("sf:object:account", mode="automation")
     assert any(node["id"] == rule_id and node["local_status"] == "Active" for node in graph["nodes"])
     text = json.dumps(bundle).casefold()
-    for ignored in ("ignoredformulatext__c", "do not copy me", "onlyinactive__c",
+    for ignored in ("ignoredformulatext__c", "onlyinactive__c",
                     "onlyinactivecriteria__c", "onlyunknown__c", "onlyunlinked__c"):
         assert ignored not in text
 
@@ -143,22 +147,94 @@ def test_workflow_field_update_cannot_join_a_definition_from_another_package():
     assert any(d["code"] == "WORKFLOW_FIELD_UPDATE_DEFINITION_UNRESOLVED" for d in store.diagnostics)
 
 
-def test_target_object_update_does_not_write_the_triggering_objects_field():
+def test_target_object_update_writes_the_parent_and_reads_from_the_child(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    body = (
+        rule("Copy subject", "<active>true</active>", action("Copy"))
+        + update("Copy", "Description", operation="Formula",
+                 extra="<targetObject>ParentId</targetObject><formula>Subject</formula>")
+    )
+    (source / "sfdx-project.json").write_text(json.dumps({
+        "packageDirectories": [{"path": "force-app"}], "sourceApiVersion": "64.0",
+    }), encoding="utf-8")
+    path = source / workflow(body, owner="EmailMessage").path
+    path.parent.mkdir(parents=True)
+    path.write_text(f"<Workflow>{body}</Workflow>", encoding="utf-8")
+    bundle = build_project(source, out=tmp_path / "snapshot")
+    edge, = query.refs(bundle, "Case.Description", relation="writes")["results"]
+    evidence, = edge["evidence"]
+    proof = evidence["resolution"]
+    assert proof["field_definition"]["locator"].endswith("/field")
+    assert proof["target_object"]["locator"].endswith("/targetObject")
+    assert proof["steps"] == [{
+        "field": "sf:field:emailmessage.parentid", "target": "sf:object:case", "basis": "standard_schema",
+    }]
+    facts = bundle["facts"]
+    assert {edge["target"] for edge in facts["relationships"] if edge["relation"] == "reads"} == {
+        "sf:field:emailmessage.parentid", "sf:field:emailmessage.subject",
+    }
+    assert "sf:field:emailmessage.description" not in {component["id"] for component in facts["components"]}
+
+
+@pytest.mark.parametrize("data_type, references, expected", [
+    ("Lookup", ("Parent__c",), "sf:field:parent__c.name"),
+    ("MasterDetail", ("Parent__c",), "sf:field:parent__c.name"),
+    ("Lookup", ("Parent__c", "AnotherParent__c"), None),
+    ("Lookup", ("Parent__c", "Malformed.Parent"), None),
+    ("Text", ("Parent__c",), None),
+])
+def test_target_object_update_uses_only_a_unique_declared_relationship(data_type, references, expected):
+    definition = parse_xml(
+        "force-app/main/default/objects/Detail__c/fields/Parent__c.field-meta.xml",
+        (f"<CustomField><fullName>Parent__c</fullName><type>{data_type}</type>"
+         + "".join(f"<referenceTo>{reference}</referenceTo>" for reference in references)
+         + "</CustomField>").encode(),
+    )
     document = workflow(
-        rule("Move owner", "<active>true</active>", action("Transfer"))
-        + update("Transfer", "OwnerId", operation="Formula",
-                 extra="<targetObject>ParentId</targetObject><formula>OwnerId</formula>"),
-        owner="EmailMessage",
+        rule("Copy", "<active>true</active>", action("Copy"))
+        + update("Copy", "Name", extra="<targetObject>Parent__c</targetObject>"),
+        owner="Detail__c",
+    )
+    store = FactStore()
+    index_definitions([definition], store)
+    extract_inventory([definition], store)
+    index_workflow([document], store)
+    extract_workflow([document], store)
+    if expected is None:
+        assert not writes(store)
+        assert any(d["code"] == "WORKFLOW_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED" for d in store.diagnostics)
+    else:
+        edge, = writes(store)
+        assert edge["target"] == expected
+        proof = store.evidence[edge["evidence_ids"][0]]["resolution"]
+        assert proof["steps"] == [{
+            "field": "sf:field:detail__c.parent__c", "target": "sf:object:parent__c",
+            "basis": "declared_lookup", "schema_source": definition.location(definition.root),
+        }]
+
+
+@pytest.mark.parametrize("owner, target_object", [
+    ("Task", "<targetObject>WhoId</targetObject>"),
+    ("EmailMessage", "<targetObject>Case</targetObject>"),
+    ("EmailMessage", "<targetObject>ParentId</targetObject><targetObject>ParentId</targetObject>"),
+])
+def test_invalid_target_object_update_never_falls_back_to_the_child(owner, target_object):
+    document = workflow(
+        rule("Copy", "<active>true</active>", action("Copy"))
+        + update("Copy", "Description", extra=target_object),
+        owner=owner,
     )
     store = FactStore()
     index_workflow([document], store)
     extract_workflow([document], store)
     assert not writes(store)
-    assert "sf:field:emailmessage.ownerid" not in store.components
-    diagnostic, = store.diagnostics
-    assert diagnostic["code"] == "WORKFLOW_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED"
-    assert diagnostic["location"]["locator"].endswith("/targetObject")
-    assert diagnostic["location"]["content_hash"] == document.content_hash
+    assert f"sf:field:{owner.casefold()}.description" not in store.components
+    assert store.diagnostics
+    for diagnostic in store.diagnostics:
+        assert diagnostic["code"] == "WORKFLOW_FIELD_UPDATE_TARGET_OBJECT_UNRESOLVED"
+        assert "/targetObject" in diagnostic["location"]["locator"]
+        assert diagnostic["location"]["content_hash"] == document.content_hash
 
 
 def test_workflow_criteria_items_keep_typed_field_operands_and_ignore_literal_values():

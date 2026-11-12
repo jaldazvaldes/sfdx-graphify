@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-SCHEMA_VERSION = 11
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
-EXTRACTOR_VERSION = "0.5.14"
-UPSTREAM_REVISION = "5eedffa87476a063a05bed96f17275ed63f05c1a"
+SCHEMA_VERSION = 13
+SUPPORTED_SCHEMA_VERSIONS = frozenset(range(1, SCHEMA_VERSION + 1))
+EXTRACTOR_VERSION = "0.5.21"
+UPSTREAM_REVISION = "06aa51be050170675912781ad8a2be2b20439d39"
 TESTED_API_VERSIONS = ("64.0",)
 CUSTOM_METADATA_RELATIONS = frozenset({"instance_of", "sets_value", "mentions"})
-RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains", "grants"}) | CUSTOM_METADATA_RELATIONS
+ENTRY_RELATIONS = frozenset({"triggered_by", "publishes", "subscribes"})
+RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains", "grants"}) | CUSTOM_METADATA_RELATIONS | ENTRY_RELATIONS
 _SCHEMA_9_KINDS = frozenset({"approvalprocess", "aura", "visualforcepage", "visualforcecomponent"})
 _PERMISSION_KINDS = frozenset({"profile", "permissionset"})
 _SCHEMA_10_KINDS = _PERMISSION_KINDS | {"namedcredential"}
@@ -65,6 +67,13 @@ def canonical_json(value) -> str:
 
 def stable_id(prefix: str, value) -> str:
     return prefix + ":" + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _evidence_id(relationship, location, rule, resolution):
+    # A literal's value affects identity. Its physical position can move after formatting.
+    if "assigned_value_location" in resolution:
+        resolution = {key: value for key, value in resolution.items() if key != "assigned_value_location"}
+    return stable_id("ev", [relationship, location["path"], location["locator"], rule, resolution])
 
 
 def _method_types_valid(text: str) -> bool:
@@ -162,12 +171,15 @@ class FactStore:
         self.evidence: dict[str, dict] = {}
         self.diagnostics: list[dict] = []
         self.record_type_definitions: dict[str, dict] = {}
+        self.raw_lookup_targets: dict[str, set[str]] = {}
+        self.child_relationships: dict[tuple[str, str], list[tuple[str, dict]]] = {}
         self._diagnostic_ids: set[str] = set()
 
     def ensure_component(self, kind, api_name, definition=None, **attrs):
         cid = component_id(kind, api_name)
         qualified_parts = api_name.partition("(")[0].split(".")
-        namespace = (qualified_parts[0] if (kind == "apexclass" and len(qualified_parts) == 2)
+        namespace = (None if attrs.get("enclosing_class") else
+                     qualified_parts[0] if (kind == "apexclass" and len(qualified_parts) == 2)
                      or (kind == "apexmethod" and len(qualified_parts) == 3)
                      else _namespace(qualified_parts[0] + "__mdt") if kind == "custommetadatarecord"
                      else _namespace(qualified_parts[0]) if kind == "workflowrule"
@@ -234,7 +246,7 @@ class FactStore:
             "qualifiers": qualifiers, "evidence_ids": [],
         })
         resolution = resolution or {"basis": "explicit_syntax"}
-        eid = stable_id("ev", [rid, location["path"], location["locator"], rule, resolution])
+        eid = _evidence_id(rid, location, rule, resolution)
         occurrence = {
             **location, "id": eid, "relationship_id": rid, "source_component": source,
             "rule": rule, "extractor_version": EXTRACTOR_VERSION, "resolution": resolution,
@@ -294,7 +306,8 @@ def _validate_custom_metadata_relationship(version, relation, source, target, qu
                  and set(qualifiers) == {"value", "value_type"} and isinstance(kind, str)
                  and type(qualifiers["value"]) in _CUSTOM_METADATA_VALUE_TYPES.get(kind, ()))
     else:
-        valid = (target["kind"] in {"apexclass", "flow", "field"}
+        valid = ((target["kind"] in {"apexclass", "flow", "field"} or
+                  (version >= 12 and target["kind"] == "object"))
                  and target["definition_status"] == "defined" and not qualifiers)
     if not valid or target["definition_status"] == "ambiguous":
         raise DataError("Invalid custom metadata relationship target or value.")
@@ -362,6 +375,25 @@ def validate_bundle(bundle):
                 raise DataError("Invalid component definition state.")
             for definition in definitions:
                 validate_location(definition)
+            if "declared_default" in component:
+                default = component["declared_default"]
+                if (manifest["schema_version"] < 13 or component["kind"] != "field" or expected != "defined"
+                        or not component["api_name"].split(".", 1)[0].casefold().endswith("__mdt")
+                        or not isinstance(default, dict) or set(default) != {"value_type", "value", "location"}
+                        or default["value_type"] != "boolean" or type(default["value"]) is not bool):
+                    raise DataError("Invalid custom metadata field default.")
+                validate_location(default["location"])
+                if default["location"]["path"] != definitions[0]["path"]:
+                    raise DataError("Custom metadata field default must be declared in the field definition.")
+            if "custom_metadata_field_inventory" in component:
+                inventory = component["custom_metadata_field_inventory"]
+                if (manifest["schema_version"] < 13 or component["kind"] != "custommetadatarecord" or expected != "defined"
+                        or not isinstance(inventory, dict) or set(inventory) != {"fields", "complete"}
+                        or type(inventory["complete"]) is not bool or not isinstance(inventory["fields"], list)
+                        or any(not isinstance(field, str) or not API_NAME.fullmatch(field)
+                               or not field.endswith("__c") or field != field.casefold() for field in inventory["fields"])
+                        or inventory["fields"] != sorted(set(inventory["fields"]))):
+                    raise DataError("Invalid custom metadata field inventory.")
             if "source_files" in component:
                 if not isinstance(component["source_files"], list):
                     raise DataError("Invalid component source files.")
@@ -380,6 +412,13 @@ def validate_bundle(bundle):
             if relation in CUSTOM_METADATA_RELATIONS:
                 _validate_custom_metadata_relationship(manifest["schema_version"], relation,
                                                        components[source], components[target], qualifiers)
+            if relation in ENTRY_RELATIONS:
+                allowed_sources = {"flow", "apextrigger", "validationrule"} if relation == "triggered_by" else (
+                    {"flow", "apextrigger"} if relation == "subscribes" else {"flow", "apexmethod", "apextrigger"})
+                if (manifest["schema_version"] < 13 or components[source]["kind"] not in allowed_sources
+                        or components[target]["kind"] != "object"
+                        or (relation != "triggered_by" and not components[target]["api_name"].casefold().endswith("__e"))):
+                    raise DataError("Invalid automation or platform event relationship.")
             if relation == "grants":
                 permission = qualifiers.get("permission")
                 if (manifest["schema_version"] < 10 or components[source]["kind"] not in _PERMISSION_KINDS
@@ -392,9 +431,13 @@ def validate_bundle(bundle):
             if "resolution_status" in qualifiers:
                 if manifest["schema_version"] < 6:
                     raise DataError("Candidate relationships require snapshot schema version 6.")
-                if qualifiers["resolution_status"] != "candidate" or relation != "calls":
-                    raise DataError("Invalid candidate call resolution.")
                 reason = qualifiers.get("uncertainty")
+                candidate_read = (relation == "reads" and qualifiers.get("context") == "custom_metadata_accessor")
+                if (qualifiers["resolution_status"] != "candidate" or (relation != "calls"
+                        and (manifest["schema_version"] < 13 or reason != "external_hierarchy"
+                             or (relation != "publishes" and not candidate_read)))):
+                    label = "call" if relation == "calls" else "relationship"
+                    raise DataError(f"Invalid candidate {label} resolution.")
                 if reason == "external_hierarchy":
                     missing = qualifiers.get("missing_ancestors")
                     if (not isinstance(missing, list) or not missing
@@ -424,6 +467,18 @@ def validate_bundle(bundle):
                 if occurrence["relationship_id"] != rid or occurrence["source_component"] != source:
                     raise DataError("Evidence points to the wrong relationship.")
                 validate_location(occurrence)
+                if "assigned_value" in occurrence["resolution"]:
+                    literal = occurrence["resolution"]["assigned_value"]
+                    if (relation != "writes" or components[target]["kind"] != "field"
+                            or not isinstance(literal, dict) or set(literal) != {"type", "value"}):
+                        raise DataError("Invalid literal write evidence.")
+                    kind, value = literal["type"], literal["value"]
+                    if not ((kind == "string" and isinstance(value, str)) or (kind == "boolean" and type(value) is bool)
+                            or (kind == "null" and value is None)
+                            or (kind == "number" and (type(value) is int or type(value) is float and math.isfinite(value)))):
+                        raise DataError("Invalid literal write value.")
+                    if "assigned_value_location" in occurrence["resolution"]:
+                        validate_location(occurrence["resolution"]["assigned_value_location"])
                 if relation in CUSTOM_METADATA_RELATIONS or occurrence["rule"] in _CUSTOM_METADATA_RULES.values():
                     if (_CUSTOM_METADATA_RULES.get(relation) != occurrence["rule"]
                             or occurrence["path"] != components[source]["definitions"][0]["path"]
@@ -435,16 +490,24 @@ def validate_bundle(bundle):
                     declaration = components.get(proof["accessor_method"], {})
                     validate_location(proof["accessor_definition"])
                     validate_location(proof["field_definition"])
+                    if proof.get("basis") == "inferred_literal_custom_metadata_accessor":
+                        validate_location(proof["accessor_read"])
+                        accessor_valid = (manifest["schema_version"] >= 13
+                                          and proof["accessor_read"]["path"] == proof["accessor_definition"]["path"])
+                    else:
+                        accessor_valid = (proof.get("basis") == "configured_literal_custom_metadata_accessor"
+                                          and accessor in manifest["scope"].get("custom_metadata_accessors", ()))
                     if (manifest["schema_version"] < 11 or relation != "reads"
-                            or qualifiers != {"context": "custom_metadata_accessor"}
+                            or qualifiers.get("context") != "custom_metadata_accessor"
+                            or set(qualifiers) != ({"context", "resolution_status", "uncertainty", "missing_ancestors"}
+                                                  if qualifiers.get("resolution_status") == "candidate" else {"context"})
                             or components[source]["kind"] != "apexmethod" or components[target]["kind"] != "field"
-                            or proof.get("basis") != "configured_literal_custom_metadata_accessor"
-                            or accessor not in manifest["scope"].get("custom_metadata_accessors", ())
+                            or not accessor_valid
                             or components[target]["api_name"].casefold().split(".", 1)[0] != accessor["type"]
                             or declaration.get("kind") != "apexmethod"
                             or proof["accessor_definition"] not in declaration["definitions"]
                             or proof["field_definition"] not in components[target]["definitions"]):
-                        raise DataError("Invalid configured custom metadata accessor evidence.")
+                        raise DataError("Invalid custom metadata accessor evidence.")
                 if relation == "grants" or occurrence["rule"] == "permission.declaration":
                     permission_proof = occurrence["resolution"]
                     declared = permission_proof.get("declared_target")
@@ -495,8 +558,7 @@ def validate_bundle(bundle):
                                  else ("class_literal", "construct_site", "constructor"))
                     for key in locations:
                         validate_location(resolution[key])
-                if eid != stable_id("ev", [rid, occurrence["path"], occurrence["locator"],
-                                           occurrence["rule"], occurrence["resolution"]]):
+                if eid != _evidence_id(rid, occurrence, occurrence["rule"], occurrence["resolution"]):
                     raise DataError("Evidence identity is inconsistent.")
                 used.add(eid)
         if used != set(indexes["evidence"]):

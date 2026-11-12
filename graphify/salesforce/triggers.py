@@ -334,7 +334,7 @@ class _TriggerExtractor(_MethodExtractor):
             return
         super().field_access(node, relation, operation=operation)
 
-    def _constructed_class(self, receiver, node):
+    def _constructed_class(self, receiver, node, *, require_immutable=False):
         if receiver is None:
             return None
         if receiver.type == "object_creation_expression":
@@ -347,10 +347,12 @@ class _TriggerExtractor(_MethodExtractor):
         matches = [item for item in self.constructed if item.binding is binding]
         if len(matches) != 1:
             return None
-        # Reassignment can change runtime type. Conservatively reject any write
-        # to this variable name before the call, including nested control paths.
+        # Async targets require an unreassigned local, including writes after a
+        # submission that could reach it again on another loop iteration.
         for current in _walk(self.body):
-            if current.start_byte < binding.available_from or current.start_byte >= node.start_byte:
+            if current.start_byte < binding.available_from:
+                continue
+            if not require_immutable and current.start_byte >= node.start_byte:
                 continue
             if current.type == "assignment_expression":
                 left = current.child_by_field_name("left")
@@ -362,7 +364,7 @@ class _TriggerExtractor(_MethodExtractor):
         receiver = node.child_by_field_name("object")
         name = self.unit.text(node.child_by_field_name("name"))
         arguments = _significant(node.child_by_field_name("arguments"))
-        if self._managed_invocation(node):
+        if self._platform_invocation(node, receiver, name, arguments) or self._managed_invocation(node):
             for argument in arguments:
                 self.visit(argument)
             return

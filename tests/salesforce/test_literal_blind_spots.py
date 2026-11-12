@@ -125,6 +125,9 @@ def test_apex_string_hints_exclude_comments_and_remain_separate_from_graph_facts
             String qualified = 'Account.Code__c';
             String unrelated = 'Code__c_Extra';
         }
+        private class Nested {
+            public void inspect() { String qualified = 'Account.Code__c'; }
+        }
     }""")
     put("triggers/Example.trigger",
         "trigger Example on Account (before insert) { String fieldName = 'Code__c'; }")
@@ -140,11 +143,11 @@ def test_apex_string_hints_exclude_comments_and_remain_separate_from_graph_facts
     assert hints["apex_strings"] == {
         "scanned_file_count": 2,
         "skipped_file_count": 1,
-        "qualified": {"literal": "Account.Code__c", "occurrence_count": 1, "file_count": 1,
+        "qualified": {"literal": "Account.Code__c", "occurrence_count": 2, "file_count": 1,
                       "example_paths": ["force-app/classes/DynamicFields.cls"]},
         "field_name": {"literal": "Code__c", "occurrence_count": 1, "file_count": 1,
                        "example_paths": ["force-app/triggers/Example.trigger"]},
     }
-    assert "Apex string hints: 1 qualified, 1 field-name matches" in cli._text(result, brief=True)
+    assert "Apex string hints: 2 qualified, 1 field-name matches" in cli._text(result, brief=True)
     del bundle["manifest"]["literal_blind_spots"]["apex_strings"]
     assert "apex_strings" not in query.refs(bundle, "Account.Code__c")["literal_blind_spots"]

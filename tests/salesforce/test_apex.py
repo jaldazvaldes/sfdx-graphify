@@ -89,8 +89,9 @@ def test_relationship_chains_and_subqueries_are_not_assigned_to_outer_object():
     fields = {(edge["target"], edge["relation"]) for edge in store.relationships.values()
               if store.components[edge["target"]]["kind"] == "field"}
     assert fields == {("sf:field:account.id", "reads"), ("sf:field:account.name", "filters"),
-                      ("sf:field:account.parentid", "reads")}
-    assert {"APEX_SOQL_FIELD_PATH_UNSUPPORTED", "APEX_SOQL_CONSTRUCT_UNSUPPORTED"} <= codes(store)
+                      ("sf:field:account.parentid", "reads"), ("sf:field:contact.lastname", "reads"),
+                      ("sf:field:contact.accountid", "reads")}
+    assert codes(store) == {"APEX_SOQL_FIELD_PATH_UNSUPPORTED"}
     assert "sf:field:account.lastname" not in store.components
     assert "sf:field:account.owner" not in store.components
 

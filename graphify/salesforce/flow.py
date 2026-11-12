@@ -8,37 +8,38 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 from dataclasses import replace
+import re
 
 from .schema import TESTED_API_VERSIONS, canonical_json
-from .symbols import API_NAME, RESOURCE_NAME, index_symbols
-from .formula_refs import formula_references
+from .symbols import API_NAME, RESOURCE_NAME, index_symbols, literal, screen_fields
+from .formula_refs import COLLECTION_ITEM_REFERENCE, formula_references
 from .relationship_paths import add_navigation_reads, resolve_source_field_path
+from .write_values import flow_write_value
 
 _BASE = {"name", "label", "description", "locationX", "locationY", "connector", "faultConnector", "processMetadataValues"}
 _OP = _BASE | {"object", "filters", "filterLogic"}
 _VALUE = {"elementReference", "stringValue", "booleanValue", "numberValue", "dateValue", "dateTimeValue"}
+_COLLECTION_FILTER_MODES = {"Formula", "formula_evaluates_to_true"}
 _UNSUPPORTED = {
     "formula": "Formula expressions are outside v0.1 expression coverage.",
-    "screens": "Screen expression contexts are outside v0.1 coverage.",
-    "loops": "Loop alias propagation is outside v0.1 coverage.",
+    "loops": "The loop does not establish a typed record and iteration path.",
     "collectionProcessors": "Collection processing is outside v0.1 coverage.",
     "collectionFilter": "Collection filtering is outside v0.1 coverage.",
     "dynamicChoiceSets": "Dynamic choice resources are outside v0.1 coverage.",
     "choices": "Choice resources are outside v0.1 coverage.",
-    "textTemplates": "Text template expression parsing is outside v0.1 coverage.",
     "apexPluginCalls": "Apex plug-in calls are outside v0.1 coverage.",
     "waits": "Wait event expressions are outside v0.1 coverage.",
     "recordRollbacks": "Transaction rollback semantics are outside v0.1 coverage.",
     "relatedRecords": "Related record lookup traversal is outside v0.1 coverage.",
     "scheduledPaths": "Scheduled path expressions are outside v0.1 coverage.",
-    "transforms": "Transform expressions are outside v0.1 coverage.",
 }
 _CHILDREN = {
     "Flow": {"apiVersion", "fullName", "label", "description", "interviewLabel", "processType", "status", "runInMode",
              "start", "startElementReference", "variables", "constants", "recordLookups", "recordCreates", "recordUpdates",
              "recordDeletes", "assignments", "decisions", "actionCalls", "subflows", "processMetadataValues", "environments",
              "isAdditionalPermissionRequiredToRun", "isTemplate", "isOverridable", "areMetricsLoggedToDataCloud",
-             "triggerOrder", "migratedFromWorkflowRuleName", "timeZoneSidKey", "builder", "sourceTemplate", "apiVersionRuntime", "formulas"}
+             "triggerOrder", "migratedFromWorkflowRuleName", "timeZoneSidKey", "builder", "sourceTemplate", "apiVersionRuntime",
+             "formulas", "textTemplates", "screens", "transforms"}
             | set(_UNSUPPORTED),
     "start": _BASE | {"object", "triggerType", "recordTriggerType", "filters", "filterLogic", "filterFormula",
                       "doesRequireRecordChangedToMeetCriteria", "schedule",
@@ -76,6 +77,24 @@ _CHILDREN = {
     "schedule": {"frequency", "startDate", "startTime"},
     "formulas": {"name", "description", "dataType", "expression", "scale"},
     "textTemplates": {"name", "description", "text", "isViewedAsPlainText"},
+    "loops": _BASE | {"collectionReference", "iterationOrder", "nextValueConnector", "noMoreValuesConnector", "assignNextValueToReference"},
+    "nextValueConnector": {"targetReference", "isGoTo"},
+    "noMoreValuesConnector": {"targetReference", "isGoTo"},
+    "collectionProcessors": _BASE | {"elementSubtype", "collectionProcessorType", "conditionLogic",
+                                    "collectionReference", "assignNextValueToReference", "formula", "conditions"},
+    "screens": _BASE | {"allowBack", "allowFinish", "allowPause", "showFooter", "showHeader", "fields",
+                        "backButtonLabel", "nextOrFinishButtonLabel", "pauseButtonLabel", "pausedText"},
+    "fields": {"name", "description", "label", "dataType", "fieldType", "fields", "fieldText", "helpText", "defaultValue",
+               "extensionName", "inputParameters", "outputParameters", "inputsOnNextNavToAssocScrn", "dataTypeMappings",
+               "isRequired", "isDisabled", "isReadOnly", "regionContainerType", "scale", "storeOutputAutomatically",
+               "processMetadataValues", "objectFieldReference", "visibilityRule", "validationRule"},
+    "dataTypeMappings": {"typeName", "typeValue"},
+    "defaultValue": _VALUE,
+    "visibilityRule": {"conditionLogic", "conditions"},
+    "validationRule": {"errorMessage", "formulaExpression"},
+    "transforms": _BASE | {"apexClass", "dataType", "isCollection", "objectType", "scale", "transformValues"},
+    "transformValues": {"name", "label", "description", "transformValueActions"},
+    "transformValueActions": {"outputFieldApiName", "transformType", "value", "inputParameters"},
 }
 
 
@@ -87,9 +106,11 @@ class _Extractor:
         self.symbols = index_symbols(document, store)
         self.handled_references = set()
         self.handled_formulas = set()
+        self.handled_constructs = set(self.symbols.supported_loops)
         self.formula_stack = set()
         self.formula_done = set()
         self.formula_tokens = {}
+        self.merge_tokens = {}
 
     def diagnostic(self, code, message, node, state="unsupported", **extra):
         self.store.diagnostic(code, message, self.doc.location(node), state=state, **extra)
@@ -104,7 +125,7 @@ class _Extractor:
             self.store.relation(self.source, target, relation, self.doc.location(node), rule,
                                 resolution=resolution or {"basis": "explicit_object", "object": owner}, qualifiers=qualifiers)
 
-    def field_edge(self, owner, field, relation, node, rule, qualifiers=None, resolution=None):
+    def field_edge(self, owner, field, relation, node, rule, qualifiers=None, resolution=None, *, literal=None):
         self.handled_references.add(node.locator)
         if not owner:
             self.diagnostic("FLOW_FIELD_OWNER_UNRESOLVED", "The field's owning object is not established.", node, "unresolved")
@@ -127,19 +148,24 @@ class _Extractor:
         resolution = resolution or {"basis": "explicit_object", "object": owner}
         if node.locator in self.formula_tokens:
             resolution = {**resolution, "formula_reference": self.formula_tokens[node.locator]}
+        if node.locator in self.merge_tokens:
+            resolution = {**resolution, "merge_reference": self.merge_tokens[node.locator]}
         self.store.relation(self.source, target, relation, location, rule,
-                            resolution=resolution, qualifiers=qualifiers)
+                            resolution={**resolution, **literal} if literal else resolution, qualifiers=qualifiers)
         if "steps" in resolution:
             add_navigation_reads(self.store, self.source, location, resolution, rule="flow.relationship_navigation",
                                  qualifiers={"context": "flow_relationship_navigation"})
 
-    def reference(self, node, relation="reads", rule="flow.direct_reference", qualifiers=None):
+    def reference(self, node, relation="reads", rule="flow.direct_reference", qualifiers=None, *, literal=None):
         if node is None:
             return
         self.handled_references.add(node.locator)
         value = node.text.strip()
         if value.startswith("{!") and value.endswith("}"):
             value = value[2:-1].strip()
+        each_item = COLLECTION_ITEM_REFERENCE.fullmatch(value) if (qualifiers or {}).get("operation") == "transform" else None
+        if each_item:
+            value = each_item[1] + each_item[2]
         parts = value.split(".")
         if parts[0].casefold() == "$setup" and len(parts) == 3 and all(API_NAME.fullmatch(p) for p in parts[1:]):
             self.field_edge(parts[1], parts[2], relation, node, rule, qualifiers,
@@ -152,7 +178,10 @@ class _Extractor:
         if not parts or not RESOURCE_NAME.fullmatch(parts[0]) or not all(API_NAME.fullmatch(p) for p in parts[1:]):
             self.diagnostic("FLOW_REFERENCE_DYNAMIC", "Only a literal resource or direct resource field is supported.", node, "dynamic")
             return
-        symbol = self.symbols.resolve(parts[0], node, require_record=len(parts) >= 2)
+        resource_count = 2 if len(parts) >= 2 and self.symbols.unique(".".join(parts[:2])) else 1
+        resource_name = ".".join(parts[:resource_count])
+        fields = parts[resource_count:]
+        symbol = self.symbols.resolve(resource_name, node, require_record=bool(fields))
         if symbol is None:
             return
         if symbol.basis == "formulas":
@@ -161,22 +190,30 @@ class _Extractor:
                 return
             self.formula_resource(symbol.name, relation, qualifiers)
             return
-        if symbol.basis in ("textTemplates", "dynamicChoiceSets", "choices", "unsupported_call_output", "unsupported_create_output"):
+        if symbol.basis == "textTemplates" and relation != "writes":
+            return  # Templates contribute their reads at the declaration.
+        if symbol.basis in ("textTemplates", "dynamicChoiceSets", "choices", "unsupported_call_output",
+                            "unsupported_create_output", "unsupported_screen_output"):
             self.diagnostic("FLOW_RESOURCE_DEPENDENCIES_UNSUPPORTED", "The referenced resource requires an unsupported dependency handler.", node)
             return
         if not symbol.object_type:
             return  # A declared scalar carries no object/field dependency.
+        if each_item and not symbol.collection:
+            self.diagnostic("FLOW_TRANSFORM_ITEM_UNRESOLVED", "A transform item requires a typed record collection.", node, "unresolved")
+            return
         basis = {"basis": symbol.basis, "symbol": symbol.name, "object": symbol.object_type,
                  "collection": symbol.collection,
                  "declaration": {key: symbol.location[key] for key in ("path", "locator")}}
         qualified = dict(qualifiers or {})
+        if each_item:
+            basis["item_selector"] = "$EachItem"
         if parts[0].casefold() in ("$record", "$record__prior"):
             qualified["record_context"] = "prior" if parts[0].casefold() == "$record__prior" else "current"
-        if len(parts) >= 2:
-            if symbol.collection:
+        if fields:
+            if symbol.collection and not each_item:
                 self.diagnostic("FLOW_COLLECTION_FIELD_UNSUPPORTED", "Direct collection field projection requires unsupported collection semantics.", node)
                 return
-            self.field_edge(symbol.object_type, ".".join(parts[1:]), relation, node, rule, qualified, basis)
+            self.field_edge(symbol.object_type, ".".join(fields), relation, node, rule, qualified, basis, literal=literal)
         else:
             qualified.update({"field_set": "unknown", "collection": symbol.collection})
             self.object_edge(symbol.object_type, relation, node, rule, qualified, basis)
@@ -184,7 +221,9 @@ class _Extractor:
     def formula(self, node, relation, qualifiers=None):
         """Record typed lexical dependencies; formula truth and evaluation stay unknown."""
         self.handled_formulas.add(node.locator)
-        references, issues = formula_references(node.text)
+        transform_expression = node.tag == "formulaExpression" and (qualifiers or {}).get("operation") == "transform"
+        references, issues = (formula_references(node.text, allow_collection_item=True) if transform_expression
+                              else formula_references(node.text))
         self.diagnostic("FLOW_FORMULA_ANALYSIS_BOUNDED",
                         "Only literal typed formula references are indexed; evaluation and dynamic dependencies are not modeled.",
                         node, severity="info")
@@ -232,6 +271,62 @@ class _Extractor:
             if symbol and symbol.basis == "formulas":
                 self.formula_resource(name)
 
+    def collection_filters(self):
+        """Index operands when the collection and its current item are typed."""
+        required = ("collectionProcessorType", "conditionLogic", "collectionReference",
+                    "assignNextValueToReference")
+        for processor in self.doc.root.all("collectionProcessors"):
+            fields = {tag: processor.all(tag) for tag in required}
+            subtypes = processor.all("elementSubtype")
+            if not any(node.text == "FilterCollectionProcessor" for node in fields["collectionProcessorType"]):
+                continue
+            formulas = processor.all("formula")
+            conditions = processor.all("conditions")
+            if (any(len(nodes) > 1 for nodes in fields.values()) or len(subtypes) > 1
+                    or len(formulas) > 1 or (formulas and conditions)):
+                self.diagnostic("FLOW_COLLECTION_FILTER_AMBIGUOUS",
+                                "The filter repeats a scalar element or mixes formula and declarative conditions.",
+                                processor, "ambiguous")
+                continue
+            if (not all(fields.values()) or any(node.children or not node.text for nodes in fields.values() for node in nodes)
+                    or any(node.children or node.text != "FilterCollectionProcessor" for node in subtypes)):
+                self.diagnostic("FLOW_COLLECTION_FILTER_UNRESOLVED",
+                                "The filter requires literal collection, current item, and condition logic elements.",
+                                processor, "unresolved")
+                continue
+            logic = fields["conditionLogic"][0].text
+            formula_mode = logic in _COLLECTION_FILTER_MODES
+            if formula_mode and (not formulas or formulas[0].children or not formulas[0].text):
+                self.diagnostic("FLOW_COLLECTION_FILTER_UNRESOLVED", "The filter requires a literal formula expression.",
+                                processor, "unresolved")
+                continue
+            if not formula_mode and (not conditions or not re.fullmatch(r"(?i)[\d()\s]*(?:(?:and|or|not)\b[\d()\s]*)*", logic)):
+                self.diagnostic("FLOW_COLLECTION_FILTER_UNRESOLVED", "The filter requires supported declarative condition logic.",
+                                processor, "unresolved")
+                continue
+            collection_node = fields["collectionReference"][0]
+            item_node = fields["assignNextValueToReference"][0]
+            if (not RESOURCE_NAME.fullmatch(item_node.text)
+                    or not (RESOURCE_NAME.fullmatch(collection_node.text) or self.symbols.unique(collection_node.text))):
+                self.diagnostic("FLOW_COLLECTION_FILTER_UNRESOLVED",
+                                "The filter requires direct collection and current item resource names.",
+                                processor, "unresolved")
+                continue
+            collection = self.symbols.resolve(collection_node.text, collection_node, require_record=True)
+            item = self.symbols.resolve(item_node.text, item_node, require_record=True)
+            if (collection is None or not collection.collection or not collection.object_type
+                    or item is None or item.basis != "declared_variable" or item.collection or not item.object_type
+                    or item.object_type.casefold() != collection.object_type.casefold()):
+                self.diagnostic("FLOW_COLLECTION_FILTER_UNRESOLVED",
+                                "The input must be a record collection with a compatible singular record variable.",
+                                processor, "unresolved")
+                continue
+            self.handled_constructs.add(processor.locator)
+            if formula_mode:
+                self.formula(formulas[0], "filters", {"operation": "collection_filter", "context": "filter_formula"})
+            else:
+                self.conditions(conditions, "collection_filter", {"operation": "collection_filter", "condition_logic": logic})
+
     def value(self, container, relation="reads", rule="flow.value_reference", qualifiers=None):
         if container is None:
             return
@@ -257,26 +352,109 @@ class _Extractor:
                 changed = rule.value("doesRequireRecordChangedToMeetCriteria")
                 if changed:
                     context["record_changed_to_meet_criteria"] = changed
-                for condition in rule.all("conditions"):
-                    # Never prefer one operand when malformed XML repeats it.
-                    left, right = condition.all("leftValueReference"), condition.all("rightValue")
-                    repeated_value = right and sum(child.tag in _VALUE for child in right[0].children) > 1
-                    if len(left) > 1 or len(right) > 1 or len(condition.all("operator")) > 1 or repeated_value:
-                        self.diagnostic("FLOW_DECISION_CONDITION_AMBIGUOUS",
-                                        "A decision condition repeats a scalar operand or operator.",
-                                        condition, "ambiguous")
-                        continue
-                    qualifiers = {**context, "operator": condition.value("operator")}
-                    if left:
-                        self.reference(left[0], "filters", "flow.decision_left_operand",
-                                       {**qualifiers, "operand": "left"})
-                    else:
-                        self.diagnostic("FLOW_DECISION_CONDITION_UNSUPPORTED",
-                                        "A direct decision condition requires a left resource reference; nested conditions are outside coverage.",
-                                        condition)
-                    if right:
-                        self.value(right[0], "filters", "flow.decision_right_operand",
-                                   {**qualifiers, "operand": "right"})
+                self.conditions(rule.all("conditions"), "decision", context)
+
+    def conditions(self, conditions, kind, context):
+        for condition in conditions:
+            left, right = condition.all("leftValueReference"), condition.all("rightValue")
+            repeated_value = right and sum(child.tag in _VALUE for child in right[0].children) > 1
+            code = f"FLOW_{kind.upper()}_CONDITION"
+            if len(left) > 1 or len(right) > 1 or len(condition.all("operator")) > 1 or repeated_value:
+                self.diagnostic(f"{code}_AMBIGUOUS", "A condition repeats a scalar operand or operator.", condition, "ambiguous")
+                continue
+            qualifiers = {**context, "operator": condition.value("operator")}
+            if left:
+                self.reference(left[0], "filters", f"flow.{kind}_left_operand", {**qualifiers, "operand": "left"})
+            else:
+                self.diagnostic(f"{code}_UNSUPPORTED", "A direct condition requires a left resource reference.", condition)
+            if right:
+                self.value(right[0], "filters", f"flow.{kind}_right_operand", {**qualifiers, "operand": "right"})
+
+    def merge_text(self, node, rule, qualifiers):
+        """Find merge tokens in prose or rich text without treating prose as a formula."""
+        cursor = 0
+        index = 0
+        while (start := node.text.find("{!", cursor)) != -1:
+            end = node.text.find("}", start + 2)
+            if end == -1:
+                self.diagnostic("FLOW_MERGE_REFERENCE_UNSUPPORTED", "The text contains an unterminated merge reference.", node)
+                break
+            cursor = end + 1
+            expression = node.text[start + 2:end].strip()
+            if "{" in expression or not expression:
+                self.diagnostic("FLOW_MERGE_REFERENCE_UNSUPPORTED", "The text contains a malformed merge reference.", node)
+                continue
+            index += 1
+            token = replace(node, text=expression, children=[], locator=f"{node.locator}/reference[{index}]")
+            self.merge_tokens[token.locator] = {
+                "expression_locator": node.locator, "decoded_character_offset": start,
+                "source_position_basis": "containing_xml_text_element",
+            }
+            self.reference(token, "reads", rule, qualifiers)
+
+    def text_templates(self):
+        for template in self.doc.root.all("textTemplates"):
+            texts = template.all("text")
+            if len(texts) != 1 or texts[0].children:
+                self.diagnostic("FLOW_TEXT_TEMPLATE_UNSUPPORTED", "The template requires a unique plain or escaped rich-text value.", template)
+                continue
+            self.merge_text(texts[0], "flow.text_template_reference",
+                            {"operation": "text_template", "template": template.value("name")})
+
+    def screens(self):
+        for screen in self.doc.root.all("screens"):
+            for field in screen_fields(screen):
+                context = {"operation": "screen", "screen": screen.value("name"), "screen_field": field.value("name")}
+                for tag in ("fieldText", "helpText"):
+                    for text in field.all(tag):
+                        self.merge_text(text, "flow.screen_text_reference", {**context, "context": tag})
+                for visibility in field.all("visibilityRule"):
+                    self.conditions(visibility.all("conditions"), "screen_visibility",
+                                    {**context, "condition_logic": visibility.value("conditionLogic")})
+                for validation in field.all("validationRule"):
+                    expressions = validation.all("formulaExpression")
+                    if len(expressions) == 1 and not expressions[0].children and expressions[0].text:
+                        self.formula(expressions[0], "filters", {**context, "context": "input_validation"})
+                for value in field.all("defaultValue"):
+                    self.value(value, "reads", "flow.screen_default", context)
+                for item in field.all("inputParameters"):
+                    self.value(item.child("value"), "reads", "flow.screen_input", context)
+                for item in field.all("outputParameters"):
+                    self.reference(item.child("assignToReference"), "writes", "flow.screen_output", {**context, "effect": "memory"})
+                if field.value("fieldType") == "ObjectProvided":
+                    self.reference(field.child("objectFieldReference"), "references", "flow.screen_object_field", context)
+
+    def transforms(self):
+        for transform in self.doc.root.all("transforms"):
+            name = literal(transform, "name")
+            output = self.symbols.unique(name)
+            context = {"operation": "transform", "transform": name}
+            groups = transform.all("transformValues")
+            actions = [action for group in groups for action in group.all("transformValueActions")]
+            if not actions:
+                self.diagnostic("FLOW_TRANSFORM_ACTION_UNSUPPORTED", "The transform has no supported mapping actions.", transform)
+            for action in actions:
+                values = action.all("value")
+                if (literal(action, "transformType") != "Map" or len(values) != 1 or action.all("inputParameters")):
+                    self.diagnostic("FLOW_TRANSFORM_ACTION_UNSUPPORTED", "Only direct Map actions with a single source value are supported.", action)
+                    continue
+                value = values[0]
+                references = value.all("elementReference")
+                expressions = value.all("formulaExpression")
+                if len(references) == 1 and len(value.children) == 1:
+                    self.reference(references[0], "reads", "flow.transform_input", context)
+                elif (len(expressions) == 1 and literal(value, "formulaDataType") and literal(value, "formulaExpression")
+                      and len(value.children) == 2):
+                    self.formula(expressions[0], "reads", context)
+                elif len(value.children) != 1 or value.children[0].tag not in _VALUE - {"elementReference"}:
+                    self.diagnostic("FLOW_TRANSFORM_VALUE_UNSUPPORTED", "The mapping source needs a literal, a direct reference, or a typed formula.", value)
+                    continue
+                targets = action.all("outputFieldApiName")
+                if len(targets) == 1 and output is not None and output.object_type and API_NAME.fullmatch(literal(action, "outputFieldApiName")):
+                    self.field_edge(output.object_type, targets[0].text, "writes", targets[0], "flow.transform_output",
+                                    {**context, "effect": "memory"}, {"basis": "transform_output", "object": output.object_type})
+                elif targets or (output is not None and output.object_type):
+                    self.diagnostic("FLOW_TRANSFORM_TARGET_UNRESOLVED", "The transform target field or object type is unproven.", action, "unresolved")
 
     def start(self):
         start = self.doc.root.child("start")
@@ -351,7 +529,7 @@ class _Extractor:
         if input_node is not None:
             self.handled_references.add(input_node.locator)
             reference = input_node.text.strip()
-            if not RESOURCE_NAME.fullmatch(reference):
+            if not (RESOURCE_NAME.fullmatch(reference) or self.symbols.unique(reference)):
                 self.diagnostic("FLOW_RECORD_INPUT_UNSUPPORTED", "Record operations require a direct record resource.", input_node)
             else:
                 symbol = self.symbols.resolve(reference, input_node, require_record=True)
@@ -390,7 +568,9 @@ class _Extractor:
                 for item in node.all("inputAssignments") if tag in ("recordCreates", "recordUpdates") else []:
                     field = item.child("field")
                     if field is not None:
-                        self.field_edge(owner, field.text.strip(), "writes", field, "flow.record_input_field", {"operation": operation_name, "effect": "database"})
+                        self.field_edge(owner, field.text.strip(), "writes", field, "flow.record_input_field",
+                                        {"operation": operation_name, "effect": "database"},
+                                        literal=flow_write_value(self.doc, item.child("value")))
                     self.value(item.child("value"), "reads", "flow.record_input_value", {"operation": operation_name})
                 for item in node.all("outputAssignments") if tag == "recordLookups" else []:
                     field = item.child("field")
@@ -427,7 +607,8 @@ class _Extractor:
                     if symbol and (symbol.collection or symbol.object_type):
                         self.diagnostic("FLOW_ASSIGNMENT_OPERATOR_UNSUPPORTED", "Collection and whole-record arithmetic is outside v0.1 coverage.", item)
                         continue
-                self.reference(target, "writes", "flow.assignment_destination", qualifiers)
+                literal = flow_write_value(self.doc, item.child("value")) if operator == "Assign" else None
+                self.reference(target, "writes", "flow.assignment_destination", qualifiers, literal=literal)
                 if operator != "Assign":
                     self.reference(target, "reads", "flow.assignment_existing_value", qualifiers)
                 self.value(item.child("value"), "reads", "flow.assignment_source", qualifiers)
@@ -466,17 +647,22 @@ class _Extractor:
         def visit(node, inherited_unsupported=False):
             expected = _CHILDREN.get(node.tag, set())
             for child in node.children:
-                unsupported = child.tag in _UNSUPPORTED
+                unsupported = (child.tag in _UNSUPPORTED and child.locator not in self.handled_formulas
+                               and child.locator not in self.handled_constructs)
                 unknown = child.tag not in expected
-                if child.tag in {"filterFormula", "expression"} and child.locator not in self.handled_formulas:
-                    self.diagnostic("FLOW_FORMULA_CONTEXT_UNSUPPORTED", "This formula occurs outside a supported expression context.",
-                                    child, construct=child.tag)
+                if child.tag in {"filterFormula", "expression", "formulaExpression"}:
+                    if child.locator not in self.handled_formulas:
+                        self.diagnostic("FLOW_FORMULA_CONTEXT_UNSUPPORTED", "This formula occurs outside a supported expression context.",
+                                        child, construct=child.tag)
+                elif (child.tag == "formulaDataType" and (expression := node.child("formulaExpression")) is not None
+                      and expression.locator in self.handled_formulas):
+                    continue
                 elif unsupported:
                     self.diagnostic("FLOW_CONSTRUCT_UNSUPPORTED", _UNSUPPORTED[child.tag], child, construct=child.tag)
                 elif unknown and not inherited_unsupported:
                     self.diagnostic("FLOW_XML_ELEMENT_UNSUPPORTED", "The XML element is not classified by the v0.1 handler for this parent.", child,
                                     construct=child.tag, parent_construct=node.tag)
-                elif child.tag in {"elementReference", "leftValueReference", "assignToReference", "inputReference", "outputReference", "field"} and child.locator not in self.handled_references and not inherited_unsupported:
+                elif child.tag in {"elementReference", "leftValueReference", "assignToReference", "inputReference", "outputReference", "field", "objectFieldReference"} and child.locator not in self.handled_references and not inherited_unsupported:
                     self.diagnostic("FLOW_REFERENCE_CONTEXT_UNSUPPORTED", "This reference occurs outside a supported dependency context.", child,
                                     construct=child.tag, parent_construct=node.tag)
                 # Do not lose recognized unsupported descendants inside an unknown tree.
@@ -499,6 +685,10 @@ def extract_flow(document, store):
     extractor.decisions()
     extractor.declarations()
     extractor.formulas()
+    extractor.collection_filters()
+    extractor.text_templates()
+    extractor.screens()
+    extractor.transforms()
     extractor.operations()
     extractor.assignments()
     extractor.calls()

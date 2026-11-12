@@ -133,7 +133,7 @@ def _component_filters(html: str) -> str:
     return html
 
 
-def standard_assets(bundle: dict) -> dict[str, tuple[bytes, str]]:
+def standard_assets(bundle: dict, *, processes_available: bool = False) -> dict[str, tuple[bytes, str]]:
     """Render all current components with the actual standard Graphify renderer.
 
     The only aggregation is one directed link per ordered pair. Its individual
@@ -205,6 +205,7 @@ def standard_assets(bundle: dict) -> dict[str, tuple[bytes, str]]:
                           f"{int(activity.get('excluded_component_count', 0)):,} · unknown status retained")
     else:
         activity_label = "All local statuses included"
+    processes_link = '<a href="/processes">Process maps</a>' if processes_available else ""
     toolbar = ("<nav id=\"full-graph-toolbar\" aria-label=\"Complete graph controls\">"
                "<strong>Salesforce · complete graph</strong>"
                "<span>Orbital layout · select a component to highlight its connections</span>"
@@ -212,7 +213,7 @@ def standard_assets(bundle: dict) -> dict[str, tuple[bytes, str]]:
                f"· {relationship_count:,} relationships · all nodes included</span>"
                f"<span>{activity_label}</span>"
                "<div><button id=\"fit-all\" type=\"button\">Fit all</button>"
-               "<a href=\"/explorer\">Detailed explorer</a></div></nav>")
+               f"<a href=\"/explorer\">Detailed explorer</a>{processes_link}</div></nav>")
     html = _replace_once(html, '<div id="graph"></div>', toolbar + '\n<div id="graph"></div>')
     html = _component_filters(html)
 

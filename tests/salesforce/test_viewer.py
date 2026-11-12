@@ -321,7 +321,8 @@ def test_server_rejects_non_loopback_before_loading(host, monkeypatch):
         viewer.create_server(Path("unused"), host=host, port=0)
 
 
-def test_registered_http_routes_integrity_and_host_isolation(bundle, tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_processes", [False, True])
+def test_registered_http_routes_integrity_and_host_isolation(bundle, tmp_path, monkeypatch, capsys, with_processes):
     source = tmp_path / "synthetic-source"
     source.mkdir()
     output = tmp_path / "snapshot"
@@ -332,7 +333,25 @@ def test_registered_http_routes_integrity_and_host_isolation(bundle, tmp_path, m
         calls.append(path)
         return real_load(path)
     monkeypatch.setattr(viewer, "load", counted_load)
-    server = viewer.create_server(output, port=0)
+    catalog_path = None
+    if with_processes:
+        catalog_path = tmp_path / "processes.json"
+        evidence = {"path": location()["path"], "line": 4, "label": "Read the field"}
+        field = cid("field", "Account.Name")
+        step = {
+            "id": "inspect", "label": "Inspect", "kind": "start", "description": "Inspect one field.",
+            "components": [cid("flow", "Update_Account"), field],
+            "effects": [{"kind": "read", "summary": "Read the name.", "component": field, "evidence": [evidence]}],
+            "evidence": [evidence],
+        }
+        process = {"id": "example", "title": "Example", "summary": "One step.", "steps": [step], "edges": []}
+        missing = cid("apexclass", "MissingClass")
+        missing_step = {**step, "components": [missing], "effects": []}
+        incomplete = {**process, "id": "incomplete", "title": "Incomplete", "steps": [missing_step]}
+        feature = {"id": "example_feature", "name": "Example feature", "processes": [process, incomplete]}
+        catalog = {"source_revision": "1" * 40, "countries": [{"id": "XX", "name": "Example", "features": [feature]}]}
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    server = viewer.create_server(output, port=0, process_maps=catalog_path)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     def request(path, headers=None):
@@ -365,7 +384,48 @@ def test_registered_http_routes_integrity_and_host_isolation(bundle, tmp_path, m
         assert code == 200 and json.loads(body)["total"] == 0
         assert request("/api/diagnostics?component=missing")[0] == 400
         assert request("/api/diagnostics?component=missing&offset=-1")[0] == 400
-        assert json.loads(request("/api/meta")[2])["coverage"]["unsupported_inventory_files"] == 1
+        meta = json.loads(request("/api/meta")[2])
+        assert meta["coverage"]["unsupported_inventory_files"] == 1
+        assert meta["processes_available"] is with_processes
+        assert request("/processes")[0] == (200 if with_processes else 404)
+        code, _, body = request("/api/processes")
+        assert code == (200 if with_processes else 404)
+        if with_processes:
+            from graphify.salesforce import cli, process_registration
+
+            result = json.loads(body)
+            assert result["snapshot_id"] == bundle["manifest"]["snapshot_id"]
+            complete_map, incomplete_map = result["countries"][0]["features"][0]["processes"]
+            assert "review_status" not in complete_map
+            assert incomplete_map["review_status"] == "needs_review"
+            assert incomplete_map["steps"][0]["missing_components"] == [missing]
+            actual = complete_map["steps"][0]
+            assert [item["id"] for item in actual["components"]] == step["components"]
+            match, = actual["effects"][0]["evidence"][0]["snapshot_matches"]
+            assert match["rule"] == "synthetic.reads"
+            assert request("/api/evidence?" + urlencode({"relationship": match["relationship"]}))[0] == 200
+            assert request("/api/processes", {"Origin": "https://attacker.invalid"})[0] == 403
+            assert request("/processes.css")[0] == request("/processes.js")[0] == 200
+            registration = {key: result[key] for key in ("source_revision", "snapshot_id", "catalog_digest")}
+            registration.update({"snapshot": str(output), "catalog": str(catalog_path), "port": server.server_port})
+            monkeypatch.setattr(process_registration, "load_process_registration", lambda _: registration)
+            assert cli.main(["processes", "show", "example", "--step", "inspect"]) == 0
+            found = json.loads(capsys.readouterr().out)
+            assert found["viewer_url"] == f"http://127.0.0.1:{server.server_port}"
+            assert found["process"]["viewer_path"] == "/processes#country=XX&process=example&step=inspect"
+            assert found["step"]["effects"] == actual["effects"]
+            assert cli.main(["processes", "list", "--component", "Account.Name"]) == 0
+            assert [item["id"] for item in json.loads(capsys.readouterr().out)["results"]] == ["example"]
+            assert cli.main(["processes", "status"]) == 0
+            status = json.loads(capsys.readouterr().out)
+            assert status["registered_files"] == "match" and status["snapshot"] == str(output)
+            assert cli.main(["refs", "Account.Name", "--registered"]) == 0
+            assert json.loads(capsys.readouterr().out)["snapshot_id"] == registration["snapshot_id"]
+            assert catalog_path is not None
+            with catalog_path.open("ab") as handle:
+                handle.write(b"\n")
+            assert cli.main(["processes", "list"]) == 1
+            assert "register again" in json.loads(capsys.readouterr().out)["error"]
         assert request("/api/meta", {"Host": "attacker.invalid"})[0] == 403
         assert request("/api/meta", {"Origin": "https://attacker.invalid"})[0] == 403
         for path in ("/../SOURCE.json", "/%2e%2e/SOURCE.json", "/facts.json", "/source", "/api/unknown"):

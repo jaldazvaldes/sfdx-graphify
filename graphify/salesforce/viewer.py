@@ -344,6 +344,9 @@ class SnapshotView:
             "schema": "Declared field ownership, lookup references, and explicit custom metadata record values.",
             "permissions": "Explicit grants in local Profile and PermissionSet XML. Effective access depends on assignments and org configuration.",
         }[mode]
+        if (mode == "permissions" and
+                self.bundle["manifest"].get("coverage", {}).get("permission_selection", {}).get("included") is False):
+            note = "Permission extraction was disabled for the current snapshot. Use build --include-permissions to extract declared grants."
         return {"snapshot_id": self.manifest_id, "focus": self._node(component),
                 "mode": mode, "depth": depth, "status_filter": status,
                 "nodes": [self._node(cid, levels[cid]) for cid in sorted(shown, key=lambda cid: (levels[cid], cid))],
@@ -411,7 +414,8 @@ def build_view(bundle: dict, component: str, *, mode: str = "impact", depth: int
 
 
 def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
-                  *, before: Path | None = None) -> ThreadingHTTPServer:
+                  *, before: Path | None = None, process_maps: Path | None = None,
+                  expected_process_identity: dict | None = None) -> ThreadingHTTPServer:
     """Load verified snapshots once and bind only to an explicit loopback address."""
     from http.server import BaseHTTPRequestHandler
     from .listener import LoopbackHTTPServer
@@ -429,16 +433,30 @@ def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
     if not parsed_address.is_loopback or not 0 <= port <= 65535:
         raise DataError("The viewer requires a loopback address and a valid local port.")
     model = SnapshotView(load(snapshot), load(before) if before is not None else None)
+    catalog = None
+    if process_maps is not None:
+        from .process_maps import load_process_maps, require_process_identity
+
+        catalog = load_process_maps(process_maps, model)
+        if expected_process_identity is not None:
+            require_process_identity(catalog, expected_process_identity)
+    model.metadata["processes_available"] = catalog is not None
     resources = files("graphify.salesforce").joinpath("viewer_static")
     from .standard_graph import standard_assets
 
-    graph_assets = standard_assets(model.bundle)
+    graph_assets = standard_assets(model.bundle, processes_available=catalog is not None)
     assets = {**graph_assets,
               "/explorer": (resources.joinpath("index.html").read_bytes(), "text/html; charset=utf-8"),
               "/vis-network.min.js": (resources.joinpath("vis-network.min.js").read_bytes(),
                                       "text/javascript; charset=utf-8"),
               "/viewer.css": (resources.joinpath("viewer.css").read_bytes(), "text/css; charset=utf-8"),
               "/viewer.js": (resources.joinpath("viewer.js").read_bytes(), "text/javascript; charset=utf-8")}
+    if catalog is not None:
+        assets.update({
+            "/processes": (resources.joinpath("process.html").read_bytes(), "text/html; charset=utf-8"),
+            "/processes.css": (resources.joinpath("processes.css").read_bytes(), "text/css; charset=utf-8"),
+            "/processes.js": (resources.joinpath("processes.js").read_bytes(), "text/javascript; charset=utf-8"),
+        })
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -482,6 +500,8 @@ def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
                                         csp=GRAPH_CSP if target.path in graph_assets else CSP)
                 if target.path == "/api/meta" and not params:
                     return self.respond(200, model.metadata)
+                if target.path == "/api/processes" and catalog is not None and not params:
+                    return self.respond(200, catalog)
                 if target.path == "/api/search" and set(params) <= {"query"}:
                     return self.respond(200, model.search(params.get("query", "")))
                 if target.path == "/api/view" and set(params) <= {"component", "mode", "depth", "status"}:
@@ -507,8 +527,10 @@ def create_server(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
 
 
 def serve(snapshot: Path, host: str = "127.0.0.1", port: int = 8767,
-          *, before: Path | None = None) -> None:
-    server = create_server(snapshot, host, port, before=before)
+          *, before: Path | None = None, process_maps: Path | None = None,
+          expected_process_identity: dict | None = None) -> None:
+    server = create_server(snapshot, host, port, before=before, process_maps=process_maps,
+                           expected_process_identity=expected_process_identity)
     bound_host, bound_port = cast(tuple[str, int], server.server_address)[:2]
     literal = f"[{bound_host}]" if ":" in bound_host else bound_host
     print(f"Local Salesforce viewer: http://{literal}:{bound_port}", flush=True)

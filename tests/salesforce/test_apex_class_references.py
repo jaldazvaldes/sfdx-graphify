@@ -114,7 +114,10 @@ def test_construction_references_include_explicit_receivers_and_async_arguments(
         "sf:apexclass:worker", "sf:apexclass:samplebatch"}
     assert all(store.relationships[item["relationship_id"]]["relation"] == "references" for item in references)
     outbound = [edge for edge in store.relationships.values() if edge["source"] == "sf:apexmethod:launcher.run"]
-    assert {edge["target"] for edge in outbound if edge["relation"] == "calls"} == {"sf:apexmethod:worker.prepare"}
+    assert {edge["target"] for edge in outbound if edge["relation"] == "calls"} == {
+        "sf:apexmethod:worker.prepare", "sf:apexmethod:worker.execute", "sf:apexmethod:samplebatch.start",
+        "sf:apexmethod:samplebatch.execute", "sf:apexmethod:samplebatch.finish",
+    }
     assert {edge["target"] for edge in outbound if edge["relation"] == "reads"} == {"sf:field:account.name"}
 
 
@@ -122,7 +125,7 @@ def test_construction_references_include_explicit_receivers_and_async_arguments(
     ("Missing", [], [], ""),
     ("Broken", [("Broken", "public class Broken { invalid(")], [], ""),
     ("Worker", [("Worker", "public class Worker {}"), ("other/Worker", "public class Worker {}")], [], ""),
-    ("Worker", [("Worker", "public class Worker {}")], [], "public class Worker {}"),
+    ("Worker", [("Worker", "public class Worker {}")], [], "public interface Worker {}"),
     ("Record__c", [("Record__c", "public class Record__c {}")], [setting("Record__c", None)], ""),
     ("Account", [("Account", "public class Account {}")], [], ""),
 ])
@@ -179,6 +182,52 @@ def test_same_arity_overloads_require_exact_lexical_argument_types_or_casts():
     assert unresolved[14]["signatures"] == ["Selector.pick(Id)", "Selector.pick(Set<Id>)"]
     assert unresolved[17]["signatures"] == ["Worker.pick(Id)", "Worker.pick(Set<Id>)"]
     assert all(item["state"] == "ambiguous" for item in unresolved.values())
+
+
+def test_same_arity_sobject_overloads_resolve_lexical_types_and_explicit_casts():
+    caller = """public class Caller {
+      void run(Account row, List<Sample__c> customRows, SObject unknown) {
+        Selector.pick(row);
+        Selector.pick((Contact) unknown);
+        Selector.pick(customRows);
+        Selector.pick(unknown);
+        Selector.pick(null);
+      }
+    }"""
+    selector = """public class Selector {
+      public static void pick(Account row) {}
+      public static void pick(Contact row) {}
+      public static void pick(List<Sample__c> rows) {}
+    }"""
+    store = build([("Caller", caller), ("Selector", selector)], metadata=[setting("Sample__c", None)])
+    selections = {
+        item["line"]: store.relationships[item["relationship_id"]]["target"]
+        for item in store.evidence.values()
+        if item["resolution"].get("overload_resolution", {}).get("basis") == "exact_sobject_argument_types"
+    }
+    assert selections == {
+        3: component_id("apexmethod", "Selector.pick(Account)"),
+        4: component_id("apexmethod", "Selector.pick(Contact)"),
+        5: component_id("apexmethod", "Selector.pick(List<Sample__c>)"),
+    }
+    assert {item["location"]["line"] for item in store.diagnostics
+            if item["code"] == "APEX_CALL_UNRESOLVED"} == {6, 7}
+
+
+@pytest.mark.parametrize("type_name,inner_type,metadata", [
+    ("Account", "public class Account {}", []),
+    ("Sample__c", "", []),
+    ("Sample__c", "", [setting("Sample__c", None), setting("Sample__c", None, package="other-app")]),
+])
+def test_sobject_overloads_require_unshadowed_standard_types_or_unique_object_definitions(
+        type_name, inner_type, metadata):
+    caller = f"public class Caller {{ void run({type_name} row) {{ Selector.pick(row); }} }}"
+    selector = (f"public class Selector {{ {inner_type} public static void pick({type_name} row) {{}} "
+                "public static void pick(Contact row) {} }")
+    store = build([("Caller", caller), ("Selector", selector)], metadata=metadata)
+    assert not any(edge["relation"] == "calls" for edge in store.relationships.values())
+    assert any(item["code"] == "APEX_CALL_UNRESOLVED" and item["state"] == "ambiguous"
+               for item in store.diagnostics)
 
 
 @pytest.mark.parametrize("selector,extra", [

@@ -80,12 +80,36 @@ def _no_links(path: Path) -> None:
             raise DataError("Cannot inspect snapshot path") from exc
 
 
-def default_output(root: Path) -> Path:
-    """Keep private derived data outside the source and the tool checkout."""
+def _local_storage() -> Path:
     base = (Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
             if os.name == "nt" else Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))))
+    return base / "sfdx-graphify"
+
+
+def _checkout_directory(base: Path, root: Path) -> Path:
     identity = _sha(os.path.normcase(str(Path(root).expanduser().resolve())).encode("utf-8"))
-    return validate_output(base / "sfdx-graphify" / identity, source_root=root)
+    return validate_output(base / identity, source_root=root)
+
+
+def local_project_directory(root: Path) -> Path:
+    """Resolve the local directory for per-checkout settings."""
+    return _checkout_directory(_local_storage(), root)
+
+
+def default_output(root: Path) -> Path:
+    """Keep private derived data outside the source and the tool checkout."""
+    setting = _local_storage() / "snapshot-root.txt"
+    _no_links(setting)
+    try:
+        configured = _read_limited(setting, _MAX_POINTER_BYTES).decode("utf-8-sig").strip()
+    except FileNotFoundError:
+        return local_project_directory(root)
+    except (OSError, UnicodeError) as exc:
+        raise DataError("Cannot read the snapshot root from snapshot-root.txt") from exc
+    base = Path(configured).expanduser()
+    if not base.is_absolute():
+        raise DataError("snapshot-root.txt must contain an absolute snapshot directory")
+    return _checkout_directory(base, root)
 
 
 def validate_output(out: Path, source_root: Path | None = None) -> Path:

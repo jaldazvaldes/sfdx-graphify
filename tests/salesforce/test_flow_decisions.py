@@ -123,7 +123,7 @@ def test_unknown_decision_extensions_and_other_conditions_are_not_walked_as_deci
     assert decision_edges(facts) == []
     assert not any(item["kind"] == "field" for item in facts["components"])
     assert {item["code"] for item in diagnostics} >= {
-        "FLOW_DECISION_CONDITION_UNSUPPORTED", "FLOW_XML_ELEMENT_UNSUPPORTED", "FLOW_CONSTRUCT_UNSUPPORTED"}
+        "FLOW_DECISION_CONDITION_UNSUPPORTED", "FLOW_XML_ELEMENT_UNSUPPORTED"}
 
 
 @pytest.mark.parametrize("duplicate", [

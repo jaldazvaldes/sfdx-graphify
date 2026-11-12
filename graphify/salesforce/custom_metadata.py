@@ -27,7 +27,7 @@ _LOCAL_TYPES = {
     **dict.fromkeys(("text", "textarea", "longtextarea", "phone", "url", "email", "picklist",
                      "metadatarelationship", "date", "datetime"), "string"),
 }
-_MENTION_KINDS = frozenset({"apexclass", "flow", "field"})
+_MENTION_KINDS = frozenset({"apexclass", "flow", "field", "object"})
 
 
 def _record_documents(documents, store):
@@ -58,8 +58,9 @@ def index_custom_metadata(documents: list[Document], store: FactStore) -> None:
         store.ensure_component("custommetadatarecord", name, document.location(document.root))
 
 
-def _explicit_values(document, store):
+def _value_fields(document, store):
     fields: dict[str, list[tuple[str, Node]]] = defaultdict(list)
+    complete = True
     for row in document.root.all("values"):
         names = row.all("field")
         if (len(names) != 1 or names[0].children or not API_NAME.fullmatch(names[0].text)
@@ -69,9 +70,14 @@ def _explicit_values(document, store):
                 "Expected one unqualified custom field API name.",
                 document.location(names[0] if names else row), state="unresolved",
             )
+            complete = False
             continue
         name = names[0].text
         fields[name.casefold()].append((name, row))
+    return fields, complete
+
+
+def _explicit_values(document, store, fields):
     for declarations in fields.values():
         name, row = declarations[0]
         if len(declarations) != 1:
@@ -209,7 +215,11 @@ def extract_custom_metadata(documents: list[Document], store: FactStore) -> None
             source, owner_id, "instance_of", root_location, "custom_metadata.type",
             resolution={"basis": "custom_metadata_record_filename"},
         )
-        for field_name, node in _explicit_values(document, store):
+        fields, complete = _value_fields(document, store)
+        store.components[source]["custom_metadata_field_inventory"] = {
+            "fields": sorted(fields), "complete": complete,
+        }
+        for field_name, node in _explicit_values(document, store, fields):
             location = document.location(node)
             qualified = f"{owner}.{field_name}"
             target_id = _declared_component(store, "field", qualified, location, "FIELD")
@@ -232,4 +242,47 @@ def extract_custom_metadata(documents: list[Document], store: FactStore) -> None
             )
             if isinstance(value, str) and proof["source_type"] != "untyped_literal":
                 _add_mention(store, source, location, mentions.get(value))
+
+
+def index_custom_metadata_defaults(documents: list[Document], store: FactStore) -> None:
+    """Keep explicitly declared checkbox defaults and their XML locations."""
+    from .inventory import identity
+
+    for document in documents:
+        if document.root.tag != "CustomField" or document.root.value("type").casefold() != "checkbox":
+            continue
+        kind, name = identity(document)
+        if not name.split(".", 1)[0].casefold().endswith("__mdt"):
+            continue
+        component = store.components[component_id(kind, name)]
+        defaults = document.root.all("defaultValue")
+        if (component["definition_status"] != "defined" or len(defaults) != 1
+                or defaults[0].children or defaults[0].text not in _BOOLEANS
+                or document.root.all("defaultValueFormula")):
+            continue
+        component["declared_default"] = {"value_type": "boolean", "value": _BOOLEANS[defaults[0].text],
+                                         "location": document.location(defaults[0])}
+
+
+def field_default_summary(field, relationships, components):
+    default = field.get("declared_default")
+    if default is None:
+        return {}
+    owner, name = field["api_name"].casefold().split(".", 1)
+    owner_id = component_id("object", owner)
+    record_ids = set()
+    explicit_ids = set()
+    for edge in relationships:
+        if edge["relation"] == "instance_of" and edge["target"] == owner_id:
+            record_ids.add(edge["source"])
+        elif edge["relation"] == "sets_value" and edge["target"] == field["id"]:
+            explicit_ids.add(edge["source"])
+    omitted = unresolved = 0
+    for record_id in record_ids - explicit_ids:
+        inventory = components[record_id].get("custom_metadata_field_inventory", {})
+        if inventory.get("complete") is True and name not in inventory["fields"]:
+            omitted += 1
+        else:
+            unresolved += 1
+    return {"declared_default": default, "omitted_record_count": omitted, "unresolved_record_count": unresolved}
 

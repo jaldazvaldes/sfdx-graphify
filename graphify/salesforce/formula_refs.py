@@ -14,6 +14,7 @@ from .schema import API_NAME
 _NAME = r"\$?[A-Za-z_][A-Za-z0-9_]*"
 _IDENTIFIER = re.compile(_NAME)
 _PATH = re.compile(_NAME + r"(?:\." + _NAME + r")*")
+COLLECTION_ITEM_REFERENCE = re.compile(rf"({_NAME})\[\$EachItem\]((?:\.[A-Za-z_][A-Za-z0-9_]*)+)")
 _NUMBER = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 _NON_REFERENCES = frozenset({"true", "false", "null", "not"})
 _GLOBAL_OBJECTS = {"$user": "User", "$profile": "Profile", "$organization": "Organization", "$userrole": "UserRole"}
@@ -145,7 +146,7 @@ def _next_code(expression, start):
     return cursor
 
 
-def formula_references(expression: str) -> tuple[list[FormulaReference], list[str]]:
+def formula_references(expression: str, *, allow_collection_item: bool = False) -> tuple[list[FormulaReference], list[str]]:
     """Return literal candidate references and syntax limitations, in order."""
     result, issues = [], []
     i = 0
@@ -185,7 +186,7 @@ def formula_references(expression: str) -> tuple[list[FormulaReference], list[st
                 issues.append("unterminated_merge_reference")
                 break
             text = expression[i + 2:end].strip()
-            if _PATH.fullmatch(text):
+            if _PATH.fullmatch(text) or (allow_collection_item and COLLECTION_ITEM_REFERENCE.fullmatch(text)):
                 result.append(FormulaReference(text, i))
             else:
                 issues.append("nonliteral_merge_reference")

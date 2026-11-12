@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 import hashlib
+import math
 import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
@@ -24,6 +26,7 @@ PARSER_VERSION = "tree-sitter-language-pack==0.11.0/apex"
 _PRIMITIVES = frozenset("blob boolean date datetime decimal double id integer long object sobject string time void aggregateresult exception".split())
 # A bounded standard type vocabulary, not a complete Salesforce schema.
 _STANDARD_OBJECTS = frozenset("account contact lead opportunity case task event user group order orderitem asset campaign campaignmember product2 pricebook2 pricebookentry contract quote quotelineitem contentversion contentdocument contentdocumentlink recordtype".split())
+_CLASS_LITERAL_STANDARD_OBJECTS = _STANDARD_OBJECTS | {"asyncapexjob"}
 _DML = frozenset({"insert", "update", "upsert", "delete", "undelete"})
 _DYNAMIC_SOQL = frozenset({"query", "querywithbinds", "countquery", "countquerywithbinds", "getquerylocator", "getquerylocatorwithbinds"})
 _COMMENTS = frozenset({"line_comment", "block_comment"})
@@ -32,6 +35,28 @@ _MAX_SOURCE_BYTES = 8 * 1024 * 1024
 _MAX_NODES = 200_000
 _RESERVED_RECEIVERS = frozenset({"trigger", "system", "schema", "database", "label", "page", "apexpages"})
 _BUILTIN_COLLECTION_ARITY = {"list": 1, "set": 1, "map": 2}
+# https://developer.salesforce.com/docs/platform/apex-dev/references/apex-dev/langcon-apex-primitives.html
+_STRING_ESCAPES = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", "s": " ",
+                   "'": "'", '"': '"', "\\": "\\"}
+_MAX_ASSIGNED_STRING_LENGTH = 1024
+_NUMERIC_LITERALS = {"int", "decimal_floating_point_literal"}
+# https://developer.salesforce.com/docs/platform/salesforce-soql-sosl/guide/sforce-api-calls-soql-relationships-understanding.html
+_STANDARD_CHILDREN = {
+    ("account", "assets"): ("Asset", "Account"),
+    ("account", "cases"): ("Case", "Account"),
+    ("account", "contacts"): ("Contact", "Account"),
+}
+# API name, job argument position, accepted arities, and the job interface.
+_ASYNC_APIS = {
+    ("system", "enqueuejob"): ("System.enqueueJob", 0, {1, 2}, "Queueable"),
+    ("system", "schedule"): ("System.schedule", 2, {3}, "Schedulable"),
+    ("database", "executebatch"): ("Database.executeBatch", 0, {1, 2}, "Batchable"),
+}
+_ASYNC_ENTRIES = {
+    "Queueable": ("System", (("execute", 1),)),
+    "Schedulable": ("System", (("execute", 1),)),
+    "Batchable": ("Database", (("start", 1), ("execute", 2), ("finish", 1))),
+}
 
 
 def _parse_source(parser, data):
@@ -84,6 +109,55 @@ def _without_parentheses(node):
     return node
 
 
+def _assigned_literal(data, target):
+    """Read a scalar only from the explicit right operand of a field write."""
+    parent = target.parent
+    if parent is not None and parent.type == "field_access" and parent.child_by_field_name("field") == target:
+        target, parent = parent, parent.parent
+    if (parent is None or parent.type != "assignment_expression" or parent.child_by_field_name("left") != target
+            or _text(data, parent.child_by_field_name("operator")) != "="):
+        return None
+    operand = _without_parentheses(parent.child_by_field_name("right"))
+    if operand is None:
+        return None
+    value = operand
+    raw = _text(data, value)
+    if value.type == "string_literal":
+        if len(raw) > 2 * _MAX_ASSIGNED_STRING_LENGTH + 2:
+            return None
+        try:
+            decoded = re.sub(r"\\(.)", lambda match: _STRING_ESCAPES[match[1]], raw[1:-1])
+        except KeyError:
+            return None
+        return (operand, "string", decoded) if len(decoded) <= _MAX_ASSIGNED_STRING_LENGTH else None
+    if value.type == "boolean":
+        return operand, "boolean", raw.casefold() == "true"
+    if value.type == "null_literal":
+        return operand, "null", None
+    sign = ""
+    if value.type == "unary_expression":
+        sign = _text(data, value.child_by_field_name("operator"))
+        if sign not in {"-", "+"}:
+            return None
+        value = _without_parentheses(value.child_by_field_name("operand"))
+        raw = _text(data, value)
+    if value is None or value.type not in _NUMERIC_LITERALS:
+        return None
+    spelling = sign + raw.rstrip("lLdDfF")
+    if len(spelling) > 128:
+        return None
+    try:
+        if value.type == "int":
+            number = int(spelling)
+        else:
+            number = float(spelling)
+            if not math.isfinite(number) or Decimal(str(number)) != Decimal(spelling):
+                return None
+    except (ValueError, InvalidOperation):
+        return None
+    return operand, "number", number
+
+
 def _text(data, node):
     return data[node.start_byte:node.end_byte].decode("utf-8") if node is not None else ""
 
@@ -113,6 +187,7 @@ class Unit:
     is_test: bool = False
     parse_error: bool = False
     member_declarations: dict[str, list[Member]] = field(default_factory=dict)
+    enclosing: Unit | None = None
 
     def text(self, node):
         return _text(self.data, node)
@@ -202,6 +277,10 @@ def _list_type(data, node):
 
 def _query_owner(unit, query):
     body = _child(query, "soql_query_body")
+    return _query_root(unit, body)
+
+
+def _query_root(unit, body):
     from_clause = body.child_by_field_name("from_clause") if body is not None else None
     children = _significant(from_clause)
     if from_clause is None or len(children) != 1:
@@ -221,11 +300,11 @@ def _constructor_definition(unit, node, store):
     body = node.child_by_field_name("body")
     flags, _ = _modifiers(unit.data, node)
     parameters = _significant(node.child_by_field_name("parameters"))
-    if (name.casefold() != unit.name.casefold() or body is None or body.type != "constructor_body"
+    if (name.casefold() != unit.name.rsplit(".", 1)[-1].casefold() or body is None or body.type != "constructor_body"
             or flags & {"static", "abstract", "virtual", "override"}
             or any(item.type != "formal_parameter" for item in parameters)):
         store.diagnostic("APEX_CONSTRUCTOR_DECLARATION_UNSUPPORTED",
-                         "Expected a non-static constructor matching its outer class.",
+                         "Expected a non-static constructor matching its class.",
                          unit.location(node), state="unresolved")
         return None
     types = tuple(_parameter_type(unit, parameter) for parameter in parameters)
@@ -243,8 +322,100 @@ def _constructor_definition(unit, node, store):
                   parameter_count=len(parameters), is_test=unit.is_test, parameter_types=types, api_name=api_name)
 
 
+def _index_class_members(unit, index, store):
+    cls, data, name = unit.class_node, unit.data, unit.name
+    body = cls.child_by_field_name("body")
+    if body is None:
+        return
+    unit.has_superclass = cls.child_by_field_name("superclass") is not None
+    if unit.has_superclass:
+        superclass = cls.child_by_field_name("superclass")
+        candidates = [n for n in _significant(superclass) if n.type in {"type_identifier", "scoped_type_identifier"}]
+        parent_name = unit.text(candidates[0]) if len(candidates) == 1 else ""
+        if parent_name and all(API_NAME.fullmatch(p) for p in parent_name.split(".")):
+            if unit.enclosing is not None and parent_name.casefold() in unit.enclosing.declared_types:
+                parent_name = f"{unit.enclosing.name}.{parent_name}"
+            unit.superclass_name = parent_name
+    for member in body.named_children:
+        if member.type == "field_declaration":
+            type_node = member.child_by_field_name("type")
+            flags = frozenset(_modifiers(data, member)[0])
+            for declaration in member.named_children:
+                if declaration.type == "variable_declarator":
+                    member_name = unit.text(declaration.child_by_field_name("name")).casefold()
+                    unit.declared_members.add(member_name)
+                    if type_node is not None:
+                        unit.member_declarations.setdefault(member_name, []).append(
+                            Member(unit, declaration, type_node, flags))
+    for node in body.named_children:
+        if node.type in _IGNORED:
+            continue
+        if node.type == "constructor_declaration":
+            constructor = _constructor_definition(unit, node, store)
+            if constructor is not None:
+                index.constructors[unit.class_id].append(constructor)
+            continue
+        if node.type in {"static_initializer", "block"}:
+            store.diagnostic("APEX_CLASS_INITIALIZER_UNSUPPORTED", "Class initializer blocks are outside coverage.",
+                             unit.location(node), construct=node.type)
+            continue
+        if node.type == "class_declaration" and unit.enclosing is None:
+            continue  # Indexed separately with its own class and method IDs.
+        if node.type in {"class_declaration", "interface_declaration", "enum_declaration"}:
+            store.diagnostic("APEX_INNER_TYPE_UNSUPPORTED", "Nested inner classes, interfaces and enums are outside coverage.",
+                             unit.location(node), construct=node.type)
+            continue
+        if node.type != "method_declaration":
+            store.diagnostic("APEX_CLASS_MEMBER_UNSUPPORTED", "This class member body is outside dependency coverage.",
+                             unit.location(node), construct=node.type)
+            continue
+        method_name = unit.text(node.child_by_field_name("name"))
+        modifiers, annotations = _modifiers(data, node)
+        invocable = "invocablemethod" in annotations
+        params = node.child_by_field_name("parameters")
+        parameters = [p for p in params.named_children if p.type == "formal_parameter"] if params is not None else []
+        result_type = node.child_by_field_name("type")
+        supported_signature = (len(parameters) <= 1
+                               and all(_list_type(data, p.child_by_field_name("type")) for p in parameters)
+                               and (unit.text(result_type).casefold() == "void" or _list_type(data, result_type)))
+        valid = bool(invocable and unit.enclosing is None and "static" in modifiers and modifiers & {"public", "global"}
+                     and supported_signature and node.child_by_field_name("body") is not None
+                     and annotations <= {"invocablemethod", "deprecated"})
+        # Register methods after every class definition has been indexed.
+        # A unique method name does not disambiguate a duplicate owner class.
+        method_id = component_id("apexmethod", name + "." + method_name)
+        method = Method(unit, node, method_id, method_name, "static" in modifiers, invocable, valid, len(parameters),
+                        is_test=unit.is_test or "istest" in annotations or "testmethod" in modifiers,
+                        parameter_types=tuple(_parameter_type(unit, p) for p in parameters))
+        index.methods[unit.class_id].append(method)
+        if invocable and not valid:
+            store.diagnostic("APEX_INVOCABLE_SIGNATURE_UNSUPPORTED", "The invocable declaration does not satisfy the supported outer static public/global list signature.", unit.location(node))
+    invocables = [m for m in index.methods[unit.class_id] if m.invocable]
+    if len(invocables) > 1:
+        store.diagnostic("APEX_INVOCABLE_AMBIGUOUS", "More than one local invocable declaration names this class.", unit.location(cls), state="ambiguous")
+
+
+def _index_inner_classes(outer, index, store):
+    body = outer.class_node.child_by_field_name("body")
+    for node in _significant(body):
+        if node.type != "class_declaration":
+            continue
+        simple_name = outer.text(node.child_by_field_name("name"))
+        name = f"{outer.name}.{simple_name}"
+        class_id = component_id("apexclass", name)
+        unit = Unit(outer.path, outer.data, outer.tree, node, class_id, name,
+                    outer.content_hash, outer.line_offsets, enclosing=outer)
+        unit.is_test = outer.is_test or "istest" in _modifiers(unit.data, node)[1]
+        unit.declared_types.update(outer.declared_types)
+        definition = unit.location(node)
+        store.ensure_component("apexclass", name, definition, inventory_method="apex_ast", parser=PARSER_VERSION,
+                               is_test=unit.is_test, enclosing_class=outer.class_id)
+        index.units.append(unit)
+        _index_class_members(unit, index, store)
+
+
 def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
-    """Index outer methods and constructors from complete class parses."""
+    """Index Apex methods and constructors, including directly enclosed classes."""
     index = ApexIndex(object_names={c["api_name"].casefold() for c in store.components.values() if c["kind"] == "object"})
     index.namespaces.update(str(c["namespace"]).casefold() for c in store.components.values()
                             if c.get("namespace") and c.get("definition_status") == "defined")
@@ -309,71 +480,10 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
                 owner = _query_owner(unit, node)
                 if owner:
                     index.object_names.add(owner.casefold())
-        body = cls.child_by_field_name("body")
-        if body is None:
-            continue
-        unit.has_superclass = cls.child_by_field_name("superclass") is not None
-        if unit.has_superclass:
-            superclass = cls.child_by_field_name("superclass")
-            candidates = [n for n in _significant(superclass) if n.type in {"type_identifier", "scoped_type_identifier"}]
-            parent_name = unit.text(candidates[0]) if len(candidates) == 1 else ""
-            if parent_name and all(API_NAME.fullmatch(p) for p in parent_name.split(".")):
-                unit.superclass_name = parent_name
-        for member in body.named_children:
-            if member.type == "field_declaration":
-                type_node = member.child_by_field_name("type")
-                flags = frozenset(_modifiers(data, member)[0])
-                for declaration in member.named_children:
-                    if declaration.type == "variable_declarator":
-                        member_name = unit.text(declaration.child_by_field_name("name")).casefold()
-                        unit.declared_members.add(member_name)
-                        if type_node is not None:
-                            unit.member_declarations.setdefault(member_name, []).append(
-                                Member(unit, declaration, type_node, flags))
-        for node in body.named_children:
-            if node.type in _IGNORED:
-                continue
-            if node.type == "constructor_declaration":
-                constructor = _constructor_definition(unit, node, store)
-                if constructor is not None:
-                    index.constructors[unit.class_id].append(constructor)
-                continue
-            if node.type in {"static_initializer", "block"}:
-                store.diagnostic("APEX_CLASS_INITIALIZER_UNSUPPORTED", "Class initializer blocks are outside coverage.",
-                                 unit.location(node), construct=node.type)
-                continue
-            if node.type in {"class_declaration", "interface_declaration", "enum_declaration"}:
-                store.diagnostic("APEX_INNER_TYPE_UNSUPPORTED", "Inner Apex type bodies are outside coverage.",
-                                 unit.location(node), construct=node.type)
-                continue
-            if node.type != "method_declaration":
-                store.diagnostic("APEX_CLASS_MEMBER_UNSUPPORTED", "This outer class member body is outside dependency coverage.",
-                                 unit.location(node), construct=node.type)
-                continue
-            method_name = unit.text(node.child_by_field_name("name"))
-            modifiers, annotations = _modifiers(data, node)
-            invocable = "invocablemethod" in annotations
-            params = node.child_by_field_name("parameters")
-            parameters = [p for p in params.named_children if p.type == "formal_parameter"] if params is not None else []
-            result_type = node.child_by_field_name("type")
-            supported_signature = (len(parameters) <= 1
-                                   and all(_list_type(data, p.child_by_field_name("type")) for p in parameters)
-                                   and (unit.text(result_type).casefold() == "void" or _list_type(data, result_type)))
-            valid = bool(invocable and "static" in modifiers and modifiers & {"public", "global"}
-                         and supported_signature and node.child_by_field_name("body") is not None
-                         and annotations <= {"invocablemethod", "deprecated"})
-            # Register methods after every class definition has been indexed.
-            # A unique method name does not disambiguate a duplicate owner class.
-            method_id = component_id("apexmethod", name + "." + method_name)
-            method = Method(unit, node, method_id, method_name, "static" in modifiers, invocable, valid, len(parameters),
-                            is_test=unit.is_test or "istest" in annotations or "testmethod" in modifiers,
-                            parameter_types=tuple(_parameter_type(unit, p) for p in parameters))
-            index.methods[unit.class_id].append(method)
-            if invocable and not valid:
-                store.diagnostic("APEX_INVOCABLE_SIGNATURE_UNSUPPORTED", "The invocable declaration does not satisfy the supported outer static public/global list signature.", unit.location(node))
-        invocables = [m for m in index.methods[unit.class_id] if m.invocable]
-        if len(invocables) > 1:
-            store.diagnostic("APEX_INVOCABLE_AMBIGUOUS", "More than one local invocable declaration names this class.", unit.location(cls), state="ambiguous")
+        _index_class_members(unit, index, store)
+    for unit in list(index.units):
+        if not store.is_ambiguous(unit.class_id):
+            _index_inner_classes(unit, index, store)
     # Class names from failed/unsupported files also prevent object-type guessing.
     index.apex_types.update(PurePosixPath(path).name.removesuffix(".cls").casefold() for path in apex)
     index.units_by_class = {unit.class_id: unit for unit in index.units if not store.is_ambiguous(unit.class_id)}
@@ -390,11 +500,12 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
             overloads = [m for m in methods if m.name.casefold() == method.name.casefold()]
             method.api_name = method.qualified_name + ("(" + ",".join(method.parameter_types) + ")" if len(overloads) > 1 else "")
             method.id = component_id("apexmethod", method.api_name)
+            ownership = {"enclosing_class": class_id} if method.unit.enclosing is not None else {}
             store.ensure_component("apexmethod", method.api_name, method.unit.location(method.node),
                                    invocable=method.invocable, invocable_signature_supported=method.invocable_valid,
                                    static=method.static, parser=PARSER_VERSION, is_test=method.is_test,
                                    qualified_name=method.qualified_name, arity=method.parameter_count,
-                                   parameter_types=list(method.parameter_types))
+                                   parameter_types=list(method.parameter_types), **ownership)
         for method in methods:
             if store.is_ambiguous(method.id):
                 store.components[method.id]["is_test"] = None
@@ -411,11 +522,12 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
             constructors.clear()
             continue
         for constructor in constructors:
+            ownership = {"enclosing_class": class_id} if constructor.unit.enclosing is not None else {}
             store.ensure_component("apexmethod", constructor.api_name, constructor.unit.location(constructor.node),
                                    is_constructor=True, invocable=False, invocable_signature_supported=False,
                                    static=False, parser=PARSER_VERSION, is_test=constructor.is_test,
                                    qualified_name=constructor.qualified_name, arity=constructor.parameter_count,
-                                   parameter_types=list(constructor.parameter_types))
+                                   parameter_types=list(constructor.parameter_types), **ownership)
         for constructor in constructors:
             if store.is_ambiguous(constructor.id):
                 store.components[constructor.id]["is_test"] = None
@@ -626,17 +738,27 @@ class _MethodExtractor:
         hierarchy = self.qualifier_hierarchy
         if hierarchy is None and allow_external and self.external_hierarchy is not None:
             hierarchy = self.external_hierarchy[0]
+        folded = name.casefold()
+        enclosing = self.unit.enclosing
+        if enclosing is not None and any("static" in member.modifiers
+                                         for member in enclosing.member_declarations.get(folded, ())):
+            return False
         return (hierarchy is not None and not self.has_binding(name, node)
-                and all(name.casefold() not in unit.declared_members
-                        and name.casefold() not in unit.declared_types
+                and all(folded not in unit.declared_members and folded not in unit.declared_types
                         for unit in hierarchy))
 
-    def _builtin_overload_type(self, node):
+    def _exact_overload_type(self, node):
         if node is None:
             return None
         if node.type == "type_identifier":
             name = self.unit.text(node)
-            return name if name.casefold() in _PRIMITIVES else None
+            if name.casefold() in _PRIMITIVES or name.casefold() in _STANDARD_OBJECTS:
+                return name
+            if API_NAME.fullmatch(name):
+                definition = self.store.components.get(component_id("object", name), {})
+                if definition.get("definition_status") == "defined":
+                    return name
+            return None
         if node.type != "generic_type":
             return None
         parts = _significant(node)
@@ -648,7 +770,7 @@ class _MethodExtractor:
             return None
         types = []
         for argument in arguments:
-            argument_type = self._builtin_overload_type(argument)
+            argument_type = self._exact_overload_type(argument)
             if argument_type is None:
                 return None
             types.append(argument_type)
@@ -671,7 +793,7 @@ class _MethodExtractor:
         else:
             return None
         type_node = declaration.child_by_field_name("type") if declaration is not None else None
-        name = self._builtin_overload_type(type_node)
+        name = self._exact_overload_type(type_node)
         if name is None:
             return None
         return {"type": name, "basis": basis, "location": self.unit.location(type_node)}
@@ -695,12 +817,14 @@ class _MethodExtractor:
         if len(matches) != 1:
             return None, {}
         target = matches[0]
-        types = set(re.findall(r"[a-z]+", ",".join(signature)))
+        types = set(re.findall(r"[a-z_][a-z0-9_]*", ",".join(signature)))
         target_hierarchy = _class_hierarchy(self.index, self.store, target.unit.class_id)
         if (types & self.index.apex_types or target_hierarchy is None
                 or any(types & unit.declared_types for unit in self.qualifier_hierarchy + target_hierarchy)):
             return None, {}
-        return target, {"overload_resolution": {"basis": "exact_builtin_argument_types", "arguments": proof}}
+        basis = ("exact_sobject_argument_types" if types.difference(_PRIMITIVES, _BUILTIN_COLLECTION_ARITY)
+                 else "exact_builtin_argument_types")
+        return target, {"overload_resolution": {"basis": basis, "arguments": proof}}
 
     def _ambiguous_call(self, node, candidates, *, code="APEX_CALL_UNRESOLVED"):
         if len(candidates) < 2 and not any(self.store.is_ambiguous(method.id) for method in candidates):
@@ -717,9 +841,15 @@ class _MethodExtractor:
         location = self.unit.location(node)
         target = self.store.field(owner, name, location) if name else self.store.resolve_component("object", owner, location)
         if target:
+            proof = resolution or {"basis": "apex_ast", "parser": PARSER_VERSION, "object": owner}
+            if relation == "writes" and name is not None:
+                assigned_value = _assigned_literal(self.unit.data, node)
+                if assigned_value is not None:
+                    operand, kind, value = assigned_value
+                    proof = {**proof, "assigned_value": {"type": kind, "value": value},
+                             "assigned_value_location": self.unit.location(operand)}
             self.store.relation(self.method.id, target, relation, location, rule,
-                                resolution=resolution or {"basis": "apex_ast", "parser": PARSER_VERSION, "object": owner},
-                                qualifiers=qualifiers)
+                                resolution=proof, qualifiers=qualifiers)
 
     def _setting_owner(self, node):
         node = _without_parentheses(node)
@@ -870,19 +1000,105 @@ class _MethodExtractor:
         )
         return True
 
+    def _class_literal(self, node):
+        """Classify a type token without turning an unproven type into Apex.
+
+        Both sObjects and Apex classes use X.class. A qualified class token
+        needs a local enclosing class or a corroborated package namespace.
+        """
+        resource = node.child_by_field_name("object")
+        qualifier, name_node = None, resource
+        if resource is not None and resource.type == "field_access":
+            qualifier = resource.child_by_field_name("object")
+            name_node = resource.child_by_field_name("field")
+        pieces = [item for item in (qualifier, name_node) if item is not None]
+        if (not pieces or any(item.type != "identifier" or not API_NAME.fullmatch(self.unit.text(item)) for item in pieces)
+                or _child(node, "safe_navigation_operator") is not None
+                or (resource is not None and _child(resource, "safe_navigation_operator") is not None)):
+            self.diagnostic("APEX_CLASS_LITERAL_UNRESOLVED", "Expected a supported literal type qualifier.", node, "unresolved")
+            return
+        root = self.unit.text(pieces[0])
+        if not self.unshadowed_qualifier(root, node) or self._initializing_binding(root, node):
+            self.diagnostic("APEX_CLASS_LITERAL_UNRESOLVED", "The type qualifier may be a lexical or inherited declaration.",
+                            node, "unresolved")
+            return
+        name = self.unit.text(name_node)
+        folded = name.casefold()
+        object_proof = ("indexed_object" if folded in self.index.object_names
+                        else "standard_object_vocabulary" if folded in _CLASS_LITERAL_STANDARD_OBJECTS else None)
+        class_id = component_id("apexclass", name)
+        local_class = self.store.components.get(class_id)
+        has_class = bool(local_class and local_class["definitions"])
+        root_class = self.store.components.get(component_id("apexclass", root))
+        root_has_class = bool(root_class and root_class["definitions"])
+        kind, basis = None, None
+        if qualifier is None:
+            if object_proof and has_class:
+                self.diagnostic("APEX_CLASS_LITERAL_UNRESOLVED", "This name has both object and Apex class evidence.",
+                                node, "ambiguous")
+                return
+            if object_proof:
+                kind, basis = "object", "literal_sobject_type"
+            elif has_class:
+                kind, basis = "apexclass", "literal_class_token"
+        elif root.casefold() == "schema" and not root_has_class:
+            if object_proof:
+                kind, basis = "object", "literal_sobject_type"
+        elif self._visible_inner_class(root, name):
+            name = root + "." + name
+            kind, basis = "apexclass", "local_inner_class_token"
+        elif (root.casefold() in self.index.namespaces and not root_has_class
+                and root.casefold() not in _RESERVED_RECEIVERS
+                and root.casefold() not in self.index.object_names and root.casefold() not in _CLASS_LITERAL_STANDARD_OBJECTS):
+            name = root + "." + name
+            kind, basis = "apexclass", "literal_class_token"
+        if kind is None:
+            self.diagnostic("APEX_CLASS_LITERAL_UNRESOLVED", "No unique supported object or Apex class type is established.",
+                            node, "unresolved")
+            return
+        location = self.unit.location(node)
+        target = self.store.resolve_component(kind, name, location)
+        if target:
+            proof = {"basis": basis, "parser": PARSER_VERSION}
+            if kind == "object":
+                proof["object_proof"] = object_proof
+            self.store.relation(self.method.id, target, "references", location, "apex.class_literal",
+                                qualifiers={"context": "class_literal"}, resolution=proof)
+
+    def _record_member(self, receiver):
+        """Resolve a record from one field declared in the current Apex class."""
+        receiver = _without_parentheses(receiver)
+        if receiver is None:
+            return None
+        explicit = receiver.type == "field_access"
+        if explicit:
+            qualifier = receiver.child_by_field_name("object")
+            if qualifier is None or qualifier.type != "this" or _child(receiver, "safe_navigation_operator") is not None:
+                return None
+            receiver = receiver.child_by_field_name("field")
+        if receiver is None or receiver.type != "identifier":
+            return None
+        name = self.unit.text(receiver)
+        declarations = self.unit.member_declarations.get(name.casefold(), ())
+        if len(declarations) != 1:
+            return None
+        if not explicit and (self.has_binding(name, receiver) or self._initializing_binding(name, receiver)):
+            return None
+        member = declarations[0]
+        static = "static" in member.modifiers
+        if (explicit and (static or self.method.static)) or (self.method.static and not static):
+            return None
+        declaration = member.node.parent
+        if declaration is None or _child(declaration, "accessor_list") is not None:
+            return None
+        owner, collection = self.record_type(member.type_node)
+        return (owner, member) if owner and not collection else None
+
     def field_access(self, node, relation="reads", *, operation="field_access"):
         resource, field_node = node.child_by_field_name("object"), node.child_by_field_name("field")
         if field_node is not None and self.unit.text(field_node).casefold() == "class":
-            name = self.unit.text(resource)
-            pieces = name.split(".")
-            if (len(pieces) in {1, 2} and all(API_NAME.fullmatch(p) for p in pieces)
-                    and not self.has_binding(pieces[0], node) and pieces[0].casefold() not in self.unit.declared_members):
-                target = self.store.resolve_component("apexclass", name, self.unit.location(node))
-                if target:
-                    self.store.relation(self.method.id, target, "references", self.unit.location(node),
-                                        "apex.class_literal", qualifiers={"context": "class_literal"},
-                                        resolution={"basis": "literal_class_token", "parser": PARSER_VERSION})
-                return
+            self._class_literal(node)
+            return
         if self._static_member_reference(node, relation):
             return
         if resource is not None and resource.type != "identifier" and field_node is not None:
@@ -903,6 +1119,15 @@ class _MethodExtractor:
                            "declaration": {key: declaration[key] for key in ("path", "locator")}})
                 self.visit(selector)
                 return
+        member_receiver = self._record_member(resource)
+        if member_receiver is not None and field_node is not None and field_node.type == "identifier":
+            owner, member = member_receiver
+            declaration = member.unit.location(member.node)
+            self.edge(owner, self.unit.text(field_node), relation, node, "apex.member_record_field",
+                      {"operation": operation, "effect": "memory"},
+                      {"basis": "declared_record_member", "object": owner,
+                       "declaration": {key: declaration[key] for key in ("path", "locator")}})
+            return
         if resource is None or resource.type != "identifier" or field_node is None:
             self.diagnostic("APEX_FIELD_PATH_UNSUPPORTED", "Only one direct field on a typed local record is supported; paths and indexed collections are not truncated.", node)
             # Preserve calls inside a complex receiver without extracting a
@@ -931,16 +1156,8 @@ class _MethodExtractor:
         args = node.child_by_field_name("arguments")
         assignments = _significant(args)
         if not owner or collection:
-            name = self.unit.text(type_node)
-            cid = (component_id("apexclass", name)
-                   if type_node is not None and type_node.type == "type_identifier" and API_NAME.fullmatch(name)
-                   else None)
-            target = self.store.components.get(cid) if cid is not None else None
-            folded = name.casefold()
-            if (target and target["definition_status"] == "defined" and target.get("inventory_method") == "apex_ast"
-                    and folded not in self.index.object_names and folded not in _STANDARD_OBJECTS
-                    and self.qualifier_hierarchy is not None
-                    and all(folded not in unit.declared_types for unit in self.qualifier_hierarchy)):
+            cid = self._literal_local_class(type_node)
+            if cid:
                 self.store.relation(self.method.id, cid, "references", self.unit.location(node),
                                     self._constructor_reference_rule, qualifiers={"invocation": "constructor"},
                                     resolution={"basis": "literal_local_class", "parser": PARSER_VERSION})
@@ -1000,13 +1217,91 @@ class _MethodExtractor:
             qualifiers["security_mode"] = self.unit.text(security).casefold().removeprefix("as ")
         self.edge(owner, None, "writes", node, "apex.database_operation", qualifiers)
 
+    def constructor_delegation(self, node):
+        selector = self.unit.text(node.child_by_field_name("constructor")).casefold()
+        args = _significant(node.child_by_field_name("arguments"))
+        class_id = self.unit.class_id
+        if selector == "super":
+            parent_name = self.unit.superclass_name
+            class_id = component_id("apexclass", parent_name) if parent_name else None
+        candidates = [method for method in self.index.constructors.get(class_id, ())
+                      if method.parameter_count == len(args)
+                      and (selector == "this" or _modifiers(method.unit.data, method.node)[0] & {"public", "global", "protected"})]
+        target, overload = self._select_method(candidates, args)
+        if (selector in {"this", "super"} and target is not None and target.id != self.method.id
+                and not self.store.is_ambiguous(target.unit.class_id)):
+            self.store.relation(self.method.id, target.id, "calls", self.unit.location(node),
+                                "apex.constructor_delegation", qualifiers={"invocation": "constructor_delegation", "delegate": selector},
+                                resolution={"basis": "unique_local_constructor", "parser": PARSER_VERSION, **overload})
+        elif not self._ambiguous_call(node, candidates, code="APEX_CONSTRUCTOR_DELEGATION_UNRESOLVED"):
+            self.diagnostic("APEX_CONSTRUCTOR_DELEGATION_UNRESOLVED",
+                            "No unique accessible local constructor matches this explicit delegation.", node, "unresolved")
+        for arg in args:
+            self.visit(arg)
+
     def query(self, node):
-        owner = _query_owner(self.unit, node)
         body = _child(node, "soql_query_body")
+        owner = _query_root(self.unit, body)
         if not owner or body is None:
             self.diagnostic("APEX_SOQL_ROOT_UNSUPPORTED", "Static SOQL requires one literal root object without aliases or relationship traversal.", node)
             return None
-        self.edge(owner, None, "reads", node, "apex.static_soql_object", {"operation": "soql", "effect": "database", "field_set": "partial_explicit"})
+        self._query_body(node, body, owner)
+        return owner
+
+    def _soql_subquery(self, node, outer_owner, clause_name):
+        body = _child(node, "soql_query_body")
+        root = _query_root(self.unit, body)
+        if not root or body is None:
+            self.diagnostic("APEX_SOQL_SUBQUERY_UNRESOLVED", "This SOQL subquery requires one literal FROM name.", node)
+            return
+        parent = node.parent
+        operator = _child(parent, "set_comparison_operator") if parent is not None else None
+        if clause_name == "where" and operator is not None:
+            operator_name = " ".join(self.unit.text(operator).casefold().split())
+            if operator_name in {"in", "not in"}:
+                self._query_body(node, body, root, context="anti_join" if operator_name == "not in" else "semi_join")
+                return
+        if clause_name != "select" or parent is None or parent.type != "select_clause":
+            self.diagnostic("APEX_SOQL_SUBQUERY_UNRESOLVED", "Expected a child SELECT subquery or a WHERE semi-join.", node)
+            return
+        key = outer_owner.casefold(), root.casefold()
+        local = self.store.child_relationships.get(key, [])
+        standard = _STANDARD_CHILDREN.get(key)
+        owner, lookup_name, proof = None, None, None
+        if len(local) == 1:
+            field_id, schema_source = local[0]
+            field = self.store.components[field_id]
+            owner, lookup_name = field["api_name"].split(".")
+            if (not self.store.is_ambiguous(field_id)
+                    and (standard is None or standard[0].casefold() == owner.casefold())):
+                proof = {"basis": "declared_child_relationship", "schema_source": schema_source}
+        elif not local and standard is not None:
+            owner, parent_name = standard
+            lookup = resolve_source_field_path(self.store, owner, parent_name + ".Id")
+            if lookup and lookup["owner"].casefold() == outer_owner.casefold():
+                lookup_name = parent_name + "Id"
+                proof = {"basis": "standard_child_relationship"}
+        if (not owner or not lookup_name or proof is None
+                or any(self.store.components.get(component_id("object", name), {}).get("definition_status") == "ambiguous"
+                       for name in (outer_owner, owner))):
+            self.diagnostic("APEX_SOQL_CHILD_RELATIONSHIP_UNRESOLVED",
+                            "No unique declared or supported standard child relationship establishes the SELECT subquery object.", node,
+                            "ambiguous" if len(local) > 1 else "unresolved")
+            return
+        from_clause = body.child_by_field_name("from_clause")
+        location_node = _significant(from_clause)[0]
+        resolution = {**proof, "relationship_name": root, "parent_object": outer_owner,
+                      "lookup_field": component_id("field", owner + "." + lookup_name)}
+        self.edge(owner, lookup_name, "reads", location_node, "apex.static_soql_child_navigation",
+                  {"operation": "soql", "context": "apex_soql_child_navigation"}, resolution)
+        self._query_body(node, body, owner, context="child_subquery", resolution=resolution)
+
+    def _query_body(self, node, body, owner, *, context=None, resolution=None):
+        qualifiers = {"operation": "soql"}
+        if context:
+            qualifiers["query_context"] = context
+        self.edge(owner, None, "reads", node, "apex.static_soql_object",
+                  {**qualifiers, "effect": "database", "field_set": "partial_explicit"}, resolution)
         aliases = set()
         selected = body.child_by_field_name("select_clause")
         if selected is not None:
@@ -1024,8 +1319,11 @@ class _MethodExtractor:
         def clause(current, relation, clause_name):
             if current.type in _IGNORED:
                 return
-            if current.type in {"subquery", "type_of_clause", "fields_expression", "alias_expression"}:
-                self.diagnostic("APEX_SOQL_CONSTRUCT_UNSUPPORTED", "Subqueries, TYPEOF, wildcard field groups and aliases are outside bounded SOQL coverage.", current)
+            if current.type == "subquery":
+                self._soql_subquery(current, owner, clause_name)
+                return
+            if current.type in {"type_of_clause", "fields_expression", "alias_expression"}:
+                self.diagnostic("APEX_SOQL_CONSTRUCT_UNSUPPORTED", "TYPEOF, wildcard field groups and aliases are outside bounded SOQL coverage.", current)
                 return
             if current.type == "bound_apex_expression":
                 for expression in current.named_children:
@@ -1044,16 +1342,17 @@ class _MethodExtractor:
                     target = self.store.field(resolved["owner"], resolved["field"], location)
                     if target is None:
                         return
-                    resolution = {"basis": "declared_parent_path", "root_object": owner,
-                                  "steps": resolved["steps"], "parser": PARSER_VERSION}
-                    qualifiers = {"operation": "soql", "clause": clause_name}
+                    path_resolution = {"basis": "declared_parent_path", "root_object": owner,
+                                       "steps": resolved["steps"], "parser": PARSER_VERSION}
+                    path_qualifiers = {**qualifiers, "clause": clause_name}
                     self.store.relation(self.method.id, target, relation, location, "apex.static_soql_parent_field",
-                                        resolution=resolution, qualifiers={**qualifiers, "field_path": name})
+                                        resolution=path_resolution, qualifiers={**path_qualifiers, "field_path": name})
                     add_navigation_reads(self.store, self.method.id, location,
-                                         {**resolution, "relationship_path": name}, rule="apex.static_soql_navigation",
-                                         qualifiers={**qualifiers, "context": "apex_soql_navigation"})
+                                         {**path_resolution, "relationship_path": name}, rule="apex.static_soql_navigation",
+                                         qualifiers={**path_qualifiers, "context": "apex_soql_navigation"})
                 else:
-                    self.edge(owner, name, relation, current, "apex.static_soql_field", {"operation": "soql", "clause": clause_name})
+                    self.edge(owner, name, relation, current, "apex.static_soql_field",
+                              {**qualifiers, "clause": clause_name})
                 return
             for child in current.named_children:
                 clause(child, "filters" if child.type == "having_clause" else relation,
@@ -1071,13 +1370,16 @@ class _MethodExtractor:
                 self.diagnostic("APEX_SOQL_CLAUSE_UNSUPPORTED", "This SOQL clause is outside dependency extraction coverage.", current)
             else:
                 self.diagnostic("APEX_SOQL_CLAUSE_UNSUPPORTED", "The pinned grammar produced an unhandled SOQL clause.", current)
-        return owner
 
     def invocation(self, node):
         object_node, name_node = node.child_by_field_name("object"), node.child_by_field_name("name")
         object_name, name = self.unit.text(object_node), self.unit.text(name_node)
         args_node = node.child_by_field_name("arguments")
         args = _significant(args_node)
+        if self._platform_invocation(node, object_node, name, args):
+            for arg in args:
+                self.visit(arg)
+            return
         # A corroborated namespace.Class receiver is a type qualifier, not a
         # record field access. Resolve it before visiting arbitrary receivers;
         # argument expressions still carry their own dependencies/diagnostics.
@@ -1155,6 +1457,117 @@ class _MethodExtractor:
         for arg in args:
             self.visit(arg)
 
+    def _platform_invocation(self, node, receiver, name, args):
+        if receiver is None:
+            return False
+        name = name.casefold()
+        if receiver.type == "identifier":
+            qualifier = self.unit.text(receiver).casefold()
+            root = qualifier
+        elif (name == "publish" and receiver.type == "field_access"
+              and self.unit.text(receiver.child_by_field_name("object")).casefold() == "system"
+              and self.unit.text(receiver.child_by_field_name("field")).casefold() == "eventbus"):
+            qualifier, root = "eventbus", "system"
+        else:
+            return False
+        key = qualifier, name
+        if (key != ("eventbus", "publish") and key not in _ASYNC_APIS
+                or root in self.index.apex_types):
+            return False
+        if not self.unshadowed_qualifier(root, receiver):
+            if self.unshadowed_qualifier(root, receiver, allow_external=True):
+                self.diagnostic("APEX_PLATFORM_RECEIVER_UNRESOLVED",
+                                "An unavailable ancestor may shadow this platform API qualifier.", node, "unresolved")
+                if key == ("eventbus", "publish") and self.external_hierarchy is not None:
+                    self._event_publication(node, args, missing_ancestors=self.external_hierarchy[1])
+                return True
+            return False
+        if key == ("eventbus", "publish"):
+            self._event_publication(node, args)
+        elif key in _ASYNC_APIS:
+            self._async_invocation(node, args, _ASYNC_APIS[key])
+        else:
+            return False
+        return True
+
+    def _event_publication(self, node, args, *, missing_ancestors=None):
+        target = _without_parentheses(args[0]) if len(args) in {1, 2} else None
+        owner, collection = None, False
+        if target is not None and target.type == "identifier":
+            binding = self.binding(self.unit.text(target), target, report=False)
+            if binding:
+                owner, collection = binding.owner, binding.collection
+        elif target is not None and target.type in {"object_creation_expression", "array_creation_expression", "cast_expression"}:
+            owner, collection = self.record_type(target.child_by_field_name("type"))
+            if target.type == "array_creation_expression":
+                dimensions = sum(child.type == "[" for dimension in target.children_by_field_name("dimensions")
+                                 for child in dimension.children)
+                if dimensions > 1 or (dimensions and collection):
+                    owner = None
+                elif dimensions == 1:
+                    collection = True
+        if owner and owner.casefold().endswith("__e"):
+            qualifiers = {"operation": "publish", "effect": "event_bus", "collection": collection, "field_set": "unknown"}
+            resolution = {"basis": "typed_platform_event", "parser": PARSER_VERSION}
+            if missing_ancestors is None:
+                self.edge(owner, None, "writes", node, "apex.platform_event_publish", qualifiers, resolution)
+            else:
+                qualifiers.update(resolution_status="candidate", uncertainty="external_hierarchy",
+                                  missing_ancestors=missing_ancestors)
+                resolution.update(basis="typed_platform_event_unverified_hierarchy", missing_ancestors=missing_ancestors)
+            self.edge(owner, None, "publishes", node, "apex.event_bus_publish", qualifiers, resolution)
+        elif missing_ancestors is None:
+            self.diagnostic("APEX_PLATFORM_EVENT_PUBLISH_UNRESOLVED",
+                            "No concrete platform event type is established for this EventBus.publish argument.", node, "unresolved")
+
+    def _async_invocation(self, node, args, api):
+        api_name, argument_index, arities, contract = api
+        argument = _without_parentheses(args[argument_index]) if len(args) in arities else None
+        receiver_is_this = argument is not None and argument.type == "this" and not self.method.static
+        class_id = (self.unit.class_id if receiver_is_this
+                    else self._constructed_class(argument, node, require_immutable=True))
+        hierarchy = _class_hierarchy(self.index, self.store, class_id) if class_id else None
+        namespace, entries = _ASYNC_ENTRIES[contract]
+        if not hierarchy or not self._implements_async_contract(hierarchy, namespace, contract):
+            self.diagnostic("APEX_ASYNC_TARGET_UNRESOLVED", f"No concrete local {contract} implementation is established for {api_name}.",
+                            node, "unresolved")
+            return
+        context = contract.casefold() + "context"
+        for method_name, arity in entries:
+            candidates = [method for method in _method_candidates(self.index, self.store, class_id, method_name, arity, include_ambiguous=True)
+                          if self._async_type_matches(method.parameter_types[0], namespace, context, hierarchy)]
+            target = candidates[0] if len(candidates) == 1 else None
+            flags = _modifiers(target.unit.data, target.node)[0] if target is not None else set()
+            if (target is None or self.store.is_ambiguous(target.id) or target.static
+                    or not flags & {"public", "global"} or (receiver_is_this and flags & {"virtual", "override", "abstract"})
+                    or target.node.child_by_field_name("body") is None):
+                self.diagnostic("APEX_ASYNC_ENTRY_UNRESOLVED", f"No unique local {contract}.{method_name} implementation is established.",
+                                node, "ambiguous" if len(candidates) > 1 else "unresolved")
+                continue
+            self.store.relation(self.method.id, target.id, "calls", self.unit.location(node), "apex.async_dispatch",
+                                qualifiers={"invocation": "async_dispatch", "async_api": api_name, "entry": method_name},
+                                resolution={"basis": "local_async_contract", "contract": contract,
+                                            "job_class": class_id, "parser": PARSER_VERSION})
+
+    def _async_type_matches(self, type_name, namespace, name, hierarchy):
+        for spelling, base in ((name, name), (namespace.casefold() + "." + name, namespace.casefold())):
+            if (type_name.casefold() == spelling and base not in self.index.apex_types
+                    and all(base not in unit.declared_types for unit in hierarchy)):
+                return True
+        return False
+
+    def _implements_async_contract(self, hierarchy, namespace, contract):
+        for unit in hierarchy:
+            interfaces = unit.class_node.child_by_field_name("interfaces")
+            if interfaces is None:
+                continue
+            for node in _significant(_child(interfaces, "type_list")):
+                head = _significant(node)[0] if node.type == "generic_type" else node
+                name = re.sub(r"\s+", "", unit.text(head))
+                if self._async_type_matches(name, namespace, contract.casefold(), hierarchy):
+                    return True
+        return False
+
     def _candidate_static_invocation(self, node, receiver, name, candidates):
         """Expose a local static target without claiming an unknown base is safe."""
         if (self.external_hierarchy is None or receiver is None or receiver.type != "identifier"
@@ -1215,7 +1628,40 @@ class _MethodExtractor:
                                             "parser": PARSER_VERSION})
         return True
 
-    def _constructed_class(self, receiver, node):
+    def _visible_inner_class(self, outer_name, inner_name):
+        class_id = component_id("apexclass", f"{outer_name}.{inner_name}")
+        unit = self.index.units_by_class.get(class_id)
+        if unit is None or unit.enclosing is None:
+            return None
+        caller = self.unit.enclosing or self.unit
+        flags, _ = _modifiers(unit.data, unit.class_node)
+        if caller.class_id == unit.enclosing.class_id or flags & {"public", "global"}:
+            return class_id
+        return None
+
+    def _literal_local_class(self, type_node):
+        hierarchy = self.qualifier_hierarchy
+        if type_node is None or hierarchy is None:
+            return None
+        if type_node.type == "scoped_type_identifier":
+            names = [self.unit.text(part) for part in _significant(type_node)]
+            if (len(names) == 2 and all(API_NAME.fullmatch(name) for name in names)
+                    and all(names[0].casefold() not in unit.declared_types for unit in hierarchy)):
+                return self._visible_inner_class(*names)
+            return None
+        name = self.unit.text(type_node)
+        if type_node.type != "type_identifier" or not API_NAME.fullmatch(name):
+            return None
+        outer = self.unit.enclosing or self.unit
+        if name.casefold() in outer.declared_types:
+            return self._visible_inner_class(outer.name, name)
+        if (name.casefold() in self.index.object_names or name.casefold() in _STANDARD_OBJECTS
+                or any(name.casefold() in unit.declared_types for unit in hierarchy)):
+            return None
+        class_id = component_id("apexclass", name)
+        return class_id if class_id in self.index.units_by_class else None
+
+    def _constructed_class(self, receiver, node, *, require_immutable=False):
         if receiver is None:
             return None
         value = receiver
@@ -1225,18 +1671,26 @@ class _MethodExtractor:
                 return None
             value = binding.node.child_by_field_name("value")
             for current in _walk(self.body):
-                if current.start_byte < binding.available_from or current.start_byte >= node.start_byte:
+                if current.start_byte < binding.available_from:
+                    continue
+                # A later assignment can reach a submission on a subsequent
+                # iteration. Async targets require an unreassigned local.
+                if not require_immutable and current.start_byte >= node.start_byte:
                     continue
                 left = current.child_by_field_name("left") if current.type == "assignment_expression" else None
                 if left is not None and left.type == "identifier" and self.unit.text(left).casefold() == binding.name.casefold():
                     return None
         if value is None or value.type != "object_creation_expression":
             return None
-        name = self.unit.text(value.child_by_field_name("type"))
-        if not API_NAME.fullmatch(name):
-            return None
-        cid = component_id("apexclass", name)
-        return cid if cid in self.store.components and not self.store.is_ambiguous(cid) else None
+        type_node = value.child_by_field_name("type")
+        if self.qualifier_hierarchy is None:
+            # Keep direct construction evidence for ordinary class names when
+            # the caller's superclass is unavailable.
+            name = self.unit.text(type_node)
+            if API_NAME.fullmatch(name) and name.casefold() not in self.unit.declared_types:
+                class_id = component_id("apexclass", name)
+                return class_id if class_id in self.index.units_by_class else None
+        return self._literal_local_class(type_node)
 
     def _member_invocation(self, node, receiver, method_name, arguments):
         hierarchy = self.qualifier_hierarchy
@@ -1345,10 +1799,7 @@ class _MethodExtractor:
         elif node.type == "method_invocation":
             self.invocation(node)
         elif node.type == "explicit_constructor_invocation":
-            self.diagnostic("APEX_CONSTRUCTOR_DELEGATION_UNSUPPORTED",
-                            "Constructor delegation is outside dependency coverage.", node)
-            for argument in _significant(node.child_by_field_name("arguments")):
-                self.visit(argument)
+            self.constructor_delegation(node)
         elif node.type == "assignment_expression":
             left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
             if left is not None and left.type == "field_access":
@@ -1388,8 +1839,11 @@ class _MethodExtractor:
 
 
 def extract_apex(index: ApexIndex, store: FactStore) -> None:
-    """Extract source dependencies of outer Apex methods and constructors."""
+    """Extract source dependencies of indexed Apex methods and constructors."""
     for unit in index.units:
+        if unit.enclosing is not None and not store.is_ambiguous(unit.class_id):
+            store.relation(unit.enclosing.class_id, unit.class_id, "contains", unit.location(unit.class_node),
+                           "apex.inner_class_owner")
         if unit.superclass_name and not store.is_ambiguous(unit.class_id):
             node = unit.class_node.child_by_field_name("superclass")
             target = store.resolve_component("apexclass", unit.superclass_name, unit.location(node))

@@ -50,12 +50,19 @@ def project(tmp_path, name="source"):
     return root
 
 
-def test_cli_uses_the_saved_snapshot_for_the_current_project(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("custom_storage", [False, True])
+def test_cli_uses_the_saved_snapshot_for_the_current_project(tmp_path, monkeypatch, capsys, custom_storage):
     from graphify.salesforce import cli, viewer
 
     cache = tmp_path / "private-cache"
     monkeypatch.setenv("LOCALAPPDATA", str(cache))
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    storage = cache / "sfdx-graphify"
+    if custom_storage:
+        storage.mkdir(parents=True)
+        destination = tmp_path / "other storage" / "snapshots"
+        (storage / "snapshot-root.txt").write_text(str(destination), encoding="utf-8-sig")
+        storage = destination
     root = project(tmp_path)
     monkeypatch.chdir(root)
     assert cli.main(["refs", "Account.Description"]) == 1
@@ -64,15 +71,16 @@ def test_cli_uses_the_saved_snapshot_for_the_current_project(tmp_path, monkeypat
     assert cli.main(["build", "."]) == 0
     built = json.loads(capsys.readouterr().out)
     output = Path(built["output"])
-    assert output.is_relative_to(cache)
+    assert output.parent == storage
     assert cli.main(["refs", "Account.Description"]) == 0
     refs = json.loads(capsys.readouterr().out)
     assert refs["snapshot_id"] == built["snapshot_id"]
     assert refs["results"]
     assert refs["freshness"]["state"] == "unknown"
 
-    def check_serve(snapshot_dir, *, port, before):
+    def check_serve(snapshot_dir, *, port, before, process_maps):
         assert snapshot_dir == output
+        assert port == 8767 and before is None and process_maps is None
 
     monkeypatch.setattr(viewer, "serve", check_serve)
     assert cli.main(["serve"]) == 0

@@ -26,6 +26,8 @@ Zero results or zero local diagnostics do not establish complete coverage of unk
 Find exact references with: sfdx-graphify refs Account.Name --format brief
 Inspect what a Flow uses with: sfdx-graphify deps Sample_Flow --format json
 Inspect validation rule inputs with: sfdx-graphify deps sf:validationrule:account.require_phone --format json
+Count declared save automation with: sfdx-graphify refs Order --relation triggered_by --limit 20 --format brief
+Find an assigned literal with: sfdx-graphify refs Order.Status --value 'Ready' --format brief
 Follow a specific relationship with: sfdx-graphify explain <relationship-id>
 Check freshness with: sfdx-graphify status --source . --require-current
 For repeated queries: sfdx-graphify session --snapshot <directory> [--expect-snapshot <snapshot-id>]
@@ -33,6 +35,10 @@ Send one UTF-8 JSON object per line, e.g. {"command":"refs","name":"Account.Name
 Each response wraps the unchanged query result with id and exit_code. Close stdin to stop.
 The session verifies and loads once, pins that snapshot, and never silently switches generations.
 Open a private local viewer: sfdx-graphify serve
+Discover registered process maps with sfdx-graphify processes list.
+Use processes show <id-or-title> --format brief for steps, connections, and effects.
+Use processes status and processes check to compare authored evidence with the checkout.
+Open the registered catalog with sfdx-graphify serve --registered-process-maps.
 Inspect a focused graph: sfdx-graphify view Account.Name --mode impact
 Use status --source for explicit full verification at the start or when sources change.
 Ordinary queries and sessions do not rescan source and report unknown freshness.
@@ -45,7 +51,7 @@ Tests remain in canonical facts. --exclude-tests filters explicit AST classifica
 Impact results identify candidates for inspection, not execution order or proven runtime effects.
 Candidate calls include unverified external hierarchies and conditional trigger dispatch.
 They are included in queries and marked AMBIGUOUS in Graphify; inspect the reason and source evidence.
-Impact traversal.candidate_relationship_ids marks candidate calls anywhere in the returned witness path.
+Impact traversal.candidate_relationship_ids marks candidate relationships anywhere in the returned witness path.
 Open the cited relative source files and locators before making consequential changes.
 An absent edge is never proof that no dependency exists. Unknown coverage remains unknown.
 Keep private snapshots outside repositories. Never upload source, snapshots, or logs automatically.
@@ -70,6 +76,8 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--include-untracked", action="store_true")
     build.add_argument("--include-inactive", action="store_true",
                        help="Include explicitly inactive local components for historical analysis.")
+    build.add_argument("--include-permissions", action="store_true",
+                       help="Extract declared grants from local profiles and permission sets.")
     build.add_argument("--custom-metadata-accessors", type=Path,
                        help="Read optional JSON rules for literal Apex custom metadata field accessors.")
     build.add_argument("--format", choices=("json", "text"), default="json")
@@ -81,7 +89,35 @@ def parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="Serve the offline viewer on localhost only.")
     serve.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
     serve.add_argument("--before", type=Path, help="Optional earlier local snapshot for comparison.")
-    serve.add_argument("--port", type=int, default=8767)
+    catalogs = serve.add_mutually_exclusive_group()
+    catalogs.add_argument("--process-maps", type=Path, help="Optional local JSON catalog of authored process maps.")
+    catalogs.add_argument("--registered-process-maps", action="store_true",
+                          help="Use this checkout's registered snapshot, catalog and port.")
+    serve.add_argument("--port", type=int, help="Local port, default 8767.")
+
+    processes = commands.add_parser("processes", help="Register and query local process maps.")
+    process_commands = processes.add_subparsers(dest="process_command", required=True)
+    register = process_commands.add_parser("register", help="Save a private process catalog for this project checkout.")
+    register.add_argument("--snapshot", required=True, type=Path)
+    register.add_argument("--catalog", required=True, type=Path)
+    register.add_argument("--port", type=int, default=8767)
+    process_commands.add_parser("status", help="Show the registered files and checkout revision.")
+    check_maps = process_commands.add_parser("check", help="Compare process references with local source files.")
+    check_maps.add_argument("--source", type=Path, help="Compare against this checkout instead of the current one.")
+    check_maps.add_argument("--format", choices=("json", "brief"), default="json")
+    country_map = process_commands.add_parser("country", help="Evaluate documented country switches for a process.")
+    country_map.add_argument("process", help="Process ID.")
+    country_map.add_argument("--country", action="append", required=True, help="Country code. Repeat to compare.")
+    list_maps = process_commands.add_parser("list", help="List matching process maps.")
+    list_maps.add_argument("--match", help="Filter by process title or ID.")
+    list_maps.add_argument("--component", help="Find process steps that mention a typed component ID or API name.")
+    show_map = process_commands.add_parser("show", help="Show the steps and optionally evidence for one step.")
+    show_map.add_argument("process")
+    show_map.add_argument("--step", help="Step ID or label.")
+    for command in (list_maps, show_map):
+        command.add_argument("--country", help="Country ID or name.")
+        command.add_argument("--feature", help="Feature ID or name.")
+        command.add_argument("--format", choices=("json", "brief"), default="json")
 
     for name in ("refs", "deps", "impact", "explain", "components", "status"):
         command = commands.add_parser(name)
@@ -93,6 +129,7 @@ def parser() -> argparse.ArgumentParser:
         location = command.add_mutually_exclusive_group()
         location.add_argument("--snapshot", type=Path, help="Defaults to the current project's saved snapshot.")
         location.add_argument("--server", help="Query the persistent localhost service without loading snapshot files.")
+        location.add_argument("--registered", action="store_true", help="Use the snapshot pinned by the process catalog.")
         command.add_argument("--expect-snapshot")
         command.add_argument("--source", type=Path)
         command.add_argument("--format", choices=("json", "text", "brief"), default="json",
@@ -107,6 +144,8 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--relation", choices=sorted(RELATIONS))
             command.add_argument("--diagnostics", choices=("summary", "full"), default="summary",
                                  help="Summary counts and up to 20 focused records (default), or every consulted-file diagnostic.")
+        if name == "refs":
+            command.add_argument("--value", help="Filter writes by an exact assigned literal, such as 'Ready' or true.")
         if name == "impact":
             command.add_argument("--depth", type=int, default=2)
 
@@ -163,12 +202,121 @@ def _project_snapshot_id() -> str | None:
     return current_snapshot_id(snapshot) if snapshot is not None else None
 
 
+def _registered_process_maps() -> dict:
+    from .process_registration import load_process_registration
+
+    registration = load_process_registration(Path.cwd())
+    if registration is None:
+        raise DataError("No process catalog is registered for this checkout. "
+                        "Run sfdx-graphify processes register --snapshot <path> --catalog <path>.")
+    return registration
+
+
+def _process_checkout(source_revision: str) -> dict:
+    from .process_check import project_revision
+
+    revision = project_revision(Path.cwd())
+    result: dict = {"checkout_revision": revision}
+    if revision is None:
+        result["warnings"] = ["The checkout revision is unavailable. Process evidence refers to the registered snapshot."]
+    elif revision != source_revision:
+        result["warnings"] = [
+            f"Checkout {revision[:12]} differs from the process snapshot source {source_revision[:12]}. "
+            "Run sfdx-graphify processes check to review source locations."
+        ]
+    return result
+
+
+def _process_command(args: argparse.Namespace) -> int:
+    code = 0
+    try:
+        if args.process_command == "register":
+            from .process_registration import save_process_registration
+
+            result = save_process_registration(Path.cwd(), args.snapshot, args.catalog, args.port)
+        else:
+            from .process_workspace import load_registered_catalog, registered_catalog, require_registered_files
+
+            registration = _registered_process_maps()
+            if args.process_command == "status":
+                result = {**registration, **_process_checkout(registration["source_revision"]), "registered_files": "match"}
+                try:
+                    require_registered_files(registration)
+                except (OSError, ValueError) as exc:
+                    result.update({"registered_files": "unverified", "error": str(exc)})
+                    code = 1
+            elif args.process_command == "country":
+                from .process_countries import evaluate_country_process
+
+                bundle, catalog = load_registered_catalog(registration)
+                rules = catalog.get("country_rules")
+                if rules is None:
+                    raise DataError("No country decisions have been documented for this catalog.")
+                result = {
+                    "source_revision": catalog["source_revision"], "snapshot_id": catalog["snapshot_id"],
+                    "process": args.process,
+                    "countries": [evaluate_country_process(bundle, catalog, rules, process=args.process, country=country)
+                                  for country in dict.fromkeys(args.country)],
+                    **_process_checkout(catalog["source_revision"]),
+                }
+            else:
+                catalog, url = registered_catalog(registration)
+                if args.process_command == "check":
+                    from .process_check import check_processes
+
+                    result = check_processes(catalog, args.source or Path.cwd())
+                    summary = result["summary"]
+                    unavailable = any(
+                        ref["status"] == "unverified" and ref.get("reason") != "no_snippet"
+                        for process in result["processes"] for ref in process["references"]
+                    )
+                    code = int(unavailable or any(summary.get(key) for key in
+                                                  ("changed", "ambiguous", "missing", "missing_components", "catalog_errors")))
+                else:
+                    from .process_queries import list_processes, show_process
+
+                    if args.process_command == "show":
+                        result = show_process(catalog, args.process, country=args.country, feature=args.feature, step=args.step)
+                        code = int(bool(result["process"].get("catalog_error")))
+                    else:
+                        result = list_processes(catalog, country=args.country, feature=args.feature, match=args.match,
+                                                component=args.component)
+                    result.update({"viewer_url": url, **_process_checkout(catalog["source_revision"])})
+    except query.QueryError as exc:
+        print(json.dumps({"error": str(exc), "candidates": exc.candidates}, ensure_ascii=False))
+        print(str(exc), file=sys.stderr)
+        return exc.code
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "format", None) == "brief":
+        if args.process_command == "check":
+            from .process_check import format_process_check
+
+            print(format_process_check(result))
+        else:
+            from .process_queries import format_process_brief
+
+            print(format_process_brief(result))
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    return code
+
+
 def _value_text(value, *, brief: bool) -> str:
     text = json.dumps(value, ensure_ascii=False)
     return text[:117] + "…" if brief and len(text) > 120 else text
 
 
+def _candidate_label(candidate: dict) -> str:
+    api_name = candidate.get("api_name") or candidate["id"]
+    return api_name if api_name == candidate["id"] else f"{api_name} [{candidate['id']}]"
+
+
 def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> str:
+    from .automation import reference_lines
+
     lines = [f"Snapshot: {result.get('snapshot_id', 'unavailable')}"]
     if "freshness" in result:
         freshness = result["freshness"]
@@ -182,6 +330,16 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                          f"{coverage.get('analyzed_files', 'unknown')} files analyzed")
     if "output" in result:
         lines.append(f"Output: {result['output']}")
+    lines.extend(reference_lines(result))
+    if "class_references" in result:
+        methods = result["class_references"]
+        lines.append(f"Class references: {methods['class_relationship_count']} direct relationships and "
+                     f"{methods['method_relationship_count']} across {methods['referenced_method_count']} of "
+                     f"{methods['method_count']} directly owned methods.")
+    if "value_filter" in result:
+        selected = result["value_filter"]
+        literal = _value_text(selected["literal"], brief=brief)
+        lines.append(f"Assigned literal {literal}: {selected['occurrence_count']} matching occurrences.")
     if "focus" in result:
         lines.append(f"Focus: {result['focus']['id']} ({result['mode']})")
         lines.append(result.get("interpretation", ""))
@@ -197,6 +355,11 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
     values = result.get("custom_metadata_values")
     if values is not None:
         lines.append(f"Custom metadata values: {values['record_count']} explicit records.")
+        if "declared_default" in values:
+            default = _value_text(values["declared_default"]["value"], brief=brief)
+            lines.append(f"{values['omitted_record_count']} records omit the field. Declared default: {default}.")
+            if values["unresolved_record_count"]:
+                lines.append(f"{values['unresolved_record_count']} records have unresolved field values.")
         groups = values["groups"]
         for group in groups[:8] if brief else groups:
             names = [name.split(".", 1)[1] for name in group["records"][:12]]
@@ -208,6 +371,8 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
     for item in result.get("results", []):
         if "relation" in item:
             qualifiers = item.get("qualifiers", {})
+            assignment_context = {"memory": " in memory", "database": " in database operation"}.get(
+                qualifiers.get("effect"), "")
             permission = qualifiers.get("permission")
             relation = item["relation"] + (f" {permission.replace('_', ' ')}" if permission else "")
             if item["relation"] == "sets_value":
@@ -218,6 +383,14 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                 relation += " (inferred)"
             relationship = f"{item['source']} --{relation}--> {item['target']}"
             lines.append(relationship if brief else f"{relationship} [{item['id']}]")
+            if item["relation"] in {"triggered_by", "subscribes", "publishes"}:
+                order = qualifiers.get("trigger_order")
+                details = [qualifiers.get("timing", "").replace("_", "-"), qualifiers.get("local_status"),
+                           qualifiers.get("record_trigger_type"),
+                           ", ".join(event.replace("_", " ") for event in qualifiers.get("events", ())),
+                           f"order {order}" if order is not None else None]
+                if any(details):
+                    lines.append("  " + ", ".join(part for part in details if part))
             resolution = item.get("resolution", {})
             if resolution.get("status") == "candidate":
                 reason = {"external_hierarchy": "external hierarchy not verified",
@@ -227,15 +400,19 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                 missing = ", ".join(resolution.get("missing_ancestors", []))
                 lines.append(f"  CANDIDATE: {reason}" + (f"; missing ancestors: {missing}" if missing else ""))
             traversal = item.get("traversal", {})
-            if traversal.get("includes_candidate_calls"):
-                witness = "  Witness path includes candidate calls"
+            if traversal.get("candidate_relationship_ids"):
+                witness = ("  Witness path includes candidate relationships"
+                           if traversal.get("includes_candidate_relationships") else "  Witness path includes candidate calls")
                 lines.append(witness + "." if brief else
                              witness + ": " + ", ".join(traversal["candidate_relationship_ids"]))
             evidence = item.get("evidence", [])
             if brief and evidence:
-                occurrence = evidence[0]
+                occurrence = next((row for row in evidence if query.assigned_write_value(row)), evidence[0])
                 line = occurrence.get("line")
                 location = occurrence["path"] + (f":{line}" if line is not None else "")
+                literal = query.assigned_write_value(occurrence)
+                if literal is not None:
+                    location += f" [assigned{assignment_context} {_value_text(literal['value'], brief=True)}]"
                 extra = len(evidence) - 1
                 lines.append(f"  {location}" + (f" (+{extra} more occurrences)" if extra else ""))
             for occurrence in (() if brief else evidence):
@@ -245,6 +422,9 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                 proof = occurrence.get("resolution")
                 if not isinstance(proof, dict):
                     continue
+                literal = query.assigned_write_value(occurrence)
+                if literal is not None:
+                    lines.append(f"    Assigned literal{assignment_context}: {_value_text(literal['value'], brief=False)}.")
                 for key, label in RELATED_EVIDENCE_SITES:
                     site = proof.get(key)
                     if isinstance(site, dict) and site.get("path"):
@@ -306,9 +486,7 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
     if result.get("error"):
         lines.append(f"Error: {result['error']}")
     for candidate in result.get("candidates", []):
-        name = candidate.get("api_name") or candidate["id"]
-        label = name if brief or name == candidate["id"] else f"{name} [{candidate['id']}]"
-        lines.append(f"Candidate: {label}")
+        lines.append(f"Candidate: {_candidate_label(candidate)}")
         for definition in candidate.get("definitions", []):
             path = definition["path"]
             lines.append(path if brief else f"  {path} {definition.get('locator', '')}")
@@ -326,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "guide":
         print(GUIDANCE, end="")
         return 0
+    if args.command == "processes":
+        return _process_command(args)
     if args.command == "install":
         from .skill_install import install_skill
         try:
@@ -362,7 +542,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         try:
             from .viewer import serve
-            serve(args.snapshot or _project_snapshot(), port=args.port, before=args.before)
+
+            if args.registered_process_maps:
+                if args.snapshot is not None or args.port is not None:
+                    raise DataError("--registered-process-maps uses the registered snapshot and port.")
+                registration = _registered_process_maps()
+                serve(Path(registration["snapshot"]), port=registration["port"], before=args.before,
+                      process_maps=Path(registration["catalog"]), expected_process_identity=registration)
+            else:
+                port = 8767 if args.port is None else args.port
+                serve(args.snapshot or _project_snapshot(), port=port, before=args.before, process_maps=args.process_maps)
             return 0
         except KeyboardInterrupt:
             return 0
@@ -383,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
             bundle = build_project(args.project_root, out=args.out,
                                    include_untracked=args.include_untracked,
                                    include_inactive=args.include_inactive,
+                                   include_permissions=args.include_permissions,
                                    custom_metadata_accessors=accessors)
             result = query.envelope(bundle, [])
             result["output"] = str(args.out or default_output(args.project_root))
@@ -391,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise DataError("Server queries do not scan source. Use status --snapshot <directory> --source <project> for explicit verification.")
             from .query_server import request_query
             request = {"command": args.command}
-            for key in ("name", "relation", "limit", "depth", "kind", "exclude_tests", "diagnostics"):
+            for key in ("name", "relation", "limit", "depth", "kind", "exclude_tests", "diagnostics", "value"):
                 if hasattr(args, key) and getattr(args, key) is not None:
                     request[key] = getattr(args, key)
             expected = args.expect_snapshot if args.expect_snapshot is not None else _project_snapshot_id()
@@ -400,7 +590,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from .snapshot import load
             expected = getattr(args, "expect_snapshot", None)
-            snapshot_dir = args.snapshot or _project_snapshot()
+            if getattr(args, "registered", False):
+                registration = _registered_process_maps()
+                snapshot_dir = Path(registration["snapshot"])
+                if expected is not None and expected != registration["snapshot_id"]:
+                    raise DataError("--expect-snapshot differs from the snapshot pinned by the process catalog.")
+                expected = registration["snapshot_id"]
+            else:
+                snapshot_dir = args.snapshot or _project_snapshot()
             bundle = load(snapshot_dir, expect_snapshot=expected) if expected is not None else load(snapshot_dir)
             if args.command == "view":
                 from .viewer import build_view
@@ -421,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = query.envelope(bundle, [], source=args.source)
                 result["output"] = str(path)
             else:
-                options = {key: getattr(args, key) for key in ("relation", "limit", "depth", "kind", "exclude_tests", "diagnostics")
+                options = {key: getattr(args, key) for key in ("relation", "limit", "depth", "kind", "exclude_tests", "diagnostics", "value")
                            if hasattr(args, key)}
                 result = query.dispatch(bundle, args.command, getattr(args, "name", ""),
                                         source=args.source, **options)
@@ -452,4 +649,6 @@ def main(argv: list[str] | None = None) -> int:
           else _text(result, full_coverage=full_coverage, brief=output_format == "brief"))
     if code:
         print(result["error"], file=sys.stderr)
+        for candidate in result.get("candidates", []):
+            print(f"Candidate: {_candidate_label(candidate)}", file=sys.stderr)
     return code

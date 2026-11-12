@@ -60,7 +60,9 @@ def _apex_string_index(scan, units, qualified_fields, field_names):
 
     summaries = {"qualified": {}, "field_name": {}}
     scanned = scanned_bytes = 0
-    for unit in sorted(units, key=lambda unit: unit.path):
+    # Inner classes share their source file and syntax tree with the outer class.
+    units_by_path = {unit.path: unit for unit in units}
+    for path, unit in sorted(units_by_path.items()):
         if unit.parse_error or len(unit.data) > min(_MAX_FILE_BYTES, _MAX_SCAN_BYTES - scanned_bytes):
             continue
         scanned += 1
@@ -70,7 +72,7 @@ def _apex_string_index(scan, units, qualified_fields, field_names):
             if node.type in {"string_literal", "multi_line_string_literal"}:
                 for match in _TOKEN.finditer(unit.data, node.start_byte, node.end_byte):
                     _count_field(counts, match[0].lower(), qualified_fields, field_names)
-        _record_counts(summaries, counts, unit.path)
+        _record_counts(summaries, counts, path)
     return {
         "eligible_file_count": sum(path.casefold().endswith((".cls", ".trigger")) for path in scan.inputs),
         "scanned_file_count": scanned,

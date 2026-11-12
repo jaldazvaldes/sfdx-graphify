@@ -114,6 +114,20 @@ def test_exact_resolution_ambiguity_empty_results_and_search(bundle):
     assert [row["id"] for row in found["results"]] == ["sf:field:account.name"]
 
 
+@pytest.mark.parametrize("output_format", ["json", "text", "brief"])
+def test_cli_lists_exact_component_ids_for_cross_kind_ambiguity(bundle, monkeypatch, capsys, output_format):
+    from graphify.salesforce import snapshot
+
+    bundle["facts"]["components"].append({"id": "sf:flow:account", "kind": "flow",
+                                          "api_name": "Account", "definitions": []})
+    monkeypatch.setattr(snapshot, "load", lambda path: bundle)
+    assert cli.main(["refs", "Account", "--snapshot", "unused", "--format", output_format]) == 3
+    output = capsys.readouterr()
+    for candidate in ("sf:object:account", "sf:flow:account"):
+        assert candidate in output.out
+        assert candidate in output.err
+
+
 def test_explain_and_invalid_bounds(bundle):
     assert len(query.explain(bundle, "relationship:0")["results"][0]["evidence"]) == 2
     with pytest.raises(query.QueryError):

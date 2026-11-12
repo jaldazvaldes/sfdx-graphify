@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from graphify.salesforce.discovery import _git, discover
+from graphify.salesforce.discovery import _git, _safe_path, discover
 from graphify.salesforce.schema import DataError, FactStore, SCHEMA_VERSION, stable_id
 from graphify.salesforce.snapshot import default_output, load, publish, source_root, validate_output
 
@@ -132,6 +132,30 @@ def test_git_current_bytes_dirty_staged_and_untracked(tmp_path):
     put(root, ".gitignore", "Ignored.cls\n")
     put(root, "force-app/main/default/classes/Ignored.cls", "public class Ignored {}")
     assert not any("Ignored" in name for name in discover(root, include_untracked=True).files)
+
+
+def test_fingerprint_discovery_preserves_working_bytes_and_selection(tmp_path):
+    from graphify.salesforce.query import freshness
+
+    root = project(tmp_path / "source")
+    put(root, FLOW, "<Flow>\n</Flow>\n")
+    put(root, "force-app/unparsed.resource", "opaque content\n")
+    commit(root)
+    git(root, "config", "core.autocrlf", "true")
+    complete = discover(root)
+    fast = discover(root, fingerprints_only=True)
+    assert (fast.inputs, fast.scope, fast.revision, fast.dirty) == (
+        complete.inputs, complete.scope, complete.revision, complete.dirty,
+    )
+    assert complete.files and complete.diagnostics
+    assert fast.files == {} and fast.diagnostics == []
+
+    git(root, "update-index", "--assume-unchanged", FLOW)
+    path = root / FLOW
+    path.write_bytes(b"<Flow>\r\n</Flow>\r\n")
+    result = freshness(bundle(complete), root)
+    assert result == {"state": "stale", "added": [], "deleted": [],
+                      "changed": [FLOW], "scope_changed": False}
 
 
 def test_git_deletion_and_empty_rebuild_remove_obsolete_facts(tmp_path):
@@ -442,6 +466,20 @@ def test_windows_junctions_rejected_for_source_and_output(tmp_path):
     _winapi.CreateJunction(str(root), str(source_link))
     with pytest.raises(DataError, match="links or junctions"):
         discover(source_link)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction contract")
+def test_fingerprint_path_rejects_an_internal_junction(tmp_path):
+    import _winapi
+
+    root = project(tmp_path / "source")
+    file = put(root, "force-app/real/Example.cls", "public class Example {}")
+    link = root / "force-app" / "linked"
+    _winapi.CreateJunction(str(file.parent), str(link))
+    with pytest.raises(DataError, match="links and junctions"):
+        _safe_path(root, "force-app/linked/Example.cls", walked_file=True)
+    with pytest.raises(DataError, match="links and junctions"):
+        discover(root, fingerprints_only=True)
 
 
 def test_output_containment_and_default_policy(tmp_path, monkeypatch):

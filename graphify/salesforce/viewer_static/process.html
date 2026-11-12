@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Salesforce process maps</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <link rel="stylesheet" href="/processes.css">
+  <script defer src="/processes.js"></script>
+</head>
+<body class="process-page">
+  <header class="page-header">
+    <div>
+      <p class="eyebrow">Salesforce · local snapshot</p>
+      <h1>Process maps</h1>
+    </div>
+    <nav class="graph-view-links" aria-label="Graph views">
+      <a class="secondary" href="/">Full project graph</a>
+      <a class="secondary" href="/explorer">Dependency explorer</a>
+    </nav>
+  </header>
+  <main class="process-main">
+    <p id="process-message" class="process-message" role="status">Loading process maps…</p>
+    <div id="process-content" hidden>
+      <div class="process-filters">
+        <label for="country-select">Country<select id="country-select"></select></label>
+        <label for="feature-select">Feature<select id="feature-select"></select></label>
+        <label for="process-select">Process<select id="process-select"></select></label>
+      </div>
+      <p id="process-empty" class="process-message" hidden>No process maps are available for this selection.</p>
+      <section id="process-map" aria-labelledby="process-title" hidden>
+        <div class="process-heading">
+          <div>
+            <h2 id="process-title"></h2>
+            <p class="subtitle" id="process-summary"></p>
+            <p class="process-message" id="process-review" hidden>Some components in this process need review.</p>
+          </div>
+          <div class="process-revision">
+            <span class="meta-label">Source revision</span>
+            <code id="process-revision"></code>
+          </div>
+        </div>
+        <div class="process-grid" id="process-grid">
+          <section class="process-panel" aria-labelledby="process-path-title">
+            <div class="process-panel-header">
+              <h3 id="process-path-title">Process path</h3>
+              <p class="hint">Choose a step to see its components and effects.</p>
+            </div>
+            <div id="process-diagram">
+              <svg id="process-arrows" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+              <div id="process-layers"></div>
+            </div>
+            <details id="process-participants">
+              <summary>All process components</summary>
+              <div id="process-components"></div>
+            </details>
+          </section>
+          <section id="process-detail" class="process-panel" aria-labelledby="step-title">
+            <div class="process-panel-header">
+              <p class="meta-label" id="step-kind"></p>
+              <h3 id="step-title" tabindex="-1"></h3>
+              <p id="step-description"></p>
+              <button type="button" id="back-to-step" class="secondary">Back to process path</button>
+            </div>
+            <div id="step-body"></div>
+          </section>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

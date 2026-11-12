@@ -81,6 +81,18 @@ def _local_system_parent(store, owner, parent, component):
     return None, None
 
 
+def declared_lookup_targets(store):
+    """Index the inventory's field-to-object declarations once per build."""
+    targets = getattr(store, "_parent_path_targets", None)
+    if targets is None:
+        targets = {}
+        for edge in store.relationships.values():
+            if edge["relation"] == "references" and edge["qualifiers"].get("context") == "lookup_declaration":
+                targets.setdefault(edge["source"], set()).add(edge["target"])
+        store._parent_path_targets = targets
+    return targets
+
+
 def resolve_field_path(store, owner: str, path: str, *,
                        standard_parents: dict[tuple[str, str], tuple[str, str]] | None = None,
                        use_source_metadata: bool = False) -> dict | None:
@@ -89,15 +101,7 @@ def resolve_field_path(store, owner: str, path: str, *,
     Consumers can opt into additional documented parent pairs. The default
     vocabulary and behavior remain unchanged for existing extractors.
     """
-    # Inventory finishes before dependency extraction. Index only those schema
-    # edges once; scanning every dependency edge for every hop is quadratic.
-    lookup_targets = getattr(store, "_parent_path_targets", None)
-    if lookup_targets is None:
-        lookup_targets = {}
-        for edge in store.relationships.values():
-            if edge["relation"] == "references" and edge["qualifiers"].get("context") == "lookup_declaration":
-                lookup_targets.setdefault(edge["source"], set()).add(edge["target"])
-        store._parent_path_targets = lookup_targets
+    lookup_targets = declared_lookup_targets(store)
     parts = path.split(".")
     if not API_NAME.fullmatch(owner) or not parts or not all(API_NAME.fullmatch(p) for p in parts):
         return None

@@ -59,11 +59,21 @@ def _linked(path: Path) -> bool:
     )
 
 
-def _safe_path(root: Path, relative: str) -> Path:
+def _safe_path(root: Path, relative: str, *, walked_file: bool = False) -> Path:
     """Reject links and traversal before resolving a discovered path."""
     rel = PurePosixPath(relative)
     if rel.is_absolute() or ".." in rel.parts or "\\" in relative or ":" in relative:
         raise DataError(f"Unsafe source path: {relative!r}")
+    if walked_file:
+        candidate = root.joinpath(*rel.parts)
+        try:
+            # Exact spelling matters on case-sensitive Windows directories.
+            # A different or unavailable resolution still needs the normal
+            # component-by-component link and containment checks below.
+            if not _linked(candidate) and str(candidate.resolve(strict=True)) == str(candidate):
+                return candidate
+        except OSError:
+            pass
     current = root
     for part in rel.parts:
         current /= part
@@ -101,7 +111,8 @@ def _capture(path: Path, *, keep_bytes: bool, git_algorithm: str | None = None) 
             blob = (hashlib.new(git_algorithm, b"blob " + str(before.st_size).encode() + b"\0")
                     if git_algorithm else None)
             size = 0
-            while chunk := stream.read(1024 * 1024):
+            chunk_size = min(before.st_size + 1, 1024 * 1024)
+            while chunk := stream.read(chunk_size):
                 size += len(chunk)
                 if size > _MAX_FILE_BYTES:
                     raise DataError(f"Input exceeds the 32 MiB per-file limit: {path.name}")
@@ -110,6 +121,7 @@ def _capture(path: Path, *, keep_bytes: bool, git_algorithm: str | None = None) 
                     blob.update(chunk)
                 if chunks is not None:
                     chunks.append(chunk)
+                chunk_size = 1024 * 1024
             after = os.fstat(stream.fileno())
             if (size != before.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
                     != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
@@ -257,18 +269,20 @@ class Scan:
     diagnostics: list[dict]
 
     def assert_unchanged(self) -> None:
-        current = discover(self.root, include_untracked=self.scope["include_untracked"])
+        current = discover(self.root, include_untracked=self.scope["include_untracked"], fingerprints_only=True)
         if (self.inputs, self.scope, self.revision) != (current.inputs, current.scope, current.revision):
             raise DataError("Source changed during the build; retry with a stable working tree")
 
 
-def discover(root: Path, include_untracked: bool = False) -> Scan:
+def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: bool = False) -> Scan:
     """Capture current bytes; Git projects select tracked files by default.
 
     Configuration is always read because it defines selection. Git ignore rules
     apply to optional untracked input through Git itself. .forceignore uses
     tested common Git patterns for all source inputs, including tracked files;
     this is an explicit policy, not a claim of full Salesforce CLI parity.
+    Verification captures identical fingerprints and scope without retaining
+    extractor input bytes or constructing diagnostics.
     """
     original = Path(root).expanduser().absolute()
     if not original.is_dir():
@@ -346,6 +360,7 @@ def discover(root: Path, include_untracked: bool = False) -> Scan:
 
     paths: set[str] = set()
     excluded: set[str] = set()
+    supported_paths: set[str] = set()
     supported: dict[str, bytes] = {}
     inputs = {relative: hashlib.sha256(content).hexdigest() for relative, content in config.items()}
     blob_hashes: dict[str, str] = {}
@@ -385,11 +400,15 @@ def discover(root: Path, include_untracked: bool = False) -> Scan:
                     continue
                 if relative in paths:
                     continue
-                path = _safe_path(root, relative)
-                keep_bytes = supported_source(relative)
+                path = _safe_path(root, relative, walked_file=fingerprints_only)
+                is_supported = supported_source(relative)
+                if is_supported:
+                    supported_paths.add(relative)
                 prior = head_files.get(relative)
                 algorithm = ("sha256" if len(prior) == 64 else "sha1") if prior else None
-                content, digest, blob_digest = _capture(path, keep_bytes=keep_bytes, git_algorithm=algorithm)
+                content, digest, blob_digest = _capture(
+                    path, keep_bytes=is_supported and not fingerprints_only, git_algorithm=algorithm,
+                )
                 inputs[relative] = digest
                 if content is not None:
                     supported[relative] = content
@@ -399,28 +418,11 @@ def discover(root: Path, include_untracked: bool = False) -> Scan:
 
     inputs = dict(sorted(inputs.items()))
     supported = dict(sorted(supported.items()))
-    unsupported = sorted(paths - supported.keys())
+    unsupported = sorted(paths - supported_paths)
     normalized_changes, filtered_paths = (_normalized_changes(root, revision, package_dirs,
                                                                inputs.keys() & head_files.keys())
                                           if revision else (set(), set()))
-    diagnostics: list[dict] = [{
-        "code": "unsupported_metadata", "severity": "warning", "path": relative,
-        "construct": "metadata_file", "resolution_state": "unsupported",
-        "message": "This source file is inventoried for freshness but is outside v0.1 extraction coverage.",
-    } for relative in unsupported]
-    diagnostics.extend({
-        "code": "git_filter_dirty_raw_fallback", "severity": "warning", "path": relative,
-        "resolution_state": "unsupported",
-        "message": "Custom Git filters are not executed. Dirty state for this file compares raw working-tree bytes with HEAD; filter-normalized equality is not asserted.",
-    } for relative in sorted(filtered_paths))
-    if not is_git and ".gitignore" in config:
-        diagnostics.append({"code": "gitignore_not_applied", "severity": "warning", "path": ".gitignore",
-                            "message": "Git ignore semantics require a Git working tree; only built-in exclusions apply."})
-    for diagnostic in diagnostics:
-        diagnostic["state"] = diagnostic.pop("resolution_state", "unsupported")
-        diagnostic["location"] = {"path": diagnostic.pop("path"), "locator": None,
-                                  "line": None, "column": None}
-        diagnostic["id"] = stable_id("diag", diagnostic)
+    diagnostics = [] if fingerprints_only else _discovery_diagnostics(unsupported, filtered_paths, is_git, config)
     counts = {"modified": 0, "deleted": 0, "added": 0}
     dirty = None
     if is_git:
@@ -447,7 +449,30 @@ def discover(root: Path, include_untracked: bool = False) -> Scan:
         "gitignore": "git_untracked" if is_git else "not_applied",
         "excluded_directory_names": sorted(EXCLUDED_DIRS), "excluded_paths": sorted(excluded),
         "unsupported_paths": unsupported, "selected_file_count": len(paths),
-        "supported_file_count": len(supported), "changes_from_head": counts,
+        "supported_file_count": len(supported_paths), "changes_from_head": counts,
         "dirty_basis": "git_normalized_working_tree_vs_head_with_raw_filter_fallback" if is_git else "not_available",
     }
     return Scan(root, supported, inputs, revision, dirty, scope, diagnostics)
+
+
+def _discovery_diagnostics(unsupported: list[str], filtered_paths: set[str],
+                           is_git: bool, config: dict[str, bytes]) -> list[dict]:
+    diagnostics: list[dict] = [{
+        "code": "unsupported_metadata", "severity": "warning", "path": relative,
+        "construct": "metadata_file", "resolution_state": "unsupported",
+        "message": "This source file is inventoried for freshness but is outside v0.1 extraction coverage.",
+    } for relative in unsupported]
+    diagnostics.extend({
+        "code": "git_filter_dirty_raw_fallback", "severity": "warning", "path": relative,
+        "resolution_state": "unsupported",
+        "message": "Custom Git filters are not executed. Dirty state for this file compares raw working-tree bytes with HEAD; filter-normalized equality is not asserted.",
+    } for relative in sorted(filtered_paths))
+    if not is_git and ".gitignore" in config:
+        diagnostics.append({"code": "gitignore_not_applied", "severity": "warning", "path": ".gitignore",
+                            "message": "Git ignore semantics require a Git working tree; only built-in exclusions apply."})
+    for diagnostic in diagnostics:
+        diagnostic["state"] = diagnostic.pop("resolution_state", "unsupported")
+        diagnostic["location"] = {"path": diagnostic.pop("path"), "locator": None,
+                                  "line": None, "column": None}
+        diagnostic["id"] = stable_id("diag", diagnostic)
+    return diagnostics

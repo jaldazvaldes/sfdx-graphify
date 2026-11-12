@@ -136,7 +136,7 @@ _OBJECT_DESCRIPTIVE = {
 
 def extract_inventory(documents: list[Document], store: FactStore):
     field_expressions = []
-    lookup_targets: dict[str, set[str]] = {}
+    lookup_targets = store.raw_lookup_targets
     for document in documents:
         kind, name = identity(document)
         if kind in {"flow", "validationrule", "recordtype"}:
@@ -154,12 +154,21 @@ def extract_inventory(documents: list[Document], store: FactStore):
             owner_id = store.resolve_component("object", owner, document.location(root))
             if owner_id:
                 store.relation(owner_id, source, "contains", document.location(root), "metadata.field_owner")
-            for reference in root.all("referenceTo"):
+            references = root.all("referenceTo")
+            for reference in references:
                 lookup_targets.setdefault(source, set()).add(reference.text.casefold())
                 target = store.resolve_component("object", reference.text, document.location(reference))
                 if target:
                     store.relation(source, target, "references", document.location(reference),
                                    "metadata.lookup_target", qualifiers={"context": "lookup_declaration"})
+            names = root.all("relationshipName")
+            if (len(names) == len(references) == 1 and API_NAME.fullmatch(names[0].text)
+                    and root.value("type") in {"Lookup", "MasterDetail", "Hierarchy"}):
+                relationship = names[0].text.casefold()
+                if name.casefold().endswith("__c") and not relationship.endswith("__r"):
+                    relationship += "__r"
+                key = references[0].text.casefold(), relationship
+                store.child_relationships.setdefault(key, []).append((source, document.location(names[0])))
         for child in root.children:
             if kind == "field" and child.tag in FIELD_DEPENDENCY_TAGS:
                 continue

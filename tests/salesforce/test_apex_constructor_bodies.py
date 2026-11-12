@@ -58,12 +58,16 @@ def test_constructor_bodies_keep_dependencies_and_no_new_to_constructor_call():
         ("sf:apexmethod:worker.normalize", "calls"),
     } <= by_target
     assert all(item["path"] == "classes/Worker.cls" for edge in edges for item in edge["evidence"])
-    incoming, = query.refs(bundle, constructor_id)["results"]
-    assert incoming["relation"] == "contains" and incoming["evidence"][0]["rule"] == "apex.constructor_owner"
+    incoming = {edge["relation"]: edge for edge in query.refs(bundle, constructor_id)["results"]}
+    assert incoming["contains"]["evidence"][0]["rule"] == "apex.constructor_owner"
+    assert incoming["calls"]["source"] == component_id("apexmethod", "Worker.new()")
+    assert incoming["calls"]["qualifiers"]["delegate"] == "this"
+    assert any(edge["target"] == component_id("apexmethod", "Base.new(Id)")
+               and edge["qualifiers"].get("delegate") == "super" for edge in edges)
     launch, = query.deps(bundle, "Launcher.run")["results"]
     assert (launch["target"], launch["relation"]) == ("sf:apexclass:worker", "references")
     assert launch["evidence"][0]["rule"] == "apex.constructed_class"
-    assert {d["location"]["line"] for d in store.diagnostics if d["code"] == "APEX_CONSTRUCTOR_DELEGATION_UNSUPPORTED"} == {2, 4}
+    assert not any("CONSTRUCTOR_DELEGATION" in d["code"] for d in store.diagnostics)
 
 
 def test_duplicate_and_malformed_constructors_do_not_generate_body_facts():
@@ -91,7 +95,7 @@ def test_duplicate_and_malformed_constructors_do_not_generate_body_facts():
         "APEX_CONSTRUCTOR_DECLARATION_UNSUPPORTED", "APEX_CONSTRUCTOR_AMBIGUOUS", "APEX_CONSTRUCTOR_ID_AMBIGUOUS"}
 
 
-def test_initializers_and_inner_types_keep_separate_diagnostics():
+def test_initializers_are_reported_and_inner_constructors_keep_their_own_effects():
     source = """public class Worker {
       static { insert new Account(Name='Static initializer'); }
       { insert new Account(Name='Instance initializer'); }
@@ -99,9 +103,11 @@ def test_initializers_and_inner_types_keep_separate_diagnostics():
       public Worker() {}
     }"""
     store = build([("Worker", source)])
-    assert {item["api_name"] for item in store.components.values() if item.get("is_constructor")} == {"Worker.new()"}
-    assert {item["code"] for item in store.diagnostics} == {"APEX_CLASS_INITIALIZER_UNSUPPORTED", "APEX_INNER_TYPE_UNSUPPORTED"}
-    assert "sf:object:account" not in store.components
+    assert {item["api_name"] for item in store.components.values() if item.get("is_constructor")} == {
+        "Worker.new()", "Worker.Inner.new()"}
+    assert {item["code"] for item in store.diagnostics} == {"APEX_CLASS_INITIALIZER_UNSUPPORTED"}
+    writes = [edge for edge in store.relationships.values() if edge["target"] == "sf:object:account"]
+    assert {edge["source"] for edge in writes} == {component_id("apexmethod", "Worker.Inner.new()")}
 
 
 def test_constructor_does_not_enter_method_invocable_or_ui_lookup():

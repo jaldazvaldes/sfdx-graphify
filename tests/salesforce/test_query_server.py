@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from graphify.salesforce import cli, query_server, session, snapshot, viewer
+from graphify.salesforce import cli, query, query_server, session, snapshot, viewer
 from graphify.salesforce.schema import DataError, FactStore, SCHEMA_VERSION, stable_id
 
 
@@ -31,10 +31,13 @@ def bundle_fixture():
         (setter, field, "reads"), (caller, setter, "calls"),
         (setter, caller, "calls"), (owner, field, "contains"),
     ]):
+        proof = {"basis": "explicit_syntax"}
+        if index == 0:
+            proof["assigned_value"] = {"type": "string", "value": "Ready"}
         store.relation(source, target, relation, {
             "path": path, "locator": f"/Flow/assignments[{index}]",
             "line": index + 1, "column": 1, "content_hash": digest,
-        }, "synthetic.http", resolution={"basis": "explicit_syntax"})
+        }, "synthetic.http", resolution=proof)
     for line in range(20, 60):
         store.diagnostic("SIBLING_GAP", f"Other source construct on line {line}.", {"path": path, "line": line})
     value = {
@@ -169,6 +172,19 @@ def test_query_errors_preserve_codes_and_next_request_still_works(service):
     ]
     for request, code in cases:
         assert query_server.request_query(address(server), request)["exit_code"] == code
+
+
+def test_cli_literal_query_reuses_server_evidence_index(service, monkeypatch, capsys):
+    server, _ = service
+
+    def reject_rebuild(_):
+        raise AssertionError("The running server already indexed the verified evidence.")
+
+    monkeypatch.setattr(query, "_evidence", reject_rebuild)
+    assert cli.main(["refs", "Account.Name", "--value", "Ready", "--server", address(server)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["value_filter"] == {"literal": "Ready", "occurrence_count": 1}
+    assert [row["line"] for row in result["results"][0]["evidence"]] == [1]
 
 
 def test_current_changes_do_not_change_pinned_server_and_expectation_is_checked_each_time(service, published):

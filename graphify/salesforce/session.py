@@ -14,7 +14,7 @@ from .schema import DataError, RELATIONS
 _OPTIONS = {
     "status": frozenset(),
     "components": frozenset({"name", "kind", "limit", "exclude_tests"}),
-    "refs": frozenset({"name", "relation", "limit", "exclude_tests", "diagnostics"}),
+    "refs": frozenset({"name", "relation", "limit", "exclude_tests", "diagnostics", "value"}),
     "deps": frozenset({"name", "relation", "limit", "exclude_tests", "diagnostics"}),
     "impact": frozenset({"name", "relation", "limit", "depth", "exclude_tests", "diagnostics"}),
     "explain": frozenset({"name"}),
@@ -44,7 +44,7 @@ def _validate(request: object) -> tuple[str, dict]:
         raise query.QueryError("Unsupported request options: " + ", ".join(sorted(unknown)))
     if "id" in request and request["id"] is not None and type(request["id"]) not in (str, int):
         raise query.QueryError("Request id must be a string, integer or null.")
-    for key in ("name", "kind", "relation", "diagnostics"):
+    for key in ("name", "kind", "relation", "diagnostics", "value"):
         if key in request and not isinstance(request[key], str):
             raise query.QueryError(f"{key} must be a string.")
     for key in ("limit", "depth"):
@@ -92,13 +92,13 @@ def parse_request(text: str) -> object:
     return request
 
 
-def answer_request(bundle: dict, request: object) -> dict:
+def answer_request(bundle: dict, request: object, *, index: query.QueryIndex | None = None) -> dict:
     """Shared HTTP/JSONL response contract; retain every returned occurrence."""
     request_id = (request.get("id") if isinstance(request, dict)
                   and type(request.get("id")) in (str, int) else None)
     try:
         command, options = _validate(request)
-        result = query.dispatch(bundle, command, **options)
+        result = query.dispatch(bundle, command, index=index, **options)
         code = 0
     except query.QueryError as exc:
         result = query.envelope(bundle, [])
@@ -126,6 +126,7 @@ def run_session(directory: Path, *, expect_snapshot: str | None = None,
     snapshot_id = bundle["manifest"]["snapshot_id"]
     if expect_snapshot is not None and expect_snapshot != snapshot_id:
         raise DataError(f"Expected snapshot {expect_snapshot}; loaded {snapshot_id}.")
+    index = query.QueryIndex.build(bundle)
     print(f"Query session ready: {snapshot_id}. Snapshot pinned until EOF; source freshness is unknown.",
           file=errors, flush=True)
     for line in incoming:
@@ -139,7 +140,7 @@ def run_session(directory: Path, *, expect_snapshot: str | None = None,
             result["error"] = f"Invalid JSON request: {exc}"
             response = {"id": None, "exit_code": 2, "result": result}
         else:
-            response = answer_request(bundle, request)
+            response = answer_request(bundle, request, index=index)
         print(json.dumps(response, ensure_ascii=False, sort_keys=True, allow_nan=False),
               file=outgoing, flush=True)
     return 0

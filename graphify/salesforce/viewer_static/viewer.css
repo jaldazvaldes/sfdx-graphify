@@ -5,3 +5,6 @@
 .edge-group.candidate .edge-path{stroke-dasharray:5 4}
 :root .legend-line.relation-grants{background:#90661a}
 :root .legend-line.relation-instance_of{background:#5867a8}:root .legend-line.relation-sets_value{background:#986336}:root .legend-line.relation-mentions{background:#7b6391}
+
+.graph-view-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.graph-view-links a { text-decoration: none; }

@@ -74,7 +74,7 @@ OBJECT_FLAGS = {
 }
 
 
-def build(tmp_path, files):
+def build(tmp_path, files, **build_options):
     source = tmp_path / "source"
     source.mkdir()
     (source / "sfdx-project.json").write_text(json.dumps({
@@ -85,7 +85,7 @@ def build(tmp_path, files):
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_bytes(content.encode("utf-8"))
     output = tmp_path / "snapshot"
-    bundle = build_project(source, out=output)
+    bundle = build_project(source, out=output, **build_options)
     assert snapshot.load(output) == bundle
     return source, output, bundle
 
@@ -101,7 +101,7 @@ def permission_project(tmp_path):
     }
 }
 """,
-    })
+    }, include_permissions=True)
 
 
 def test_local_grants_record_positive_boolean_evidence(permission_project):
@@ -209,7 +209,7 @@ def test_mixed_declarations_suppress_only_the_conflicting_operation(tmp_path):
     </fieldPermissions>
 </PermissionSet>
 """
-    _, _, bundle = build(tmp_path, {PERMISSION_SET_PATH: xml})
+    _, _, bundle = build(tmp_path, {PERMISSION_SET_PATH: xml}, include_permissions=True)
     grant, = query.deps(bundle, "SampleSupport", relation="grants")["results"]
     assert grant["target"] == component_id("field", "Account.Name")
     assert grant["qualifiers"] == {"permission": "edit"}
@@ -239,7 +239,7 @@ def test_task_and_event_grants_keep_their_declared_field_scope(tmp_path):
     _, _, bundle = build(tmp_path, {
         activity_field: "<CustomField><type>Text</type></CustomField>",
         PERMISSION_SET_PATH: xml,
-    })
+    }, include_permissions=True)
     task, = query.refs(bundle, "Task.Note__c", relation="grants")["results"]
     event, = query.refs(bundle, "Event.Note__c", relation="grants")["results"]
     assert task["target"] == component_id("field", "Task.Note__c")
@@ -247,3 +247,48 @@ def test_task_and_event_grants_keep_their_declared_field_scope(tmp_path):
     assert task["qualifiers"] == {"permission": "read"}
     assert event["qualifiers"] == {"permission": "edit"}
     assert query.refs(bundle, "Activity.Note__c", relation="grants")["results"] == []
+
+
+def test_default_skips_permission_xml_but_keeps_fingerprints_and_literal_hints(tmp_path):
+    field = f"{PACKAGE}/objects/Account/fields/Name.field-meta.xml"
+    credential = f"{PACKAGE}/namedCredentials/SampleService.namedCredential-meta.xml"
+    invalid_profile = "<Profile><field>Account.Name</field>"
+    source, _, default = build(tmp_path, {
+        field: "<CustomField><type>Text</type></CustomField>",
+        credential: "<NamedCredential/>",
+        PROFILE_PATH: invalid_profile,
+        PERMISSION_SET_PATH: PERMISSION_SET,
+    })
+    default_manifest = default["manifest"]
+    assert default_manifest["coverage"]["permission_selection"] == {
+        "included": False, "selected_file_count": 2, "analyzed_file_count": 0,
+        "skipped_file_count": 2, "failed_file_count": 0,
+    }
+    assert default_manifest["coverage"]["analyzed_files"] == 2
+    assert "include_permissions" not in default_manifest["scope"]
+    assert not any(row["code"].startswith("PERMISSION_") for row in default["diagnostics"])
+    assert not any(row["kind"] in {"profile", "permissionset"} for row in default["facts"]["components"])
+    assert query.refs(default, "Account.Name", relation="grants")["results"] == []
+    inputs = default_manifest["inputs"]
+    for path, data in ((PROFILE_PATH, invalid_profile), (PERMISSION_SET_PATH, PERMISSION_SET)):
+        assert inputs[path] == hashlib.sha256(data.encode()).hexdigest()
+    literal = default_manifest["literal_blind_spots"]["qualified"]["account.name"]
+    assert literal["occurrence_count"] == 2
+    assert set(literal["example_paths"]) == {PROFILE_PATH, PERMISSION_SET_PATH}
+
+    enabled = build_project(source, out=tmp_path / "with-permissions", include_permissions=True)
+    enabled_manifest = enabled["manifest"]
+    assert enabled_manifest["inputs"] == inputs
+    assert enabled_manifest["scope"] == {**default_manifest["scope"], "include_permissions": True}
+    assert enabled_manifest["coverage"]["permission_selection"] == {
+        "included": True, "selected_file_count": 2, "analyzed_file_count": 1,
+        "skipped_file_count": 0, "failed_file_count": 1,
+    }
+    assert enabled_manifest["coverage"]["analyzed_files"] == 3
+    assert [row["location"]["path"] for row in enabled["diagnostics"]
+            if row["code"] == "PERMISSION_METADATA_UNRESOLVED"] == [PROFILE_PATH]
+    assert len(query.refs(enabled, "Account.Name", relation="grants")["results"]) == 1
+
+    for bundle in (default, enabled):
+        assert any(row["kind"] == "namedcredential" and row["definition_status"] == "defined"
+                   for row in bundle["facts"]["components"])
