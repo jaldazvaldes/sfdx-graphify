@@ -111,7 +111,7 @@ def test_filter_returns_only_matching_write_evidence(assignments, literal, line)
     occurrence, = write["evidence"]
     assert occurrence["line"] == line
     assert write["evidence_ids"] == [occurrence["id"]]
-    assert result["value_filter"] == {"literal": literal, "occurrence_count": 1}
+    assert result["value_filter"] == {"literal": literal, "occurrence_count": 1, "unknown_occurrence_count": 1}
     assert len(query.explain(assignments, write["id"])["results"][0]["evidence"]) == 7
     assert assignments == original
 
@@ -122,8 +122,44 @@ def test_literal_filter_has_cli_and_session_parity(assignments, monkeypatch, cap
     cli_result = json.loads(capsys.readouterr().out)
     request = {"command": "refs", "name": "Order.Status", "value": "Ready"}
     assert session.answer_request(assignments, request)["result"] == cli_result
+    command = ["refs", "Order.Status", "--snapshot", "sample", "--value", "Ready"]
+    for output_format in ("brief", "evidence", "text"):
+        assert cli.main([*command, "--format", output_format]) == 0
+        output = capsys.readouterr().out
+        assert "1 indexed write occurrence has an unknown assigned value" in output
     assert 'Sample.cls:1 [assigned "Ready"]' in cli._text(cli_result, brief=True)
     assert query.refs(assignments, "Order.Status", value="1")["total"] == 0
     with pytest.raises(query.QueryError, match="requires writes"):
         query.refs(assignments, "Order.Status", value="Ready", relation="reads")
     assert session.answer_request(assignments, {**request, "value": True})["exit_code"] == 2
+
+
+def test_value_filter_counts_unknown_writes_before_limiting_relationships():
+    store = FactStore()
+    field = store.ensure_component("field", "Order.Status")
+    first = store.ensure_component("apexmethod", "First.save")
+    second = store.ensure_component("flow", "Second")
+    test = store.ensure_component("apexmethod", "WriterTest.testSave", is_test=True)
+    value = {"type": "string", "value": "Ready"}
+    relation(store, first, field, "writes", 1, assigned_value=value)
+    relation(store, second, field, "writes", 2, assigned_value=value)
+    relation(store, second, field, "writes", 3)
+    relation(store, test, field, "writes", 4)
+    bundle = make_bundle(store)
+
+    result = query.refs(bundle, field, value="Ready", exclude_tests=True, limit=1)
+    assert result["truncated"]
+    assert [site["line"] for site in result["results"][0]["evidence"]] == [1]
+    assert result["value_filter"] == {"literal": "Ready", "occurrence_count": 2, "unknown_occurrence_count": 1}
+    all_writes = query.refs(bundle, field, value="missing", limit=1)
+    assert all_writes["results"] == []
+    assert all_writes["value_filter"]["unknown_occurrence_count"] == 2
+
+
+def test_value_filter_keeps_rebuild_guidance_for_older_snapshot(assignments):
+    assignments["manifest"]["schema_version"] = 12
+    for occurrence in assignments["facts"]["evidence"]:
+        occurrence["resolution"].pop("assigned_value", None)
+    result = query.refs(assignments, "Order.Status", value="Ready")
+    assert result["value_filter"] == {"literal": "Ready", "occurrence_count": 0}
+    assert "Rebuild to use this filter." in cli._text(result, brief=True)

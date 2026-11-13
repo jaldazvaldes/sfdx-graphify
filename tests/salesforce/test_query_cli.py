@@ -290,6 +290,28 @@ def test_brief_query_keeps_source_location_and_counts_without_verbose_evidence(b
     assert "relationship:0" in output
     assert "Verbose diagnostic details." in output
 
+def test_evidence_output_keeps_every_write_line_and_groups_by_path(bundle, monkeypatch, capsys):
+    from graphify.salesforce import snapshot
+
+    monkeypatch.setattr(snapshot, "load", lambda path: bundle)
+    first, second = bundle["facts"]["evidence"][:2]
+    first["line"] = 10
+    second["line"] = 8
+    first["resolution"] = {
+        "assigned_value": {"type": "string", "value": "Ready"},
+        "assigned_value_location": {"path": first["path"], "line": 4},
+    }
+    bundle["facts"]["relationships"][0]["qualifiers"]["effect"] = "memory"
+    args = ["refs", "Account.Name", "--relation", "writes", "--snapshot", "unused", "--format", "evidence"]
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert "2 occurrences" in output
+    assert output.count("flows/Sample.flow-meta.xml") == 1
+    assert '10 set_name writes [memory] "Ready" (value at 4)' in output
+    assert output.index("8 set_name writes [memory]") < output.index("10 set_name writes [memory]")
+    assert "evidence:0" not in output
+
+
 def test_empty_component_search_explains_tracked_scope(bundle):
     scope = bundle["manifest"]["scope"]
     scope.update(selection="git_tracked", include_untracked=False)

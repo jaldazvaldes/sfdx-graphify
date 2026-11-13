@@ -382,8 +382,10 @@ def test_forceignore_common_git_patterns(tmp_path, rules, names, expected):
 def test_forceignore_applies_to_tracked_and_untracked_without_false_deletions(tmp_path):
     root = project(tmp_path / "source")
     tracked = "force-app/main/default/classes/Hidden.cls"
+    tracked_in_ignored_dir = "force-app/main/default/blocked/nested/Keep.cls"
     put(root, tracked, "class Hidden {}")
-    put(root, ".forceignore", "Hidden.cls\nNewHidden.cls\n")
+    put(root, tracked_in_ignored_dir, "class Keep {}")
+    put(root, ".forceignore", "Hidden.cls\nNewHidden.cls\nblocked/\n!**/blocked/**/Keep.cls\n")
     commit(root)
     put(root, "force-app/main/default/classes/NewHidden.cls", "class NewHidden {}")
     scan = discover(root, include_untracked=True)
@@ -391,6 +393,9 @@ def test_forceignore_applies_to_tracked_and_untracked_without_false_deletions(tm
     assert scan.dirty is False
     assert scan.scope["changes_from_head"] == {"added": 0, "modified": 0, "deleted": 0}
     (root / tracked).unlink()
+    (root / tracked_in_ignored_dir).unlink()
+    (root / tracked_in_ignored_dir).parent.rmdir()
+    (root / tracked_in_ignored_dir).parent.parent.rmdir()
     assert discover(root).dirty is False
 
 
@@ -447,6 +452,19 @@ def test_source_link_rejected(tmp_path):
         pytest.skip("Symlink creation is unavailable on this host")
     with pytest.raises(DataError, match="links and junctions"):
         discover(root)
+
+
+@pytest.mark.parametrize("fingerprints_only", [False, True])
+def test_discovery_rejects_file_symlinks_inside_walked_directory(tmp_path, fingerprints_only):
+    root = project(tmp_path / "source")
+    target = put(tmp_path, "External.cls", "public class External {}")
+    link = root / "force-app" / "Linked.cls"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("Symlink creation is unavailable on this host")
+    with pytest.raises(DataError, match="links and junctions"):
+        discover(root, fingerprints_only=fingerprints_only)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction contract")

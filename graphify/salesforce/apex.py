@@ -109,15 +109,19 @@ def _without_parentheses(node):
     return node
 
 
-def _assigned_literal(data, target):
-    """Read a scalar only from the explicit right operand of a field write."""
+def _assignment_operand(data, target):
+    """Return the explicit right operand of a simple field write."""
     parent = target.parent
     if parent is not None and parent.type == "field_access" and parent.child_by_field_name("field") == target:
         target, parent = parent, parent.parent
     if (parent is None or parent.type != "assignment_expression" or parent.child_by_field_name("left") != target
             or _text(data, parent.child_by_field_name("operator")) != "="):
         return None
-    operand = _without_parentheses(parent.child_by_field_name("right"))
+    return _without_parentheses(parent.child_by_field_name("right"))
+
+
+def _scalar_literal(data, operand):
+    """Decode one supported scalar literal without evaluating expressions."""
     if operand is None:
         return None
     value = operand
@@ -837,13 +841,55 @@ class _MethodExtractor:
                               signatures=signatures, candidate_count=len(ordered))
         return True
 
+    def _assigned_value(self, target):
+        """Resolve a literal or a unique same-class String constant at the write site."""
+        operand = _assignment_operand(self.unit.data, target)
+        literal = _scalar_literal(self.unit.data, operand)
+        if literal is not None or operand is None:
+            return literal
+
+        name = operand
+        if operand.type == "field_access":
+            receiver = operand.child_by_field_name("object")
+            qualifier = self.unit.text(receiver)
+            if (receiver is None or receiver.type != "identifier"
+                    or _child(operand, "safe_navigation_operator") is not None
+                    or qualifier.casefold() != self.unit.name.casefold()
+                    or not self.unshadowed_qualifier(qualifier, receiver)
+                    or self._initializing_binding(qualifier, receiver)):
+                return None
+            name = operand.child_by_field_name("field")
+        elif operand.type != "identifier":
+            return None
+        else:
+            spelling = self.unit.text(name)
+            if self.has_binding(spelling, name) or self._initializing_binding(spelling, name):
+                return None
+
+        if name is None or name.type != "identifier":
+            return None
+        declarations = self.unit.member_declarations.get(self.unit.text(name).casefold(), ())
+        if len(declarations) != 1 or self.store.is_ambiguous(self.unit.class_id):
+            return None
+        member = declarations[0]
+        if (not {"static", "final"} <= member.modifiers
+                or self.unit.text(member.type_node).casefold() != "string"
+                or "string" in self.unit.declared_types
+                or "string" in self.index.apex_types
+                or _child(member.node.parent, "accessor_list") is not None):
+            return None
+        value = _without_parentheses(member.node.child_by_field_name("value"))
+        if value is not None and value.type == "string_literal":
+            return _scalar_literal(self.unit.data, value)
+        return None
+
     def edge(self, owner, name, relation, node, rule, qualifiers, resolution=None):
         location = self.unit.location(node)
         target = self.store.field(owner, name, location) if name else self.store.resolve_component("object", owner, location)
         if target:
             proof = resolution or {"basis": "apex_ast", "parser": PARSER_VERSION, "object": owner}
             if relation == "writes" and name is not None:
-                assigned_value = _assigned_literal(self.unit.data, node)
+                assigned_value = self._assigned_value(node)
                 if assigned_value is not None:
                     operand, kind, value = assigned_value
                     proof = {**proof, "assigned_value": {"type": kind, "value": value},
@@ -1066,7 +1112,7 @@ class _MethodExtractor:
                                 qualifiers={"context": "class_literal"}, resolution=proof)
 
     def _record_member(self, receiver):
-        """Resolve a record from one field declared in the current Apex class."""
+        """Resolve a record from a field or auto-getter in the current class."""
         receiver = _without_parentheses(receiver)
         if receiver is None:
             return None
@@ -1089,8 +1135,15 @@ class _MethodExtractor:
         if (explicit and (static or self.method.static)) or (self.method.static and not static):
             return None
         declaration = member.node.parent
-        if declaration is None or _child(declaration, "accessor_list") is not None:
+        if declaration is None:
             return None
+        accessors = _child(declaration, "accessor_list")
+        if accessors is not None:
+            getters = [accessor for accessor in _significant(accessors)
+                       if any(token.type == "get" for token in accessor.children)]
+            if (accessors.has_error or len(getters) != 1
+                    or not any(token.type == ";" for token in getters[0].children)):
+                return None
         owner, collection = self.record_type(member.type_node)
         return (owner, member) if owner and not collection else None
 

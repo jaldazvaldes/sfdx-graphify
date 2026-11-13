@@ -1,7 +1,7 @@
-"""Resolve parent paths only through declared lookups or explicit standard links.
+"""Resolve paths only through declared lookups or explicit standard links.
 
 This is a deliberately small schema vocabulary, not suffix-based object guessing.
-Polymorphic relationships and child subqueries are not selected by name.
+Polymorphic relationships are not selected by name.
 """
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ SOURCE_STANDARD_PARENTS = {
     ("opportunity", "contact"): ("ContactId", "Contact"),
     ("order", "account"): ("AccountId", "Account"),
     ("order", "billtocontact"): ("BillToContactId", "Contact"),
+    ("order", "opportunity"): ("OpportunityId", "Opportunity"),
     ("order", "shiptocontact"): ("ShipToContactId", "Contact"),
     ("orderitem", "order"): ("OrderId", "Order"),
     ("orderitem", "pricebookentry"): ("PricebookEntryId", "PricebookEntry"),
@@ -58,6 +59,76 @@ SOURCE_STANDARD_PARENTS = {
     **{(owner, "recordtype"): ("RecordTypeId", "RecordType") for owner in _RECORD_TYPE_OWNERS},
     **{(owner, "createdby"): ("CreatedById", "User") for owner in _CREATED_BY_OWNERS},
 }
+
+# Child collection API names cannot be inferred from the object's plural label.
+# Order.OpportunityId establishes the inverse for Opportunity.Orders.
+# https://developer.salesforce.com/docs/platform/object-reference/references/standard-objects/object-order.html
+_FLOW_STANDARD_CHILDREN = {("opportunity", "orders"): ("Order", "Opportunity")}
+
+
+def _flow_child_step(store, owner, name):
+    parent_id = component_id("object", owner)
+    key = owner.casefold(), name.casefold()
+    entries = store.child_relationships.get(key, ())
+    standard = _FLOW_STANDARD_CHILDREN.get(key)
+    if not entries:
+        if standard is None:
+            return None
+        child, parent = standard
+        inverse = resolve_source_field_path(store, child, parent + ".Id")
+        if inverse is None or inverse["owner"].casefold() != owner.casefold():
+            return None
+        field = inverse["steps"][0]["field"]
+        raw_targets = store.raw_lookup_targets.get(field)
+        if raw_targets and raw_targets != {owner.casefold()}:
+            return None
+        return child, {"field": field, "target": component_id("object", child),
+                       "basis": "standard_child_relationship", "direction": "child"}
+    if len(entries) != 1:
+        return None
+    field, schema_source = entries[0]
+    if store.is_ambiguous(field) or declared_lookup_targets(store).get(field) != {parent_id}:
+        return None
+    child = store.components[field]["api_name"].split(".", 1)[0]
+    child_id = component_id("object", child)
+    if ((child_id in store.components and store.is_ambiguous(child_id))
+            or (standard is not None and field != component_id("field", f"{standard[0]}.{standard[1]}Id"))):
+        return None
+    return child, {"field": field, "target": child_id, "basis": "declared_child_relationship",
+                   "direction": "child", "schema_source": schema_source}
+
+
+def resolve_flow_record_path(store, owner: str, path: str) -> dict | None:
+    """Resolve record navigation, with an optional terminal child collection."""
+    parts = path.split(".")
+    if not API_NAME.fullmatch(owner) or not all(API_NAME.fullmatch(part) for part in parts):
+        return None
+    current, steps = owner, []
+    for index, name in enumerate(parts):
+        owner_id = component_id("object", current)
+        if owner_id in store.components and store.is_ambiguous(owner_id):
+            return None
+        parent = resolve_source_field_path(store, current, name + ".Id")
+        key = current.casefold(), name.casefold()
+        has_child = key in store.child_relationships or key in _FLOW_STANDARD_CHILDREN
+        if has_child:
+            # Ambiguous names and implicit projection over collections are unsupported.
+            if parent is not None or index != len(parts) - 1:
+                return None
+            child = _flow_child_step(store, current, name)
+            if child is None:
+                return None
+            current, step = child
+            return {"owner": current, "steps": [*steps, step], "collection": True}
+        if parent is None:
+            return None
+        step = parent["steps"][0]
+        raw_targets = store.raw_lookup_targets.get(step["field"])
+        if raw_targets and raw_targets != {parent["owner"].casefold()}:
+            return None
+        current = parent["owner"]
+        steps.append(step)
+    return {"owner": current, "steps": steps, "collection": False}
 
 
 def resolve_source_field_path(store, owner: str, path: str) -> dict | None:

@@ -248,10 +248,7 @@ def assigned_write_value(occurrence: dict) -> dict | None:
     return value if isinstance(value, dict) and "value" in value else None
 
 
-def _matches_assigned_value(occurrence: dict, value: str) -> bool:
-    assignment = assigned_write_value(occurrence)
-    if assignment is None:
-        return False
+def _matches_assigned_value(assignment: dict, value: str) -> bool:
     literal = assignment["value"]
     return value == (literal if isinstance(literal, str) else canonical_json(literal))
 
@@ -356,9 +353,16 @@ def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None 
                       and (relation is None or item["relation"] == relation)),
                      key=lambda item: _relationship_key(item, indexed))
     matching_evidence = {}
+    unknown_occurrences = 0
     if value is not None:
         for item in matches:
-            selected = [key for key in item["evidence_ids"] if _matches_assigned_value(evidence[key], value)]
+            selected = []
+            for key in item["evidence_ids"]:
+                assignment = assigned_write_value(evidence[key])
+                if assignment is None:
+                    unknown_occurrences += 1
+                elif _matches_assigned_value(assignment, value):
+                    selected.append(key)
             if selected:
                 matching_evidence[item["id"]] = selected
         matches = [item for item in matches if item["id"] in matching_evidence]
@@ -370,7 +374,9 @@ def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None 
     result["test_filter"] = filtering
     if value is not None:
         result["value_filter"] = {"literal": value, "occurrence_count": sum(map(len, matching_evidence.values()))}
-        if bundle["manifest"].get("schema_version", SCHEMA_VERSION) < 13:
+        if result["schema_version"] >= 13:
+            result["value_filter"]["unknown_occurrence_count"] = unknown_occurrences
+        else:
             result["limitations"].append("This snapshot predates assigned literal write values. Rebuild to use this filter.")
     if endpoint == "target" and target["kind"] == "apexclass":
         result["class_references"] = _class_reference_summary(methods, matches)

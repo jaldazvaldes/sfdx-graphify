@@ -6,13 +6,13 @@ This independent fork builds on Graphify. The Salesforce workflow uses the `sfdx
 
 ## 1. Install the tool
 
-Install the published **0.6.0** wheel from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
+Install the published **0.6.1** wheel from any folder. `uv` creates a separate Python environment. The wheel installation works without Git or a clone of this repository.
 
 ```powershell
-uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.6.0/sfdx_graphify-0.6.0-py3-none-any.whl'
+uv tool install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.6.1/sfdx_graphify-0.6.1-py3-none-any.whl'
 ```
 
-After installation succeeds, `sfdx-graphify --version` should print `sfdx-graphify 0.6.0`.
+After installation succeeds, `sfdx-graphify --version` should print `sfdx-graphify 0.6.1`.
 
 <details>
 <summary>PowerShell setup without a command on PATH</summary>
@@ -27,12 +27,12 @@ $cli = Join-Path (uv tool dir --bin) 'sfdx-graphify.exe'
 **Without `uv`.** With Python 3.10+ installed, use a dedicated virtual environment.
 
 ```powershell
-$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.6.0'
+$venv = Join-Path $env:LOCALAPPDATA 'sfdx-graphify\venv-0.6.1'
 python -m venv $venv
 if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
 $python = Join-Path $venv 'Scripts\python.exe'
 $cli = Join-Path $venv 'Scripts\sfdx-graphify.exe'
-& $python -m pip install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.6.0/sfdx_graphify-0.6.0-py3-none-any.whl'
+& $python -m pip install 'https://github.com/jaldazvaldes/sfdx-graphify/releases/download/sfdx-v0.6.1/sfdx_graphify-0.6.1-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Wheel installation failed.' }
 & $cli --version
 ```

@@ -18,6 +18,7 @@ Use build --include-inactive for historical analysis. Unknown/ambiguous status i
 Check activity_policy in query results: older snapshots can include every local status.
 Inspect coverage and diagnostics before relying on results.
 Use --format brief for one source location per relationship and diagnostic totals.
+Use --format evidence on refs, deps, and impact for compact source locations grouped by file.
 Use --format text for detailed evidence, --full-coverage for the complete coverage object or JSON for structured output.
 refs, deps and impact include diagnostic_context: complete counts by code/file and at most 20 focused records by default.
 Use --diagnostics full for every diagnostic in consulted files; JSONL/HTTP requests use diagnostics: "full".
@@ -80,6 +81,7 @@ def parser() -> argparse.ArgumentParser:
                        help="Extract declared grants from local profiles and permission sets.")
     build.add_argument("--custom-metadata-accessors", type=Path,
                        help="Read optional JSON rules for literal Apex custom metadata field accessors.")
+    build.add_argument("--timings", action="store_true", help="Report elapsed build phases in seconds on stderr.")
     build.add_argument("--format", choices=("json", "text"), default="json")
     commands.add_parser("guide", help="Print agent usage guidance without writing files.")
     install = commands.add_parser("install", help="Copy the Salesforce skill for an assistant.")
@@ -132,8 +134,11 @@ def parser() -> argparse.ArgumentParser:
         location.add_argument("--registered", action="store_true", help="Use the snapshot pinned by the process catalog.")
         command.add_argument("--expect-snapshot")
         command.add_argument("--source", type=Path)
-        command.add_argument("--format", choices=("json", "text", "brief"), default="json",
-                             help="JSON, detailed text, or brief text with source locations and diagnostic totals.")
+        formats = ("json", "text", "brief")
+        if name in ("refs", "deps", "impact"):
+            formats += ("evidence",)
+        command.add_argument("--format", choices=formats, default="json",
+                             help="JSON, detailed text, or a compact source view.")
         command.add_argument("--full-coverage", action="store_true",
                              help="Include full snapshot coverage in text output.")
         command.add_argument("--require-current", action="store_true")
@@ -148,6 +153,10 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--value", help="Filter writes by an exact assigned literal, such as 'Ready' or true.")
         if name == "impact":
             command.add_argument("--depth", type=int, default=2)
+
+    apex_check = commands.add_parser("check-apex", help="Classify Apex source lines as code, comment, or uncertain.")
+    apex_check.add_argument("citations", nargs="+", metavar="PATH:LINE")
+    apex_check.add_argument("--source", type=Path, default=Path("."))
 
     export = commands.add_parser("export")
     export.add_argument("target", choices=("graphify",))
@@ -340,6 +349,9 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
         selected = result["value_filter"]
         literal = _value_text(selected["literal"], brief=brief)
         lines.append(f"Assigned literal {literal}: {selected['occurrence_count']} matching occurrences.")
+        if unknown := selected.get("unknown_occurrence_count"):
+            subject = "1 indexed write occurrence has" if unknown == 1 else f"{unknown} indexed write occurrences have"
+            lines.append(f"{subject} an unknown assigned value. Omit --value to inspect all indexed writes.")
     if "focus" in result:
         lines.append(f"Focus: {result['focus']['id']} ({result['mode']})")
         lines.append(result.get("interpretation", ""))
@@ -504,6 +516,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "guide":
         print(GUIDANCE, end="")
         return 0
+    if args.command == "check-apex":
+        from .apex_source_check import check_apex_lines
+
+        try:
+            rows = check_apex_lines(args.source, args.citations)
+        except (DataError, OSError, ValueError, ImportError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        for row in rows:
+            reason = f" ({row['reason']})" if row.get("reason") else ""
+            print(f"{row['path']}:{row['line']} {row['state']}{reason}")
+        return int(any(row["state"] == "unknown" for row in rows))
     if args.command == "processes":
         return _process_command(args)
     if args.command == "install":
@@ -569,13 +593,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.custom_metadata_accessors is not None:
                 with args.custom_metadata_accessors.open("rb") as handle:
                     accessors = handle.read(1024 * 1024 + 1)
+            timings = {} if args.timings else None
             bundle = build_project(args.project_root, out=args.out,
                                    include_untracked=args.include_untracked,
                                    include_inactive=args.include_inactive,
                                    include_permissions=args.include_permissions,
-                                   custom_metadata_accessors=accessors)
+                                   custom_metadata_accessors=accessors, timings=timings)
             result = query.envelope(bundle, [])
             result["output"] = str(args.out or default_output(args.project_root))
+            if timings is not None:
+                print(json.dumps({"build_seconds": timings}), file=sys.stderr)
         elif getattr(args, "server", None) is not None:
             if args.source is not None or args.require_current:
                 raise DataError("Server queries do not scan source. Use status --snapshot <directory> --source <project> for explicit verification.")
@@ -645,8 +672,16 @@ def main(argv: list[str] | None = None) -> int:
                   "error": f"Required local dependency is unavailable: {exc}"}
         code = 1
     full_coverage = args.command in {"build", "export"} or getattr(args, "full_coverage", False)
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True) if output_format == "json"
-          else _text(result, full_coverage=full_coverage, brief=output_format == "brief"))
+    if output_format == "evidence":
+        from .evidence_text import evidence_lines
+
+        header = _text({**result, "results": []}, full_coverage=full_coverage, brief=True)
+        output = "\n".join([header, *evidence_lines(result)])
+    elif output_format == "json":
+        output = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    else:
+        output = _text(result, full_coverage=full_coverage, brief=output_format == "brief")
+    print(output)
     if code:
         print(result["error"], file=sys.stderr)
         for candidate in result.get("candidates", []):

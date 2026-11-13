@@ -183,7 +183,7 @@ def test_cli_literal_query_reuses_server_evidence_index(service, monkeypatch, ca
     monkeypatch.setattr(query, "_evidence", reject_rebuild)
     assert cli.main(["refs", "Account.Name", "--value", "Ready", "--server", address(server)]) == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["value_filter"] == {"literal": "Ready", "occurrence_count": 1}
+    assert result["value_filter"] == {"literal": "Ready", "occurrence_count": 1, "unknown_occurrence_count": 1}
     assert [row["line"] for row in result["results"][0]["evidence"]] == [1]
 
 

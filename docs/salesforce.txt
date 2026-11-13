@@ -1,14 +1,14 @@
-sfdx-graphify 0.6.0
+sfdx-graphify 0.6.1
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
 endorsed by Graphify Labs or Salesforce. Preserve LICENSE, LICENSE-MIT and NOTICE.
 
-From the fork checkout, build the 0.6.0 standalone wheel and install it in
+From the fork checkout, build the current standalone wheel and install it in
 its own Python 3.10+ environment with uv:
 
   uv run --no-project --with build python scripts/build_salesforce_wheel.py --out-dir dist
-  uv tool install ./dist/sfdx_graphify-0.6.0-py3-none-any.whl
+  uv tool install ./dist/sfdx_graphify-0.6.1-py3-none-any.whl
   sfdx-graphify --version
   sfdx-graphify install --platform claude
 
@@ -57,6 +57,20 @@ The module form works without installing the console script:
   python -m graphify.salesforce view Contact.LastName --snapshot <external-directory> --depth 2
   python -m graphify.salesforce serve --snapshot <external-directory> --port 8767
   python -m graphify.salesforce serve --snapshot <external-directory> --before <earlier-directory>
+
+Add --timings to build to report elapsed phases as a JSON object on stderr.
+Definition indexing includes Apex and trigger parsing. Validation and
+publication include the source consistency check and artifact writes.
+Timing measurements stay outside the snapshot and its identity.
+
+Use --format evidence on refs, deps, and impact to get source locations
+grouped by file. This includes all occurrences of the returned relationships
+and keeps their candidate status, write effects, and matching literal sites.
+For Apex references found by text search, check the complete source file with
+sfdx-graphify check-apex --source . path/to/Class.cls:42.
+A code result identifies syntax outside comments. Verify the assignment,
+record type and execution conditions separately.
+Unverified lines include a reason and make the command exit with status 1.
 
 The installed command is sfdx-graphify. JSON is the default and keeps full
 coverage details. Query output with --format brief includes one source location
@@ -365,6 +379,13 @@ Literal write filtering matches exact typed values at each occurrence. It keeps
 the field assignment distinct from the persistence operation. The snapshot
 stores supported literals from direct Apex assignments and record initializers,
 Flow assignments and record inputs, and Workflow or approval field updates.
+With --value, the result also reports indexed write occurrences whose assigned
+value is unknown. This count covers the selected write scope before the result
+limit. Omit --value to inspect their source locations.
+An Apex field assignment can use a unique same-class
+static final String with a literal initializer. Evidence includes the write
+site and the source location of the value. Expressions and labels whose value
+cannot be established still appear in unfiltered write queries.
 
 API VERSION
 
@@ -556,6 +577,12 @@ of its existence in an org. Assignment writes describe memory unless a record
 operation establishes a database write. Whole-record operations do not invent
 field-level effects. Unsupported constructs and unknown/ambiguous/dynamic types
 are visible in diagnostics and coverage.
+
+Apex can attribute record fields accessed through a uniquely typed property
+with an automatic getter to the declared sObject. Flow Record Update inputs
+can traverse resolved parent lookups and end at a declared child collection.
+Field assignments on that update retain the related object's ownership and
+the source evidence for the navigation.
 
 Literal LWC Apex imports establish references; direct imperative uses and imported
 wire adapters establish separate static call candidates. Local bindings and

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 
 from .discovery import discover, lwc_bundle, supported_source
 from .activity import inactive_components, remove_inactive
@@ -44,7 +45,16 @@ LIMITATIONS = [
 
 
 def build_project(root, *, out=None, include_untracked=False, include_inactive=False,
-                  include_permissions=False, custom_metadata_accessors=None):
+                  include_permissions=False, custom_metadata_accessors=None, timings: dict[str, float] | None = None):
+    started = perf_counter()
+
+    def record_phase(name: str) -> None:
+        nonlocal started
+        if timings is not None:
+            now = perf_counter()
+            timings[name] = round(now - started, 6)
+            started = now
+
     accessor_rules = parse_accessor_rules(custom_metadata_accessors) if custom_metadata_accessors is not None else []
     root = Path(root).expanduser().absolute()
     output = validate_output(Path(out) if out is not None else default_output(root), source_root=root)
@@ -66,6 +76,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                 or any(old_scope.get(key) != scan.scope.get(key) for key in selection_keys)
                 or previous_source_still_exists):
             raise DataError("No supported metadata found. Check package directories and --include-untracked.")
+    record_phase("discovery")
     store = FactStore()
     for diagnostic in scan.diagnostics:
         entry = dict(diagnostic)
@@ -130,6 +141,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
                 documents.append(document)
         else:
             documents.append(parse_xml(path, data))
+    record_phase("xml_parsing")
     index_definitions(documents, store)
     index_workflow(workflows, store)
     index_approval_processes(approvals, store)
@@ -139,6 +151,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     index_named_credentials(named_credentials, store)
     apex_index = index_apex(apex, store)
     trigger_index = index_triggers(triggers, trigger_metadata, apex_index, store)
+    record_phase("definition_indexing")
     excluded = inactive_components(store.components.values(), include_inactive=include_inactive)
     extract_inventory(documents, store)
     extract_workflow(workflows, store, excluded=excluded)
@@ -165,6 +178,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     index_custom_metadata_defaults(documents, store)
     extract_custom_metadata(custom_metadata, store)
     facts = store.finish()
+    record_phase("dependency_extraction")
     diagnostics = sorted(store.diagnostics, key=lambda d: d["id"])
     observed_versions = {d.root.value("apiVersion") for d in [*documents, *trigger_metadata]
                          if d.root.tag in {"Flow", "ApexTrigger"} and d.root.value("apiVersion")}
@@ -250,6 +264,8 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     )
     bundle = {"manifest": manifest, "facts": facts, "diagnostics": diagnostics}
     manifest["snapshot_id"] = stable_id("snapshot", bundle)
+    record_phase("manifest_and_fingerprint")
     validate_bundle(bundle)
     publish(bundle, output, root, source_guard=scan.assert_unchanged)
+    record_phase("validation_and_publication")
     return bundle

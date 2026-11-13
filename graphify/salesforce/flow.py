@@ -13,7 +13,7 @@ import re
 from .schema import TESTED_API_VERSIONS, canonical_json
 from .symbols import API_NAME, RESOURCE_NAME, index_symbols, literal, screen_fields
 from .formula_refs import COLLECTION_ITEM_REFERENCE, formula_references
-from .relationship_paths import add_navigation_reads, resolve_source_field_path
+from .relationship_paths import add_navigation_reads, resolve_flow_record_path, resolve_source_field_path
 from .write_values import flow_write_value
 
 _BASE = {"name", "label", "description", "locationX", "locationY", "connector", "faultConnector", "processMetadataValues"}
@@ -336,11 +336,12 @@ class _Extractor:
             elif child.tag not in _VALUE:
                 self.diagnostic("FLOW_VALUE_UNSUPPORTED", "This value representation is outside v0.1 coverage.", child)
 
-    def filters(self, node, owner, operation):
+    def filters(self, node, owner, operation, resolution=None):
         for item in node.all("filters"):
             field = item.child("field")
             if field is not None:
-                self.field_edge(owner, field.text.strip(), "filters", field, "flow.filter_field", {"operation": operation})
+                self.field_edge(owner, field.text.strip(), "filters", field, "flow.filter_field",
+                                {"operation": operation}, resolution)
             self.value(item.child("value"), "filters", "flow.filter_operand", {"operation": operation})
 
     def decisions(self):
@@ -524,27 +525,62 @@ class _Extractor:
 
     def operation_owner(self, node):
         owner = node.value("object")
-        input_node = node.child("inputReference")
+        inputs = node.all("inputReference")
+        if node.tag == "recordUpdates" and len(inputs) > 1:
+            self.handled_references.update(item.locator for item in inputs)
+            self.diagnostic("FLOW_RECORD_INPUT_AMBIGUOUS", "The update repeats its record input.", node, "ambiguous")
+            return None, None, None
+        input_node = inputs[0] if inputs else None
         symbol = None
+        resolution = None
         if input_node is not None:
             self.handled_references.add(input_node.locator)
             reference = input_node.text.strip()
             if not (RESOURCE_NAME.fullmatch(reference) or self.symbols.unique(reference)):
-                self.diagnostic("FLOW_RECORD_INPUT_UNSUPPORTED", "Record operations require a direct record resource.", input_node)
+                if node.tag == "recordUpdates" and "." in reference:
+                    objects = node.all("object")
+                    if len(objects) > 1 or any(item.children or not item.text for item in objects):
+                        self.diagnostic("FLOW_OBJECT_TYPE_CONFLICT", "The related update needs one literal object type.",
+                                        node, "ambiguous")
+                        return None, None, None
+                    symbol, resolution = self.related_record_input(input_node, reference)
+                    if symbol is None:
+                        return None, None, None
+                else:
+                    self.diagnostic("FLOW_RECORD_INPUT_UNSUPPORTED", "Record operations require a direct record resource.", input_node)
             else:
                 symbol = self.symbols.resolve(reference, input_node, require_record=True)
             if symbol and symbol.object_type:
                 if owner and owner.casefold() != symbol.object_type.casefold():
                     self.diagnostic("FLOW_OBJECT_TYPE_CONFLICT", "The explicit object conflicts with the input record type.", node, "ambiguous")
-                    return None, None
+                    return None, None, None
                 owner = owner or symbol.object_type
-        return owner, symbol
+        return owner, symbol, resolution
+
+    def related_record_input(self, node, reference):
+        root, _, path = reference.partition(".")
+        if not RESOURCE_NAME.fullmatch(root):
+            self.diagnostic("FLOW_RECORD_INPUT_UNSUPPORTED", "The related record input needs a literal record resource.", node)
+            return None, None
+        symbol = self.symbols.resolve(root, node, require_record=True)
+        if symbol is None or symbol.object_type is None:
+            return None, None
+        resolved = None if symbol.collection else resolve_flow_record_path(self.store, symbol.object_type, path)
+        if resolved is None:
+            self.diagnostic("FLOW_RECORD_INPUT_RELATIONSHIP_UNRESOLVED",
+                            "The complete path to the related record or collection is not uniquely established.", node,
+                            "unresolved")
+            return None, None
+        resolution = {"basis": "related_record_input", "object": resolved["owner"], "symbol": symbol.name,
+                      "relationship_path": reference, "relationship_steps": resolved["steps"],
+                      "declaration": {key: symbol.location[key] for key in ("path", "locator")}}
+        return replace(symbol, object_type=resolved["owner"], collection=resolved["collection"]), resolution
 
     def operations(self):
         for tag, operation in (("recordLookups", "lookup"), ("recordCreates", "create"),
                                ("recordUpdates", "update"), ("recordDeletes", "delete")):
             for node in self.doc.root.all(tag):
-                owner, symbol = self.operation_owner(node)
+                owner, symbol, resolution = self.operation_owner(node)
                 if tag == "recordCreates" and node.value("doesUpsert") == "true":
                     operation_name = "upsert"
                 else:
@@ -558,8 +594,12 @@ class _Extractor:
                 elif tag == "recordLookups" and node.value("storeOutputAutomatically") == "true":
                     qualifier["collection"] = node.value("getFirstRecordOnly") != "true"
                 location_node = node.child("object") or node.child("inputReference") or node
-                self.object_edge(owner, relation, location_node, "flow.record_operation", qualifier)
-                self.filters(node, owner, operation_name)
+                self.object_edge(owner, relation, location_node, "flow.record_operation", qualifier, resolution)
+                if resolution is not None:
+                    add_navigation_reads(self.store, self.source, self.doc.location(node.child("inputReference")),
+                                         {**resolution, "steps": resolution["relationship_steps"]},
+                                         rule="flow.relationship_navigation", qualifiers={"context": "flow_relationship_navigation"})
+                self.filters(node, owner, operation_name, resolution)
                 for field in node.all("queriedFields") if tag == "recordLookups" else []:
                     self.field_edge(owner, field.text.strip(), "reads", field, "flow.queried_field", {"operation": operation_name})
                 sort_field = node.child("sortField") if tag == "recordLookups" else None
@@ -569,7 +609,7 @@ class _Extractor:
                     field = item.child("field")
                     if field is not None:
                         self.field_edge(owner, field.text.strip(), "writes", field, "flow.record_input_field",
-                                        {"operation": operation_name, "effect": "database"},
+                                        {"operation": operation_name, "effect": "database"}, resolution,
                                         literal=flow_write_value(self.doc, item.child("value")))
                     self.value(item.child("value"), "reads", "flow.record_input_value", {"operation": operation_name})
                 for item in node.all("outputAssignments") if tag == "recordLookups" else []:

@@ -249,13 +249,25 @@ def _in_scope(relative: str, package_dirs: list[str]) -> bool:
     return any(directory == "." or relative.startswith(directory + "/") for directory in package_dirs)
 
 
-def _force_ignored(spec: GitIgnoreSpec, relative: str, *, directory: bool = False) -> bool:
-    """Apply root-relative patterns without re-including pruned parent directories."""
-    parts = PurePosixPath(relative).parts
-    for count in range(1, len(parts)):
-        if spec.match_file("/".join(parts[:count]) + "/"):
-            return True
-    return spec.match_file(relative + ("/" if directory else ""))
+def _force_ignored(spec: GitIgnoreSpec, relative: str, ignored_dirs: dict[str, bool], *,
+                   directory: bool = False) -> bool:
+    """Apply patterns and cache each directory's effective exclusion for this scan."""
+    parent = relative.rpartition("/")[0]
+    if parent not in ignored_dirs:
+        # HEAD can contain directories absent from the working tree. Apply the
+        # same ancestor pruning before testing a file under one of those paths.
+        parts = parent.split("/")
+        ignored = False
+        for count in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:count])
+            if prefix not in ignored_dirs:
+                ignored_dirs[prefix] = ignored or spec.match_file(prefix + "/")
+            ignored = ignored_dirs[prefix]
+    if not directory:
+        return ignored_dirs[parent] or spec.match_file(relative)
+    if relative not in ignored_dirs:
+        ignored_dirs[relative] = ignored_dirs[parent] or spec.match_file(relative + "/")
+    return ignored_dirs[relative]
 
 
 @dataclass
@@ -332,6 +344,7 @@ def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: 
         force_spec = GitIgnoreSpec.from_lines(force_lines)
     except (ValueError, TypeError) as exc:
         raise DataError(f"Invalid .forceignore pattern: {exc}") from exc
+    ignored_dirs = {"": False}
 
     git_probe = _git(root, ["rev-parse", "--is-inside-work-tree"], optional=True)
     if git_probe is None and any((parent / ".git").exists() for parent in (root, *root.parents)):
@@ -375,7 +388,8 @@ def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: 
 
     for directory in package_dirs:
         base = _safe_path(root, directory)
-        if directory != "." and (_excluded(directory) or _force_ignored(force_spec, directory, directory=True)):
+        if directory != "." and (_excluded(directory)
+                                 or _force_ignored(force_spec, directory, ignored_dirs, directory=True)):
             excluded.add(directory + "/")
             continue
         if not base.exists():
@@ -384,7 +398,7 @@ def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: 
             for name in list(dirs):
                 path = Path(current) / name
                 relative = path.relative_to(root).as_posix()
-                if _excluded(relative) or _force_ignored(force_spec, relative, directory=True):
+                if _excluded(relative) or _force_ignored(force_spec, relative, ignored_dirs, directory=True):
                     dirs.remove(name)
                     excluded.add(relative + "/")
                 else:
@@ -393,14 +407,14 @@ def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: 
                 relative = (Path(current) / name).relative_to(root).as_posix()
                 if relative in _CONFIG_FILES:
                     continue
-                if _excluded(relative) or _force_ignored(force_spec, relative):
+                if _excluded(relative) or _force_ignored(force_spec, relative, ignored_dirs):
                     excluded.add(relative)
                     continue
                 if selected is not None and relative not in selected:
                     continue
                 if relative in paths:
                     continue
-                path = _safe_path(root, relative, walked_file=fingerprints_only)
+                path = _safe_path(root, relative, walked_file=True)
                 is_supported = supported_source(relative)
                 if is_supported:
                     supported_paths.add(relative)
@@ -428,7 +442,8 @@ def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: 
     if is_git:
         comparable_head = {p: oid for p, oid in head_files.items()
                            if (p in _CONFIG_FILES or (_in_scope(p, package_dirs)
-                                                     and not _force_ignored(force_spec, p))) and not _excluded(p)}
+                                                     and not _force_ignored(force_spec, p, ignored_dirs)))
+                           and not _excluded(p)}
         for relative in inputs:
             prior = comparable_head.get(relative)
             if prior is None:
