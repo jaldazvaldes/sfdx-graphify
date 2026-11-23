@@ -1,4 +1,5 @@
 from graphify.salesforce import cli, query
+from graphify.salesforce.automation import publication_labels
 from graphify.salesforce.service import build_project
 
 
@@ -86,6 +87,18 @@ def test_event_roles_direction_and_grants_have_bounded_evidence(tmp_path):
         "classes/OutboundPublisher.cls": """public class OutboundPublisher {
             public void send() { EventBus.publish(new Outbound__e()); }
         }""",
+        "classes/CalledPublisher.cls": """public class CalledPublisher {
+            public static void send() { EventBus.publish(new Called__e()); send(); }
+        }""",
+        "classes/DirectCaller.cls": """public class DirectCaller {
+            public void run() { CalledPublisher.send(); }
+        }""",
+        "classes/ProvisionalCaller.cls": """public class ProvisionalCaller extends MissingBase {
+            public void run() { CalledPublisher.send(); }
+        }""",
+        "classes/TestCaller.cls": """@IsTest private class TestCaller {
+            @IsTest static void run() { CalledPublisher.send(); Publisher.send(); }
+        }""",
         "classes/InboundTest.cls": """@IsTest private class InboundTest {
             @IsTest static void sends() { EventBus.publish(new Inbound__e()); }
         }""",
@@ -115,7 +128,15 @@ def test_event_roles_direction_and_grants_have_bounded_evidence(tmp_path):
     assert candidate["resolution"]["status"] == "candidate"
     assert candidate["resolution"]["missing_ancestors"] == ["MissingBase"]
     assert candidate["evidence"][0]["line"] == 4
+    assert candidate["publication_context"]["caller_status"] == "no_indexed_production_callers"
+    assert publication_labels(candidate) == ("no indexed production callers", "emission unverified")
+    assert edges["sf:apexmethod:publisher.send"]["publication_context"] == {
+        "caller_status": "candidate_production_caller", "emission": "unverified",
+        "indexed_caller_count": 0, "candidate_caller_count": 1,
+    }
     assert edges["sf:flow:eventresourcesend"]["evidence"][0]["locator"].endswith("/inputReference")
+    assert edges["sf:flow:eventresourcesend"]["publication_context"]["caller_status"] == "not_applicable"
+    assert result["platform_event"]["relation_filter"] == "publishes"
     assert result["platform_event"]["direction"] == "local_publisher_and_subscriber"
     assert result["platform_event"]["subscribers"] == ["sf:apextrigger:noticetrigger", "sf:flow:eventread"]
     assert result["platform_event"]["apex_publication_methods_without_indexed_callers"] == ["CandidatePublisher.send"]
@@ -130,6 +151,10 @@ def test_event_roles_direction_and_grants_have_bounded_evidence(tmp_path):
     assert inbound["platform_event"]["create_permission_sets"] == ["InboundPublisher"]
     assert "Declared permission sets with Create: InboundPublisher" in cli._text(inbound, brief=True)
     assert query.refs(bundle, "Outbound__e")["platform_event"]["direction"] == "possible_external_subscriber"
+    called, = query.refs(bundle, "Called__e", relation="publishes")["results"]
+    assert called["publication_context"] == {"caller_status": "indexed_and_candidate_production_callers",
+                                              "emission": "unverified", "indexed_caller_count": 1,
+                                              "candidate_caller_count": 1}
 
 
 def test_event_create_grants_remain_opt_in(tmp_path):

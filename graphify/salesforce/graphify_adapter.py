@@ -45,7 +45,7 @@ def projection_graph(bundle: dict):
         details = []
         for item in sorted(relationships, key=lambda item: item["id"]):
             context = item.get("qualifiers", {}).get("context")
-            structural = (item["relation"] in {"contains", "instance_of", "sets_value"}
+            structural = (item["relation"] in {"contains", "instance_of", "sets_value", "places_field"}
                           or (item["relation"] == "references" and context == "lookup_declaration"))
             layer = "schema" if structural else "mentions" if item["relation"] == "mentions" else "dependencies"
             details.append({"id": item["id"], "relation": item["relation"],

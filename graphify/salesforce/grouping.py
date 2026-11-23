@@ -8,10 +8,10 @@ import networkx as nx
 from .schema import DataError, component_id
 
 
-_PARENT_KINDS = {"field": "object", "outboundmessage": "object",
+_PARENT_KINDS = {"field": "object", "layout": "object", "outboundmessage": "object",
                  "validationrule": "object", "workflowrule": "object",
                  "approvalprocess": "object", "apexmethod": "apexclass"}
-_TYPE_NAMES = {"object": "Object", "field": "Field", "apexclass": "Apex class",
+_TYPE_NAMES = {"object": "Object", "field": "Field", "layout": "Page layout", "apexclass": "Apex class",
                "apexmethod": "Apex method", "apextrigger": "Trigger", "flow": "Flow",
                "lwc": "Lightning component", "outboundmessage": "Outbound message",
                "validationrule": "Validation rule", "workflowrule": "Workflow rule",
@@ -19,6 +19,7 @@ _TYPE_NAMES = {"object": "Object", "field": "Field", "apexclass": "Apex class",
                "visualforcepage": "Visualforce page", "visualforcecomponent": "Visualforce component"}
 _TYPE_GROUPS = {"flow": "Flows", "apextrigger": "Triggers", "lwc": "Lightning components",
                 "field": "Fields without an unambiguous owner",
+                "layout": "Page layouts without an unambiguous owner",
                 "apexmethod": "Apex methods without an unambiguous owner",
                 "outboundmessage": "Outbound messages without an unambiguous owner",
                 "validationrule": "Validation rules without an unambiguous owner",
@@ -60,6 +61,9 @@ def _owners(graph):
         if candidates:
             if len(candidates) == 1:
                 owners[node] = next(iter(candidates))
+            continue
+        if data.get("kind") == "layout":
+            # Layout labels may contain punctuation; ownership comes from the layout declaration.
             continue
         qualified = _name(graph, node).split("(", 1)[0]
         if "." not in qualified:

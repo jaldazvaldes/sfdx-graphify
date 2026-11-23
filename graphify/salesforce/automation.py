@@ -177,19 +177,59 @@ def _event_direction(publishers, candidates, subscribers):
     return "unresolved"
 
 
-def _publication_methods_without_callers(publishers, components, relationships):
+def _publication_callers(publishers, components, relationships):
+    """Count direct call relationships to publisher methods without assuming execution."""
     methods = {source for source in publishers if components[source]["kind"] == "apexmethod"}
     if not methods:
-        return []
-    calls = [(edge["source"], edge["target"]) for edge in relationships
+        return {}
+    calls = [edge for edge in relationships
              if edge["relation"] == "calls" and edge["target"] in methods and edge["source"] != edge["target"]
              and components[edge["source"]].get("is_test") is not True]
-    inactive = inactive_components(components[source] for source, _ in calls)
-    called = {target for source, target in calls if source not in inactive}
-    return [components[source]["api_name"] for source in sorted(methods - called)]
+    inactive = inactive_components(components[edge["source"]] for edge in calls)
+    counts = {method: {"indexed": set(), "candidate": set()} for method in methods}
+    for edge in calls:
+        if edge["source"] in inactive:
+            continue
+        status = "candidate" if relationship_resolution(edge)["status"] == "candidate" else "indexed"
+        counts[edge["target"]][status].add(edge["source"])
+    return {method: (len(roles["indexed"]), len(roles["candidate"])) for method, roles in counts.items()}
 
 
-def _event_context(incoming, components, permissions_included, relationships):
+def _publication_context(counts):
+    result = {"emission": "unverified"}
+    if counts is None:
+        return {**result, "caller_status": "not_applicable"}
+    indexed, candidate = counts
+    if indexed and candidate:
+        status = "indexed_and_candidate_production_callers"
+    elif indexed:
+        status = "indexed_production_caller"
+    elif candidate:
+        status = "candidate_production_caller"
+    else:
+        status = "no_indexed_production_callers"
+    return {**result, "caller_status": status, "indexed_caller_count": indexed, "candidate_caller_count": candidate}
+
+
+def publication_labels(item: dict) -> tuple[str, ...]:
+    """Concise text labels for a publication statement's direct-caller evidence."""
+    context = item.get("publication_context")
+    if not context:
+        return ()
+    status = context["caller_status"]
+    emission = "emission unverified"
+    if status == "not_applicable":
+        return (emission,)
+    if status == "indexed_and_candidate_production_callers":
+        return "indexed and candidate direct production callers", emission
+    if status == "no_indexed_production_callers":
+        return "no indexed production callers", emission
+    if status == "candidate_production_caller":
+        return "candidate direct production caller", emission
+    return "indexed direct production caller", emission
+
+
+def _event_context(incoming, components, permissions_included, relationships, results, relation_filter):
     by_kind = {kind: set() for kind in ("publishes", "candidate_publishes", "subscribes")}
     create_sets = set()
     sources = {edge["source"]: components[edge["source"]] for edge in incoming}
@@ -206,16 +246,23 @@ def _event_context(incoming, components, permissions_included, relationships):
               and edge["qualifiers"].get("permission") == "create"):
             create_sets.add(source["api_name"])
     publishers, candidates, subscribers = (sorted(by_kind[key]) for key in ("publishes", "candidate_publishes", "subscribes"))
+    publication_rows = [edge for edge in results if edge["relation"] == "publishes"]
+    relevant_publishers = set(publishers + candidates) | {edge["source"] for edge in publication_rows}
+    callers = _publication_callers(relevant_publishers, components, relationships)
+    for edge in publication_rows:
+        edge["publication_context"] = _publication_context(callers.get(edge["source"]))
+    uncalled = [components[source]["api_name"] for source in sorted(set(publishers + candidates))
+                if callers.get(source) == (0, 0)]
     return {"state": "indexed", "direction": _event_direction(publishers, candidates, subscribers),
             "publishers": publishers, "candidate_publishers": candidates, "subscribers": subscribers,
+            "relation_filter": relation_filter,
             "permissions_included": permissions_included,
             "create_permission_sets": sorted(create_sets, key=str.casefold),
-            "apex_publication_methods_without_indexed_callers": _publication_methods_without_callers(
-                publishers + candidates, components, relationships),
-            "interpretation": "Static production evidence from this checkout. External participants, grant assignments and delivery need org or integration evidence."}
+            "apex_publication_methods_without_indexed_callers": uncalled,
+            "interpretation": "Publication statements and direct caller evidence are static. A direct caller leaves entry-point reachability, branch conditions and delivery unverified. External participants and grant assignments need org or integration evidence."}
 
 
-def reference_context(bundle, target, relationships, components):
+def reference_context(bundle, target, relationships, components, *, results=(), relation=None):
     if target["kind"] != "object":
         return {}
     event = _platform_event(target)
@@ -226,7 +273,7 @@ def reference_context(bundle, target, relationships, components):
     incoming = [edge for edge in relationships if edge["target"] == target["id"] and edge["relation"] in relevant]
     if event:
         permissions = bundle["manifest"]["coverage"].get("permission_selection", {}).get("included", False)
-        return {key: _event_context(incoming, components, permissions, relationships)}
+        return {key: _event_context(incoming, components, permissions, relationships, results, relation)}
     return {key: _save_automation(incoming, components)}
 
 
@@ -235,10 +282,16 @@ def reference_lines(result):
     if event is not None:
         if event["state"] == "unavailable":
             return ["Rebuild this snapshot to index platform event publishers and subscribers."]
-        direction = event["direction"].replace("_", " ")
+        direction = {
+            "local_publisher_and_subscriber": "local publication and subscription evidence",
+            "candidate_local_publisher": "candidate local publication evidence",
+            "possible_external_publisher": "possible external publisher",
+            "possible_external_subscriber": "possible external subscriber",
+        }.get(event["direction"], "unresolved")
         lines = [f"Event direction (local static evidence): {direction}. "
-                 f"{len(event['publishers'])} publishers, {len(event['candidate_publishers'])} candidate publishers, "
-                 f"{len(event['subscribers'])} subscribers."]
+                 f"{len(event['publishers'])} sources with publication statements, "
+                 f"{len(event['candidate_publishers'])} candidate publication sources, "
+                 f"{len(event['subscribers'])} subscription declarations. Emission unverified."]
         uncalled = event["apex_publication_methods_without_indexed_callers"]
         if uncalled:
             names = ", ".join(uncalled[:8])

@@ -57,6 +57,13 @@ _ASYNC_ENTRIES = {
     "Schedulable": ("System", (("execute", 1),)),
     "Batchable": ("Database", (("start", 1), ("execute", 2), ("finish", 1))),
 }
+_FFLIB_UOW_TYPES = {"fflib_sobjectunitofwork", "fflib_isobjectunitofwork"}
+_FFLIB_UOW_INTERFACE = "fflib_isobjectunitofwork"
+_FFLIB_PUBLISH_TIMINGS = {
+    "registerpublishbeforetransaction": "before_transaction",
+    "registerpublishaftersuccesstransaction": "after_success_transaction",
+    "registerpublishafterfailuretransaction": "after_failure_transaction",
+}
 
 
 def _parse_source(parser, data):
@@ -254,6 +261,7 @@ class ApexIndex:
     apex_types: set[str] = field(default_factory=set)
     object_names: set[str] = field(default_factory=set)
     namespaces: set[str] = field(default_factory=set)
+    fflib_interface_overloads: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
 
 
 def _filename_location(path, data):
@@ -297,6 +305,39 @@ def _query_root(unit, body):
 def _parameter_type(unit, parameter):
     source = unit.text(parameter.child_by_field_name("type"))
     return re.sub(r"\s+", "", re.sub(r"/\*[\s\S]*?\*/|//[^\r\n]*", "", source))
+
+
+def _fflib_overload(data, method, parameter):
+    """Classify one local overload, retaining incompatible signatures as blockers."""
+    flags, _ = _modifiers(data, method)
+    if "static" in flags or _text(data, method.child_by_field_name("type")).casefold() != "void":
+        return "other"
+    raw_type = _text(data, parameter.child_by_field_name("type"))
+    for dimensions in parameter.children_by_field_name("dimensions"):
+        raw_type += _text(data, dimensions)
+    signature = re.sub(r"/\*[\s\S]*?\*/|//[^\r\n]*|\s+", "", raw_type).casefold()
+    return {"sobject": "single", "sobject[]": "list", "list<sobject>": "list"}.get(signature, "other")
+
+
+def _fflib_accepts(overloads, collection):
+    return ("other" not in overloads and len(overloads) == len(set(overloads))
+            and ("list" if collection else "single") in overloads)
+
+
+def _index_fflib_uow_interface(index, data, root):
+    declarations = _significant(root)
+    if len(declarations) != 1 or declarations[0].type != "interface_declaration":
+        return
+    interface = declarations[0]
+    if (_text(data, interface.child_by_field_name("name")).casefold() != _FFLIB_UOW_INTERFACE
+            or any(part.type not in {"modifiers", "identifier", "interface_body"} for part in _significant(interface))):
+        return
+    for method in _significant(interface.child_by_field_name("body")):
+        if method.type == "method_declaration":
+            name = _text(data, method.child_by_field_name("name")).casefold()
+            parameters = _significant(method.child_by_field_name("parameters"))
+            if name in _FFLIB_PUBLISH_TIMINGS and len(parameters) == 1:
+                index.fflib_interface_overloads[name].append(_fflib_overload(data, method, parameters[0]))
 
 
 def _constructor_definition(unit, node, store):
@@ -461,6 +502,8 @@ def index_apex(apex: dict[str, bytes], store: FactStore) -> ApexIndex:
         if too_large:
             unavailable("APEX_STRUCTURE_LIMIT", "Apex source exceeds the bounded AST structural limits.")
             continue
+        if filename.casefold() == _FFLIB_UOW_INTERFACE:
+            _index_fflib_uow_interface(index, data, root)
         classes = [node for node in root.named_children if node.type == "class_declaration"]
         if len(classes) != 1 or _text(data, classes[0].child_by_field_name("name")).casefold() != filename.casefold():
             unavailable("APEX_CLASS_SHAPE_UNSUPPORTED", "Expected one outer class matching the source filename.")
@@ -631,22 +674,23 @@ class _MethodExtractor:
     def diagnostic(self, code, message, node, state="unsupported"):
         self.store.diagnostic(code, message, self.unit.location(node), state=state)
 
-    def record_type(self, node):
+    def record_type(self, node, *, unit=None):
         if node is None:
             return None, False
+        unit = self.unit if unit is None else unit
         collection = False
         if node.type == "generic_type":
             children = _significant(node)
-            if len(children) != 2 or self.unit.text(children[0]).casefold() != "list" or len(_significant(children[1])) != 1:
+            if len(children) != 2 or unit.text(children[0]).casefold() != "list" or len(_significant(children[1])) != 1:
                 return None, True
             node = _significant(children[1])[0]
             collection = True
         elif node.type == "array_type":
             node = node.child_by_field_name("element")
             collection = True
-        name = self.unit.text(node)
+        name = unit.text(node)
         if (not API_NAME.fullmatch(name) or name.casefold() in _PRIMITIVES
-                or name.casefold() in self.index.apex_types or name.casefold() in self.unit.declared_types):
+                or name.casefold() in self.index.apex_types or name.casefold() in unit.declared_types):
             return None, collection
         if (name.casefold() in self.index.object_names or name.casefold() in _STANDARD_OBJECTS
                 or name.lower().endswith(("__c", "__mdt", "__e", "__x"))):
@@ -683,7 +727,7 @@ class _MethodExtractor:
                     self.bindings.append(Binding(self.unit.text(name), None, False, node.parent, node, node.start_byte))
 
     def index_loop_binding(self, node):
-        """Use the explicit element type only inside the loop body.
+        """Use an explicit record or local wrapper type only inside the loop body.
 
         The iterable is evaluated in the outer scope. Its origin is not inferred;
         unsupported element declarations still shadow any outer record alias.
@@ -691,10 +735,11 @@ class _MethodExtractor:
         name, body = node.child_by_field_name("name"), node.child_by_field_name("body")
         if name is None or body is None:
             return False
-        owner, collection = self.record_type(node.child_by_field_name("type"))
+        type_node = node.child_by_field_name("type")
+        owner, collection = self.record_type(type_node)
         proven_owner = owner if not collection else None
         self.bindings.append(Binding(self.unit.text(name), proven_owner, False, body, node, body.start_byte))
-        return proven_owner is not None
+        return proven_owner is not None or self._local_wrapper_class(type_node) is not None
 
     def binding(self, name, node, *, report=True):
         ancestors = []
@@ -1111,8 +1156,8 @@ class _MethodExtractor:
             self.store.relation(self.method.id, target, "references", location, "apex.class_literal",
                                 qualifiers={"context": "class_literal"}, resolution=proof)
 
-    def _record_member(self, receiver):
-        """Resolve a record from a field or auto-getter in the current class."""
+    def _readable_member(self, receiver):
+        """Find an accessible field or auto-getter in the current class."""
         receiver = _without_parentheses(receiver)
         if receiver is None:
             return None
@@ -1144,8 +1189,71 @@ class _MethodExtractor:
             if (accessors.has_error or len(getters) != 1
                     or not any(token.type == ";" for token in getters[0].children)):
                 return None
+        return member
+
+    def _record_member(self, receiver):
+        member = self._readable_member(receiver)
+        if member is None:
+            return None
         owner, collection = self.record_type(member.type_node)
         return (owner, member) if owner and not collection else None
+
+    def _wrapper_record_member(self, receiver):
+        """Resolve one record field or automatic property on a typed local wrapper."""
+        receiver = _without_parentheses(receiver)
+        if receiver is None or receiver.type != "field_access" or _child(receiver, "safe_navigation_operator") is not None:
+            return None
+        wrapper = _without_parentheses(receiver.child_by_field_name("object"))
+        field_node = receiver.child_by_field_name("field")
+        if wrapper is None or wrapper.type != "identifier" or field_node is None or field_node.type != "identifier":
+            return None
+        binding = self.binding(self.unit.text(wrapper), wrapper, report=False)
+        if binding is None or binding.owner is not None or self._initializing_binding(binding.name, wrapper):
+            return None
+        declaration = binding.node.parent if binding.node.type == "variable_declarator" else binding.node
+        type_node = declaration.child_by_field_name("type") if declaration is not None else None
+        wrapper_class = self._local_wrapper_class(type_node)
+        if wrapper_class is None:
+            return None
+        unit = self.index.units_by_class[wrapper_class]
+        members = unit.member_declarations.get(self.unit.text(field_node).casefold(), ())
+        visible = {"public", "global"}
+        same_class = unit.class_id == self.unit.class_id
+        outer = unit.enclosing or unit
+        if len(members) != 1 or (not same_class and not _modifiers(outer.data, outer.class_node)[0] & visible):
+            return None
+        member = members[0]
+        if "static" in member.modifiers or (not same_class and not member.modifiers & visible):
+            return None
+        accessors = _child(member.node.parent, "accessor_list")
+        if accessors is not None:
+            # A computed or getter-only property does not establish a stored record.
+            declared = _significant(accessors)
+            getters = [item for item in declared if any(token.type == "get" for token in item.children)]
+            setters = [item for item in declared if any(token.type == "set" for token in item.children)]
+            if (len(declared) != 2 or accessors.has_error
+                    or len(getters) != 1 or len(setters) != 1
+                    or any(not any(token.type == ";" for token in accessor.children) for accessor in declared)):
+                return None
+            modifiers, _ = _modifiers(unit.data, getters[0])
+            if not same_class and modifiers and not modifiers & visible:
+                return None
+        owner, collection = self.record_type(member.type_node, unit=unit)
+        hierarchy = _class_hierarchy(self.index, self.store, wrapper_class)
+        if (not owner or collection or hierarchy is None
+                or any(owner.casefold() in scope.declared_types
+                       for scope in hierarchy + ([unit.enclosing] if unit.enclosing else []))):
+            return None
+        return owner, member, type_node
+
+    def _local_wrapper_class(self, type_node):
+        if type_node is None or type_node.type != "type_identifier":
+            return None
+        name = self.unit.text(type_node).casefold()
+        if (name in self.index.namespaces or name in self.index.object_names or name in _STANDARD_OBJECTS
+                or name.endswith(("__c", "__mdt", "__e", "__x"))):
+            return None
+        return self._literal_local_class(type_node)
 
     def field_access(self, node, relation="reads", *, operation="field_access"):
         resource, field_node = node.child_by_field_name("object"), node.child_by_field_name("field")
@@ -1181,6 +1289,16 @@ class _MethodExtractor:
                       {"basis": "declared_record_member", "object": owner,
                        "declaration": {key: declaration[key] for key in ("path", "locator")}})
             return
+        if field_node is not None and field_node.type == "identifier":
+            wrapper_member = self._wrapper_record_member(resource)
+            if wrapper_member is not None:
+                owner, member, wrapper_type = wrapper_member
+                self.edge(owner, self.unit.text(field_node), relation, node, "apex.wrapper_record_field",
+                          {"operation": operation, "effect": "memory"},
+                          {"basis": "declared_wrapper_record_member", "object": owner,
+                           "declaration": self.unit.location(wrapper_type),
+                           "member_declaration": member.unit.location(member.node)})
+                return
         if resource is None or resource.type != "identifier" or field_node is None:
             self.diagnostic("APEX_FIELD_PATH_UNSUPPORTED", "Only one direct field on a typed local record is supported; paths and indexed collections are not truncated.", node)
             # Preserve calls inside a complex receiver without extracting a
@@ -1514,6 +1632,8 @@ class _MethodExtractor:
         if receiver is None:
             return False
         name = name.casefold()
+        if name in _FFLIB_PUBLISH_TIMINGS:
+            return self._fflib_event_registration(node, receiver, name, args)
         if receiver.type == "identifier":
             qualifier = self.unit.text(receiver).casefold()
             root = qualifier
@@ -1543,23 +1663,100 @@ class _MethodExtractor:
             return False
         return True
 
+    def _publication_operand(self, value):
+        """Return an explicitly typed operand and any array dimensions on its declarator."""
+        value = _without_parentheses(value)
+        if value is None:
+            return None, 0
+        declaration = value
+        if value.type in {"identifier", "field_access"}:
+            binding = self.binding(self.unit.text(value), value, report=False) if value.type == "identifier" else None
+            if binding is not None:
+                declaration = binding.node
+            else:
+                member = self._readable_member(value)
+                if member is None:
+                    return None, 0
+                declaration = member.node
+        elif value.type not in {"object_creation_expression", "array_creation_expression", "cast_expression"}:
+            return None, 0
+        dimensions = sum(child.type == "[" for group in declaration.children_by_field_name("dimensions")
+                         for child in group.children)
+        if declaration.type == "variable_declarator":
+            declaration = declaration.parent
+        return declaration.child_by_field_name("type"), dimensions
+
+    def _event_argument(self, target):
+        type_node, dimensions = self._publication_operand(target)
+        if type_node is not None and type_node.type == "array_type":
+            dimensions += sum(child.type == "[" for group in type_node.children_by_field_name("dimensions")
+                              for child in group.children)
+            type_node = type_node.child_by_field_name("element")
+        owner, collection = self.record_type(type_node)
+        if not owner or not owner.casefold().endswith("__e") or dimensions + int(collection) > 1:
+            return None, False
+        return owner, collection or bool(dimensions)
+
+    def _fflib_event_registration(self, node, receiver, name, args):
+        """Record the registration, keeping normal call dispatch for a local implementation."""
+        if len(args) != 1:
+            return False
+        hierarchy, missing_ancestors = self.qualifier_hierarchy, []
+        if hierarchy is None:
+            if self.external_hierarchy is None:
+                return False
+            hierarchy, missing_ancestors = self.external_hierarchy
+        type_node, dimensions = self._publication_operand(receiver)
+        if dimensions or type_node is None or type_node.type != "type_identifier":
+            return False
+        uow = self.unit.text(type_node).casefold()
+        if uow not in _FFLIB_UOW_TYPES or any(uow in unit.declared_types for unit in hierarchy):
+            return False
+        # Local classes can shadow a framework name. A vendored implementation
+        # identifies its Unit of Work contract explicitly and keeps its call edges.
+        class_id = component_id("apexclass", uow)
+        local = self.index.units_by_class.get(class_id)
+        if class_id in self.store.components and self.store.is_ambiguous(class_id):
+            return False
+        if uow == "fflib_sobjectunitofwork" and uow in self.index.apex_types and local is None:
+            return False
+        owner, collection = self._event_argument(args[0])
+        if _FFLIB_UOW_INTERFACE in self.index.apex_types:
+            interface_id = component_id("apexclass", _FFLIB_UOW_INTERFACE)
+            if (interface_id not in self.store.components or self.store.is_ambiguous(interface_id)
+                    or not _fflib_accepts(self.index.fflib_interface_overloads.get(name, ()), collection)):
+                return False
+        if local is not None:
+            interfaces = local.class_node.child_by_field_name("interfaces")
+            if (uow != "fflib_sobjectunitofwork" or interfaces is None or _FFLIB_UOW_INTERFACE in local.declared_types
+                    or not any(local.text(item).casefold() == _FFLIB_UOW_INTERFACE
+                               for item in _significant(_child(interfaces, "type_list")))):
+                return False
+            methods = _method_candidates(self.index, self.store, class_id, name, 1, include_ambiguous=True)
+            overloads = [_fflib_overload(method.unit.data, method.node,
+                                        _significant(method.node.child_by_field_name("parameters"))[0]) for method in methods]
+            if not _fflib_accepts(overloads, collection) or any(self.store.is_ambiguous(method.id) for method in methods):
+                return False
+        if owner:
+            qualifiers = {"operation": "register_publish", "effect": "fflib_registration",
+                          "collection": collection, "timing": _FFLIB_PUBLISH_TIMINGS[name]}
+            resolution = {"basis": "typed_fflib_unit_of_work", "receiver_type": self.unit.text(type_node),
+                          "method": self.unit.text(node.child_by_field_name("name")), "parser": PARSER_VERSION}
+            if missing_ancestors:
+                qualifiers.update(resolution_status="candidate", uncertainty="external_hierarchy",
+                                  missing_ancestors=missing_ancestors)
+                resolution.update(basis="typed_fflib_unit_of_work_unverified_hierarchy", missing_ancestors=missing_ancestors)
+            self.edge(owner, None, "publishes", node, "apex.fflib_event_registration", qualifiers, resolution)
+        else:
+            self.diagnostic("APEX_PLATFORM_EVENT_PUBLISH_UNRESOLVED",
+                            "No concrete platform event type is established for this fflib registration.", node, "unresolved")
+        if local is None and _without_parentheses(receiver).type in {"object_creation_expression", "cast_expression"}:
+            self.visit(receiver)
+        return local is None
+
     def _event_publication(self, node, args, *, missing_ancestors=None):
-        target = _without_parentheses(args[0]) if len(args) in {1, 2} else None
-        owner, collection = None, False
-        if target is not None and target.type == "identifier":
-            binding = self.binding(self.unit.text(target), target, report=False)
-            if binding:
-                owner, collection = binding.owner, binding.collection
-        elif target is not None and target.type in {"object_creation_expression", "array_creation_expression", "cast_expression"}:
-            owner, collection = self.record_type(target.child_by_field_name("type"))
-            if target.type == "array_creation_expression":
-                dimensions = sum(child.type == "[" for dimension in target.children_by_field_name("dimensions")
-                                 for child in dimension.children)
-                if dimensions > 1 or (dimensions and collection):
-                    owner = None
-                elif dimensions == 1:
-                    collection = True
-        if owner and owner.casefold().endswith("__e"):
+        owner, collection = self._event_argument(args[0] if len(args) in {1, 2} else None)
+        if owner:
             qualifiers = {"operation": "publish", "effect": "event_bus", "collection": collection, "field_set": "unknown"}
             resolution = {"basis": "typed_platform_event", "parser": PARSER_VERSION}
             if missing_ancestors is None:

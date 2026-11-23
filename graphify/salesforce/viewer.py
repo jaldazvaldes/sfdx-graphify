@@ -218,9 +218,13 @@ class SnapshotView:
             return False
         if kind in {"instance_of", "sets_value"}:
             return mode == "schema"
+        if kind == "places_field":
+            return mode in {"schema", "impact"}
         if kind == "mentions":
             return mode == "automation"
         if mode == "schema":
+            if kind == "contains" and self.components[relation["target"]]["kind"] == "layout":
+                return True
             return (all(self.components[relation[key]]["kind"] in {"object", "field"}
                         for key in ("source", "target"))
                     and (kind == "contains" or (kind == "references" and

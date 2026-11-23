@@ -90,7 +90,7 @@ def _component_filters(html: str, *, process_graph: bool = False) -> str:
         <option value="schema">Schema</option>
         <option value="dependencies">Dependencies</option>{process_options}
       </select></label>
-    <p id="relationship-layer-help" class="graph-explanation">Schema: membership and lookups. Dependencies: usage in code and automation. Select a component to highlight its connections. Filters keep positions and groups fixed.</p>
+    <p id="relationship-layer-help" class="graph-explanation">The schema layer shows membership, lookups and field placement on page layouts. Dependencies show usage in code and automation. Select a component to highlight its connections. Filters keep positions and groups fixed.</p>
     <p id="visible-count" role="status" aria-live="polite"></p>
     <p id="empty-graph" hidden>No components match the selected types and communities.</p>
   </section>

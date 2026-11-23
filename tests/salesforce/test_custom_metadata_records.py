@@ -8,6 +8,8 @@ import json
 from graphify.salesforce.cli import main
 from graphify.salesforce.custom_metadata import extract_custom_metadata, index_custom_metadata
 from graphify.salesforce.schema import FactStore
+from graphify.salesforce.session import answer_request
+from graphify.salesforce.snapshot import load
 from graphify.salesforce.xml_source import METADATA_NS, XML_SCHEMA_INSTANCE_NS, parse_xml
 
 
@@ -93,6 +95,24 @@ def test_custom_metadata_cli_pins_accessor_and_summarizes_values_before_query_li
     assert {group["value"]: group["records"] for group in summary["groups"]} == {
         True: ["Sample_Settings.North"], False: ["Sample_Settings.South"],
     }
+    request = ["refs", field, "--snapshot", str(snapshot)]
+    assert main([*request, "--value", "true"]) == 2
+    invalid = json.loads(capsys.readouterr().out)
+    assert invalid["results"] == []
+    assert "--relation sets_value --format brief without --value" in invalid["error"]
+    assert main([*request, "--relation", "writes", "--value", "true"]) == 0
+    assert json.loads(capsys.readouterr().out)["value_filter"]["occurrence_count"] == 0
+
+    bundle = load(snapshot)
+    options = {"command": "refs", "name": field, "relation": "sets_value"}
+    values = answer_request(bundle, options)
+    assert values["exit_code"] == 0
+    assert values["result"]["custom_metadata_values"] == summary
+    for req in (options, {"command": "refs", "name": field}):
+        error = answer_request(bundle, {**req, "value": "true"})
+        assert error["exit_code"] == 2
+        assert error["result"]["error"] == invalid["error"]
+
     assert main(["deps", "Sample_Settings.North", "--snapshot", str(snapshot), "--format", "brief"]) == 0
     assert "--sets_value true-->" in capsys.readouterr().out
     assert main(["deps", "Sample_Settings.North", "--snapshot", str(snapshot), "--relation", "mentions"]) == 0

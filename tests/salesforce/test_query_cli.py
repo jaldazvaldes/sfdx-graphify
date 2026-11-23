@@ -300,6 +300,8 @@ def test_evidence_output_keeps_every_write_line_and_groups_by_path(bundle, monke
     first["resolution"] = {
         "assigned_value": {"type": "string", "value": "Ready"},
         "assigned_value_location": {"path": first["path"], "line": 4},
+        "record_update": {"element": "Save_Records", "collection": "Pending_Records",
+                          "site": {"path": first["path"], "line": 17}},
     }
     bundle["facts"]["relationships"][0]["qualifiers"]["effect"] = "memory"
     args = ["refs", "Account.Name", "--relation", "writes", "--snapshot", "unused", "--format", "evidence"]
@@ -308,8 +310,134 @@ def test_evidence_output_keeps_every_write_line_and_groups_by_path(bundle, monke
     assert "2 occurrences" in output
     assert output.count("flows/Sample.flow-meta.xml") == 1
     assert '10 set_name writes [memory] "Ready" (value at 4)' in output
+    assert "Update attempt Save_Records at line 17 (collection Pending_Records)" in output
     assert output.index("8 set_name writes [memory]") < output.index("10 set_name writes [memory]")
     assert "evidence:0" not in output
+
+
+@pytest.mark.parametrize("output_format", ["evidence", "summary"])
+def test_relation_query_compacts_supplemental_hints_only(bundle, monkeypatch, capsys, output_format):
+    from graphify.salesforce import blind_spots, snapshot
+
+    monkeypatch.setattr(snapshot, "load", lambda path: bundle)
+    path = "layouts/Other.layout-meta.xml"
+    hit = {"literal": "Name", "occurrence_count": 2, "file_count": 1, "example_paths": [path]}
+    empty = {"literal": "Account.Name", "occurrence_count": 0, "file_count": 0, "example_paths": []}
+    hints = {"state": "indexed", "scanned_file_count": 4, "skipped_file_count": 2,
+             "qualified": empty, "field_name": hit, "interpretation": "Full literal interpretation.",
+             "apex_strings": {"scanned_file_count": 3, "skipped_file_count": 1,
+                              "qualified": empty, "field_name": empty}}
+    monkeypatch.setattr(blind_spots, "literal_mentions", lambda manifest, component: hints)
+    args = ["refs", "Account.Name", "--snapshot", "unused", "--format", output_format]
+    assert cli.main([*args, "--relation", "writes"]) == 0
+    scoped = capsys.readouterr().out
+    assert "Metadata (4 scanned, 2 skipped): 0/0 qualified, 2/1 field name" in scoped
+    assert "Apex strings (3 scanned, 1 skipped): 0/0 qualified, 0/0 field name" in scoped
+    assert "other objects or unrelated text" in scoped and "--format text" in scoped
+    assert "Sample.flow-meta.xml" in scoped and "writes" in scoped
+    assert path not in scoped and "check-apex" not in scoped
+    assert cli.main(args) == 0
+    assert path in capsys.readouterr().out
+    assert cli.main([*args, "--relation", "writes", "--format", "brief"]) == 0
+    assert path in capsys.readouterr().out
+    hints["apex_strings"]["field_name"] = hit
+    assert cli.main([*args, "--relation", "writes", "--format", "evidence"]) == 0
+    assert "Use check-apex" in capsys.readouterr().out
+
+
+def test_compact_method_literal_hints_preserve_overload_ambiguity():
+    from graphify.salesforce.evidence_text import compact_literal_hints
+
+    hit = {"occurrence_count": 3, "file_count": 2}
+    hints = {"scanned_file_count": 5, "skipped_file_count": 1, "qualified": hit, "method_name": hit}
+    output = "\n".join(compact_literal_hints(hints))
+    assert "3/2 method name" in output
+    assert "overloads share hints" in output
+
+
+def test_summary_selects_representative_citations_and_keeps_exact_values(bundle, monkeypatch, capsys):
+    from graphify.salesforce import snapshot
+
+    monkeypatch.setattr(snapshot, "load", lambda path: bundle)
+    bundle["manifest"]["schema_version"] = 13
+    first, second = bundle["facts"]["evidence"][:2]
+    first.update(line=10, rule="flow.record_input_field",
+                 locator="/Flow/recordUpdates[@name=Save_It]/inputAssignments[2]/field",
+                 resolution={"assigned_value": {"type": "string", "value": "Ready"}})
+    second["line"] = 8
+    args = ["refs", "Account.Name", "--relation", "writes", "--snapshot", "unused", "--format", "summary"]
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert "2 occurrences across 1 groups" in output
+    assert "flows/\n  Sample.flow-meta.xml:8 set_name writes (+1 more)" in output
+    assert "Sample.flow-meta.xml:10" not in output
+
+    assert cli.main([*args, "--value", "Ready"]) == 0
+    output = capsys.readouterr().out
+    assert 'Assigned literal "Ready": 1 matching occurrences' in output
+    assert "1 indexed write occurrence has an unknown assigned value" in output
+    assert "flows/Sample.flow-meta.xml\n  10 set_name writes" in output
+    assert "[Record update Save_It]" in output
+
+
+def test_summary_save_automation_uses_distinct_examples_by_phase():
+    from graphify.salesforce.evidence_text import summary_lines
+
+    target = "sf:object:account"
+    edges = []
+    for name, timing in [("one", "before_save"), ("two", "before_save"), ("three", "after_save")]:
+        edges.append({"source": f"sf:flow:{name}", "target": target, "relation": "triggered_by",
+                      "qualifiers": {"timing": timing, "local_status": "Active"},
+                      "evidence": [{"path": f"flows/{name}.flow-meta.xml", "line": 10}]})
+    result = {"component": {"id": target}, "save_automation": {"state": "indexed"}, "results": edges}
+    output = "\n".join(summary_lines(result))
+    assert "3 occurrences across 2 groups" in output
+    assert "one.flow-meta.xml:10 triggered_by before_save Active (+1 more)" in output
+    assert "three.flow-meta.xml:10 triggered_by after_save Active" in output
+    assert "two.flow-meta.xml" not in output
+
+
+def test_event_text_summarizes_grants_and_orders_publications_by_caller_evidence():
+    from graphify.salesforce.evidence_text import evidence_lines, summary_lines
+
+    event = "sf:object:sample__e"
+    edges = []
+    for sender, path, caller_status in [
+        ("a", "classes/ACallerless.cls", "no_indexed_production_callers"),
+        ("z", "classes/ZWithCaller.cls", "candidate_production_caller"),
+    ]:
+        edges.append({"id": sender, "source": f"sf:apexmethod:{sender}.send", "target": event,
+                      "relation": "publishes", "qualifiers": {},
+                      "publication_context": {"caller_status": caller_status, "emission": "unverified"},
+                      "evidence": [{"path": path, "line": 10}]})
+    grant = {"id": "grant", "source": "sf:permissionset:sample", "target": event, "relation": "grants",
+             "qualifiers": {"permission": "create"},
+             "evidence": [{"path": "permissionsets/Sample.permissionset-meta.xml", "line": 2}]}
+    result = {"component": {"id": event}, "platform_event": {"relation_filter": None},
+              "results": [*edges, grant]}
+    for render in (evidence_lines, summary_lines):
+        output = "\n".join(render(result))
+        assert output.index("ZWithCaller.cls") < output.index("ACallerless.cls")
+        assert "[candidate direct production caller] [emission unverified]" in output
+        assert "[no indexed production callers] [emission unverified]" in output
+        assert "Permission grants summarized (1 returned relationship)" in output
+        assert "Sample.permissionset-meta.xml" not in output
+        details = {**result, "platform_event": {"relation_filter": "grants"}, "results": [grant]}
+        assert "Sample.permissionset-meta.xml" in "\n".join(render(details))
+    assert result["results"] == [*edges, grant]
+
+
+def test_evidence_distinguishes_method_declaration_from_outbound_message_call():
+    from graphify.salesforce.evidence_text import evidence_lines, summary_lines
+
+    edges = [{"relation": relation, "source": "sf:flow:sample", "target": target, "qualifiers": {},
+              "evidence": [{"path": "flows/Sample.flow-meta.xml", "line": 10}]}
+             for relation, target in [("contains", "sf:apexmethod:owner.run"),
+                                      ("calls", "sf:outboundmessage:order.dispatch")]]
+    for render in (evidence_lines, summary_lines):
+        output = "\n".join(render({"results": edges}))
+        assert "contains owner.run [method declaration]" in output
+        assert "calls order.dispatch [outbound message]" in output
 
 
 def test_empty_component_search_explains_tracked_scope(bundle):

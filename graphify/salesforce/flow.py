@@ -1,7 +1,7 @@
 """Bounded, deterministic Salesforce Flow dependency extraction.
 
-The handlers follow the public Metadata API Flow reference. They deliberately
-do not evaluate formulas or model execution order.
+The handlers follow the public Metadata API Flow reference. They do not
+evaluate formulas or predict which paths execute.
 """
 
 from __future__ import annotations
@@ -15,23 +15,24 @@ from .symbols import API_NAME, RESOURCE_NAME, index_symbols, literal, screen_fie
 from .formula_refs import COLLECTION_ITEM_REFERENCE, formula_references
 from .relationship_paths import add_navigation_reads, resolve_flow_record_path, resolve_source_field_path
 from .write_values import flow_write_value
+from .xml_source import Node
 
 _BASE = {"name", "label", "description", "locationX", "locationY", "connector", "faultConnector", "processMetadataValues"}
 _OP = _BASE | {"object", "filters", "filterLogic"}
 _VALUE = {"elementReference", "stringValue", "booleanValue", "numberValue", "dateValue", "dateTimeValue"}
 _COLLECTION_FILTER_MODES = {"Formula", "formula_evaluates_to_true"}
 _UNSUPPORTED = {
-    "formula": "Formula expressions are outside v0.1 expression coverage.",
+    "formula": "The extractor cannot resolve formula dependencies in this context.",
     "loops": "The loop does not establish a typed record and iteration path.",
-    "collectionProcessors": "Collection processing is outside v0.1 coverage.",
-    "collectionFilter": "Collection filtering is outside v0.1 coverage.",
-    "dynamicChoiceSets": "Dynamic choice resources are outside v0.1 coverage.",
-    "choices": "Choice resources are outside v0.1 coverage.",
-    "apexPluginCalls": "Apex plug-in calls are outside v0.1 coverage.",
-    "waits": "Wait event expressions are outside v0.1 coverage.",
-    "recordRollbacks": "Transaction rollback semantics are outside v0.1 coverage.",
-    "relatedRecords": "Related record lookup traversal is outside v0.1 coverage.",
-    "scheduledPaths": "Scheduled path expressions are outside v0.1 coverage.",
+    "collectionProcessors": "Collection processor extraction requires a typed record collection filter with supported conditions.",
+    "collectionFilter": "The extractor expects collectionProcessors with collectionProcessorType set to FilterCollectionProcessor.",
+    "dynamicChoiceSets": "The extractor does not trace fields used to build a dynamic choice set.",
+    "choices": "The extractor does not trace dependencies of choice values.",
+    "apexPluginCalls": "The extractor does not link Apex plug-in calls to their implementation.",
+    "waits": "The extractor does not trace wait event conditions or their input values.",
+    "recordRollbacks": "The extractor does not determine which record changes a rollback reverses.",
+    "relatedRecords": "The extractor does not trace relatedRecords nested in record lookups.",
+    "scheduledPaths": "The extractor does not trace scheduling conditions or time-source fields on scheduled paths.",
 }
 _CHILDREN = {
     "Flow": {"apiVersion", "fullName", "label", "description", "interviewLabel", "processType", "status", "runInMode",
@@ -98,6 +99,52 @@ _CHILDREN = {
 }
 
 
+def _unique_child(node: Node, tag: str) -> Node | None:
+    children = node.all(tag)
+    return children[0] if len(children) == 1 else None
+
+
+def _connector_target(node: Node, tag: str) -> str:
+    connector = _unique_child(node, tag)
+    if connector is None or not _known_children(connector):
+        return ""
+    return literal(connector, "targetReference").casefold()
+
+
+def _known_children(node: Node) -> bool:
+    return all(child.tag in _CHILDREN[node.tag] for child in node.children)
+
+
+def _loop_update_assignments(
+    assignment: Node, loop_name: str, collection: str,
+) -> list[Node] | None:
+    """Match direct field assignments followed by one addition of the current item."""
+    items = assignment.all("assignmentItems")
+    if len(items) < 2 or not all(_known_children(item) for item in items):
+        return None
+    add = items[-1]
+    value = _unique_child(add, "value")
+    if (literal(add, "operator") != "Add" or literal(add, "assignToReference").casefold() != collection
+            or value is None or len(value.children) != 1
+            or literal(value, "elementReference").casefold() != loop_name):
+        return None
+
+    targets = []
+    fields = set()
+    for item in items[:-1]:
+        record, _, field = literal(item, "assignToReference").casefold().partition(".")
+        value = _unique_child(item, "value")
+        if (record != loop_name or not API_NAME.fullmatch(field) or field in fields
+                or literal(item, "operator") != "Assign" or value is None or not _known_children(value)):
+            return None
+        target = _unique_child(item, "assignToReference")
+        if target is None:
+            return None
+        fields.add(field)
+        targets.append(target)
+    return targets
+
+
 class _Extractor:
     def __init__(self, document, store, source):
         self.doc = document
@@ -156,7 +203,8 @@ class _Extractor:
             add_navigation_reads(self.store, self.source, location, resolution, rule="flow.relationship_navigation",
                                  qualifiers={"context": "flow_relationship_navigation"})
 
-    def reference(self, node, relation="reads", rule="flow.direct_reference", qualifiers=None, *, literal=None):
+    def reference(self, node, relation="reads", rule="flow.direct_reference", qualifiers=None, *, literal=None,
+                  record_update=None):
         if node is None:
             return
         self.handled_references.add(node.locator)
@@ -204,6 +252,8 @@ class _Extractor:
         basis = {"basis": symbol.basis, "symbol": symbol.name, "object": symbol.object_type,
                  "collection": symbol.collection,
                  "declaration": {key: symbol.location[key] for key in ("path", "locator")}}
+        if record_update is not None:
+            basis["record_update"] = record_update
         qualified = dict(qualifiers or {})
         if each_item:
             basis["item_selector"] = "$EachItem"
@@ -334,7 +384,8 @@ class _Extractor:
             if child.tag == "elementReference":
                 self.reference(child, relation, rule, qualifiers)
             elif child.tag not in _VALUE:
-                self.diagnostic("FLOW_VALUE_UNSUPPORTED", "This value representation is outside v0.1 coverage.", child)
+                self.diagnostic("FLOW_VALUE_UNSUPPORTED",
+                                "Expected an element reference or a string, boolean, number, date or date-time literal.", child)
 
     def filters(self, node, owner, operation, resolution=None):
         for item in node.all("filters"):
@@ -633,22 +684,74 @@ class _Extractor:
                 if upsert is not None:
                     self.field_edge(owner, upsert.text.strip(), "filters", upsert, "flow.upsert_key", {"operation": operation_name})
 
+    def loop_record_updates(self):
+        """Link a typed loop item's field assignments to the loop-exit update input."""
+        if not self.symbols.loop_scopes:
+            return {}
+        named: dict[str, list[Node]] = {}
+        for node in self.doc.root.children:
+            if name := literal(node, "name").casefold():
+                named.setdefault(name, []).append(node)
+
+        updates = {}
+        for loop in self.doc.root.all("loops"):
+            loop_name = literal(loop, "name").casefold()
+            scope = self.symbols.loop_scopes.get(loop_name)
+            if (loop.locator not in self.symbols.supported_loops or not scope
+                    or loop.all("connector") or loop.all("faultConnector") or not _known_children(loop)):
+                continue
+            body = named.get(_connector_target(loop, "nextValueConnector"), [])
+            exit_nodes = named.get(_connector_target(loop, "noMoreValuesConnector"), [])
+            if len(body) != 1 or len(exit_nodes) != 1:
+                continue
+            assignment, update = body[0], exit_nodes[0]
+            if (assignment.tag != "assignments" or assignment.locator not in scope
+                    or _connector_target(assignment, "connector") != loop_name or assignment.all("faultConnector")
+                    or update.tag != "recordUpdates"
+                    or any(update.all(tag) for tag in ("object", "filters", "filterLogic", "inputAssignments"))
+                    or not _known_children(assignment) or not _known_children(update)):
+                continue
+            input_reference = _unique_child(update, "inputReference")
+            collection = literal(update, "inputReference")
+            update_name = literal(update, "name")
+            if (input_reference is None or not API_NAME.fullmatch(collection) or not API_NAME.fullmatch(update_name)
+                    or collection.casefold() == literal(loop, "collectionReference").casefold()):
+                continue
+            item_symbol = self.symbols.unique(loop_name)
+            output_symbol = self.symbols.unique(collection)
+            if (item_symbol is None or item_symbol.basis != "loop_current_item" or not item_symbol.object_type
+                    or output_symbol is None
+                    or not output_symbol.collection or not output_symbol.object_type
+                    or output_symbol.basis != "declared_variable"
+                    or output_symbol.object_type.casefold() != item_symbol.object_type.casefold()):
+                continue
+            targets = _loop_update_assignments(assignment, loop_name, collection.casefold())
+            if targets is None:
+                continue
+            record_update = {"element": update_name, "collection": collection,
+                             "site": self.doc.location(input_reference)}
+            updates.update((target.locator, record_update) for target in targets)
+        return updates
+
     def assignments(self):
+        updates = self.loop_record_updates()
         for assignment in self.doc.root.all("assignments"):
             for item in assignment.all("assignmentItems"):
                 operator = item.value("operator")
                 if operator not in ("Assign", "Add", "Subtract", "Multiply", "Divide"):
-                    self.diagnostic("FLOW_ASSIGNMENT_OPERATOR_UNSUPPORTED", "This assignment operator is outside scalar/direct-record v0.1 coverage.", item)
+                    self.diagnostic("FLOW_ASSIGNMENT_OPERATOR_UNSUPPORTED", "Expected Assign, Add, Subtract, Multiply or Divide.", item)
                     continue
                 qualifiers = {"operation": "assignment", "effect": "memory", "operator": operator}
                 target = item.child("assignToReference")
                 if target is not None and operator != "Assign" and "." not in target.text:
                     symbol = self.symbols.resolve(target.text.strip(), target)
                     if symbol and (symbol.collection or symbol.object_type):
-                        self.diagnostic("FLOW_ASSIGNMENT_OPERATOR_UNSUPPORTED", "Collection and whole-record arithmetic is outside v0.1 coverage.", item)
+                        self.diagnostic("FLOW_ASSIGNMENT_OPERATOR_UNSUPPORTED",
+                                        "The extractor does not track arithmetic assignments to a collection or a whole record.", item)
                         continue
                 literal = flow_write_value(self.doc, item.child("value")) if operator == "Assign" else None
-                self.reference(target, "writes", "flow.assignment_destination", qualifiers, literal=literal)
+                self.reference(target, "writes", "flow.assignment_destination", qualifiers, literal=literal,
+                               record_update=updates.get(target.locator) if target is not None else None)
                 if operator != "Assign":
                     self.reference(target, "reads", "flow.assignment_existing_value", qualifiers)
                 self.value(item.child("value"), "reads", "flow.assignment_source", qualifiers)
@@ -700,7 +803,7 @@ class _Extractor:
                 elif unsupported:
                     self.diagnostic("FLOW_CONSTRUCT_UNSUPPORTED", _UNSUPPORTED[child.tag], child, construct=child.tag)
                 elif unknown and not inherited_unsupported:
-                    self.diagnostic("FLOW_XML_ELEMENT_UNSUPPORTED", "The XML element is not classified by the v0.1 handler for this parent.", child,
+                    self.diagnostic("FLOW_XML_ELEMENT_UNSUPPORTED", "The extractor does not recognize this XML element under its parent.", child,
                                     construct=child.tag, parent_construct=node.tag)
                 elif child.tag in {"elementReference", "leftValueReference", "assignToReference", "inputReference", "outputReference", "field", "objectFieldReference"} and child.locator not in self.handled_references and not inherited_unsupported:
                     self.diagnostic("FLOW_REFERENCE_CONTEXT_UNSUPPORTED", "This reference occurs outside a supported dependency context.", child,

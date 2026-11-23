@@ -1,6 +1,6 @@
 // Shared visibility: node filters and canonical relationship layers compose.
 const TYPE_LABELS = new Map([
-  ['flow', 'Flows'], ['object', 'Objects'], ['field', 'Fields'],
+  ['flow', 'Flows'], ['object', 'Objects'], ['field', 'Fields'], ['layout', 'Page layouts'],
   ['apexclass', 'Apex classes'], ['apexmethod', 'Apex methods'], ['apextrigger', 'Triggers'],
   ['lwc', 'Lightning components'], ['outboundmessage', 'Outbound messages'],
   ['validationrule', 'Validation rules'],

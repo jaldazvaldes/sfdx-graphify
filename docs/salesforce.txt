@@ -1,4 +1,4 @@
-sfdx-graphify 0.6.1
+sfdx-graphify 0.6.4
 Local Salesforce dependency evidence
 
 This is an independent community fork of Graphify, not affiliated with or
@@ -8,7 +8,7 @@ From the fork checkout, build the current standalone wheel and install it in
 its own Python 3.10+ environment with uv:
 
   uv run --no-project --with build python scripts/build_salesforce_wheel.py --out-dir dist
-  uv tool install ./dist/sfdx_graphify-0.6.1-py3-none-any.whl
+  uv tool install ./dist/sfdx_graphify-0.6.4-py3-none-any.whl
   sfdx-graphify --version
   sfdx-graphify install --platform claude
 
@@ -46,6 +46,25 @@ version.
 The module form works without installing the console script:
 
   python -m graphify.salesforce guide
+
+For a structural question, read the Flow XML file from the revision being investigated:
+  sfdx-graphify flow-outline force-app/main/default/flows/Sample_Flow.flow-meta.xml
+
+The JSON outline lists direct Flow children in document order. Each row contains the
+element type, opening line, closing line and selected fields as [field, line, value].
+Use --element decisions or --element start to narrow it, then read the cited XML
+for nested conditions, connectors and defaults. A next_offset value can be passed
+to --offset with the same filter to continue. This command reads the named file
+directly and works without a snapshot.
+
+The start row includes any declared entry formula, filter logic, and requirement
+that a record change to meet the criteria. Each direct filters row contains its
+closing line and ordered terms as [field, line, value], including typed operands.
+Use the cited XML range when partial, clipped_formula_lines, omitted_entry_filters
+or omitted_fields appears, or a value ends in an ellipsis. These are static
+declarations; whether a particular record triggers the Flow depends on its data
+and the applicable settings.
+
   python -m graphify.salesforce build <salesforce-project> --out <external-directory>
   python -m graphify.salesforce refs Account.Name --snapshot <external-directory>
   python -m graphify.salesforce deps SampleAccount --snapshot <external-directory>
@@ -66,6 +85,25 @@ Timing measurements stay outside the snapshot and its identity.
 Use --format evidence on refs, deps, and impact to get source locations
 grouped by file. This includes all occurrences of the returned relationships
 and keeps their candidate status, write effects, and matching literal sites.
+Use --format summary for counts and representative citations. Combine the
+directory heading with each filename to cite a relative source path. Save
+automation counts are accompanied by representative citations by kind and
+phase. Mixed custom metadata queries summarize record values and show
+representative citations for dependencies. An exact --value query keeps
+every returned matching location and reports indexed writes of unknown value.
+To inspect declared custom metadata record values, use refs Type__mdt.Field__c
+--relation sets_value --format summary. The --value filter applies to writes.
+For Platform Event refs, publication rows show indexed caller evidence.
+Publish statements, including those with indexed callers, leave emission
+unverified. Default text output summarizes permission grants. Use
+--relation grants for grant details or JSON to keep every returned relationship.
+Text rows identify Apex method declarations and show the target kind for Flow,
+Apex class and outbound message calls. Use --relation calls for a caller list.
+For supported Flow loop assignments, write evidence can also cite the later
+record update that receives the accumulated collection. The assignment remains
+an in-memory write and the cited update is an attempt on the documented path.
+Reachability for a particular record and transaction commit depend on runtime
+conditions. Missing update evidence leaves the persistence path unresolved.
 For Apex references found by text search, check the complete source file with
 sfdx-graphify check-apex --source . path/to/Class.cls:42.
 A code result identifies syntax outside comments. Verify the assignment,
@@ -76,6 +114,8 @@ The installed command is sfdx-graphify. JSON is the default and keeps full
 coverage details. Query output with --format brief includes one source location
 per relationship and diagnostic totals. Use --format text for all displayed
 evidence and diagnostic records with a short coverage summary.
+With an explicit --relation, --format evidence and --format summary report counts
+for supplemental literal hints. Use --format text to inspect example paths.
 Add --full-coverage to include the complete coverage object in text output. Use --source and --require-current on a query when freshness
 must be verified. Queries without source access report unknown freshness. Name
 ambiguity is an error with candidates, including duplicate local definitions.
@@ -268,6 +308,13 @@ Use an exact component ID such as sf:object:account when the same name belongs
 to multiple component kinds. Apex .class literals for proven sObjects reference
 the object.
 
+Use refs Account.Name --relation places_field --format evidence to list the
+page layouts that place a field and the XML lines declaring each placement.
+Use deps on a layout's full metadata name to list its fields with the same
+relation filter. Each placement comes from a field in a page layout section.
+The XML establishes the layout configuration. Which layout a user sees
+depends on record type and profile assignments.
+
 For fields and Apex methods present in the graph, refs also returns
 literal_blind_spots from snapshots that include the corresponding index. Field
 scans cover layouts, FlexiPages, quick actions, permissions, reports, approvals,
@@ -366,8 +413,9 @@ The save query counts active record-triggered flows by timing, Apex triggers,
 and validation rules from local declarations. The count precedes the result
 limit. Trigger conditions and transaction order require further evidence.
 
-Platform event edges describe literal or typed Apex publications, verified Flow
-creates, and Apex or Flow subscription declarations. A candidate publication
+Platform event edges describe literal or typed Apex publications, fflib Unit
+of Work registrations, verified Flow creates, and Apex or Flow subscription
+declarations. A candidate publication
 retains the reason for uncertainty. Event direction summarizes local production
 evidence. Apex publish sites without indexed production callers are flagged.
 Build with --include-permissions to see declared Create grants from permission
@@ -553,6 +601,15 @@ concretely typed platform event or event collection records a write to the
 event object with operation publish. These facts identify the call site and
 target and leave delivery and subscriber execution to runtime evidence.
 
+The publishes relation also covers registerPublishBeforeTransaction,
+registerPublishAfterSuccessTransaction and registerPublishAfterFailureTransaction
+on a receiver typed as fflib_ISObjectUnitOfWork or fflib_SObjectUnitOfWork when
+the argument identifies a concrete platform event, a typed list or a
+one-dimensional array of that event. An unavailable ancestor that could
+shadow the receiver type leaves the registration as a candidate.
+The cited line is the registration. The timing qualifier records the requested
+phase. Publication depends on commitWork and the transaction outcome.
+
 Queries expose candidates as resolution.status=candidate with confidence
 AMBIGUOUS, a reason and source evidence. Reasons distinguish external caller
 hierarchy, conditional virtual dispatch and the fflib event convention. External
@@ -589,7 +646,11 @@ wire adapters establish separate static call candidates. Local bindings and
 shadowing are checked with the pinned JavaScript AST. Literal @salesforce/schema
 imports create object and field references, including resolved lookup hops.
 Aura tracks verified enqueues of literal controller actions to unique local
-@AuraEnabled methods. Visualforce references unique local Apex controllers and
+@AuraEnabled methods. For an Aura bundle, use deps <AuraBundle> --relation calls
+--format evidence to locate the markup root declaring its Apex controller and
+the JavaScript lookup and enqueue for each action. The line beside each target
+is the lookup. An enqueue labeled with a line number is in that same script.
+Visualforce references unique local Apex controllers and
 extensions declared in markup. It also tracks supported literal action bindings
 and remote action calls to unique local Apex targets. Dynamic bindings and ambiguous
 targets remain diagnostic. Source modules and markup are hashed for provenance.
@@ -787,9 +848,9 @@ option pages through all file diagnostics without discarding canonical records.
 With --before, the viewer compares canonical facts and their evidence. It also
 discloses extractor/schema/scope/source-input differences: added edges after an
 extractor upgrade can mean expanded coverage, not a source or runtime change.
-Version stamps alone do not mark evidence as changed. Schema versions 1 through 12
-remain readable. New builds emit schema 13 for save automation, platform events
-and declared custom metadata defaults. Rebuild from source
+Version stamps alone do not mark evidence as changed. Schema versions 1 through 13
+remain readable. New builds emit schema 14 with page layouts and their field
+placements. Rebuild from source
 and restart pinned sessions and viewers to load the
 new generation. Verify source freshness separately with status --source. Record
 the extractor revision with the snapshot ID. Start the query server with

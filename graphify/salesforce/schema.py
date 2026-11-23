@@ -9,14 +9,14 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 SUPPORTED_SCHEMA_VERSIONS = frozenset(range(1, SCHEMA_VERSION + 1))
-EXTRACTOR_VERSION = "0.6.1"
+EXTRACTOR_VERSION = "0.6.4"
 UPSTREAM_REVISION = "06aa51be050170675912781ad8a2be2b20439d39"
 TESTED_API_VERSIONS = ("64.0",)
 CUSTOM_METADATA_RELATIONS = frozenset({"instance_of", "sets_value", "mentions"})
 ENTRY_RELATIONS = frozenset({"triggered_by", "publishes", "subscribes"})
-RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains", "grants"}) | CUSTOM_METADATA_RELATIONS | ENTRY_RELATIONS
+RELATIONS = frozenset({"reads", "writes", "filters", "calls", "references", "contains", "grants", "places_field"}) | CUSTOM_METADATA_RELATIONS | ENTRY_RELATIONS
 _SCHEMA_9_KINDS = frozenset({"approvalprocess", "aura", "visualforcepage", "visualforcecomponent"})
 _PERMISSION_KINDS = frozenset({"profile", "permissionset"})
 _SCHEMA_10_KINDS = _PERMISSION_KINDS | {"namedcredential"}
@@ -25,7 +25,7 @@ PERMISSIONS_BY_TARGET = {
     "object": frozenset({"read", "create", "edit", "delete", "view_all_records", "modify_all_records", "view_all_fields"}),
     "apexclass": frozenset({"execute"}),
 }
-KINDS = frozenset({"object", "field", "flow", "apexclass", "apexmethod", "apextrigger", "lwc",
+KINDS = frozenset({"object", "field", "layout", "flow", "apexclass", "apexmethod", "apextrigger", "lwc",
                    "outboundmessage", "validationrule", "workflowrule", "custommetadatarecord"}) | _SCHEMA_9_KINDS | _SCHEMA_10_KINDS
 _QUALIFIED_KINDS = frozenset({"field", "outboundmessage", "validationrule", "approvalprocess", "custommetadatarecord"})
 API_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -34,6 +34,7 @@ _DISPATCH_CANDIDATE_INVOCATIONS = {"conditional_virtual_dispatch": "constructed_
 RELATED_EVIDENCE_SITES = (("dispatch_site", "Dispatch"), ("class_literal", "Domain literal"),
                           ("construct_site", "Factory construction"), ("constructor", "Domain constructor"),
                           ("hook", "Hook"), ("member_declaration", "Member declaration"))
+_SUPPLEMENTAL_EVIDENCE_KEYS = frozenset({"assigned_value_location", "record_update"})
 
 
 class DataError(ValueError):
@@ -70,9 +71,9 @@ def stable_id(prefix: str, value) -> str:
 
 
 def _evidence_id(relationship, location, rule, resolution):
-    # A literal's value affects identity. Its physical position can move after formatting.
-    if "assigned_value_location" in resolution:
-        resolution = {key: value for key, value in resolution.items() if key != "assigned_value_location"}
+    # Supplementary provenance can change without replacing the original write occurrence.
+    if _SUPPLEMENTAL_EVIDENCE_KEYS.intersection(resolution):
+        resolution = {key: value for key, value in resolution.items() if key not in _SUPPLEMENTAL_EVIDENCE_KEYS}
     return stable_id("ev", [relationship, location["path"], location["locator"], rule, resolution])
 
 
@@ -119,6 +120,11 @@ def _method_types_valid(text: str) -> bool:
 def component_id(kind: str, api_name: str) -> str:
     if kind not in KINDS:
         raise DataError(f"Unsupported component kind: {kind}")
+    if kind == "layout":
+        owner, _, name = api_name.partition("-")
+        if not API_NAME.fullmatch(owner) or not name.isprintable() or not name or name != name.strip():
+            raise DataError(f"Invalid {kind} API name: {api_name}")
+        return f"sf:{kind}:" + quote(api_name.casefold(), safe="._")
     if kind == "profile":
         if not api_name.isprintable() or api_name != api_name.strip():
             raise DataError(f"Invalid {kind} API name: {api_name}")
@@ -184,6 +190,9 @@ class FactStore:
                      else _namespace(qualified_parts[0] + "__mdt") if kind == "custommetadatarecord"
                      else _namespace(qualified_parts[0]) if kind == "workflowrule"
                      else _namespace(api_name.partition("(")[0]))
+        if kind == "layout":
+            prefix, separator, _ = api_name.partition("-")[2].partition("__")
+            namespace = prefix if separator and API_NAME.fullmatch(prefix) else None
         current = self.components.setdefault(cid, {
             "id": cid, "kind": kind, "api_name": api_name,
             "namespace": namespace, "definition_status": "referenced_only",
@@ -361,6 +370,8 @@ def validate_bundle(bundle):
                 raise DataError("Profiles, permission sets and Named Credentials require snapshot schema version 10.")
             if manifest["schema_version"] < 11 and component["kind"] == "custommetadatarecord":
                 raise DataError("Custom metadata records require snapshot schema version 11.")
+            if manifest["schema_version"] < 14 and component["kind"] == "layout":
+                raise DataError("Page layouts require snapshot schema version 14.")
             if manifest["schema_version"] < 8 and component["kind"] == "workflowrule":
                 raise DataError("Workflow rules require snapshot schema version 8.")
             if manifest["schema_version"] < 4 and component["kind"] == "apexmethod" and "(" in component["api_name"]:
@@ -409,6 +420,16 @@ def validate_bundle(bundle):
             qualifiers = relationship["qualifiers"]
             if not isinstance(qualifiers, dict):
                 raise DataError("Invalid relationship qualifiers.")
+            if relation == "places_field":
+                layout, field = components[source], components[target]
+                if (layout["kind"] != "layout" or layout["definition_status"] != "defined"
+                        or field["kind"] != "field" or field["definition_status"] == "ambiguous"
+                        or qualifiers):
+                    raise DataError("Invalid layout field placement.")
+                owner = layout["api_name"].partition("-")[0].casefold()
+                field_owner, field_name = field["api_name"].split(".")
+                if owner != field_owner.casefold() and shared_activity_field(components, owner, field_name) != field:
+                    raise DataError("Layout field placement targets a field on a different object.")
             if relation in CUSTOM_METADATA_RELATIONS:
                 _validate_custom_metadata_relationship(manifest["schema_version"], relation,
                                                        components[source], components[target], qualifiers)
@@ -467,6 +488,10 @@ def validate_bundle(bundle):
                 if occurrence["relationship_id"] != rid or occurrence["source_component"] != source:
                     raise DataError("Evidence points to the wrong relationship.")
                 validate_location(occurrence)
+                if relation == "places_field" or occurrence["rule"] == "layout.item_field":
+                    if (relation != "places_field" or occurrence["rule"] != "layout.item_field"
+                            or occurrence["path"] != components[source]["definitions"][0]["path"]):
+                        raise DataError("Invalid layout field placement evidence.")
                 if "assigned_value" in occurrence["resolution"]:
                     literal = occurrence["resolution"]["assigned_value"]
                     if (relation != "writes" or components[target]["kind"] != "field"
@@ -479,6 +504,18 @@ def validate_bundle(bundle):
                         raise DataError("Invalid literal write value.")
                     if "assigned_value_location" in occurrence["resolution"]:
                         validate_location(occurrence["resolution"]["assigned_value_location"])
+                if "record_update" in occurrence["resolution"]:
+                    update = occurrence["resolution"]["record_update"]
+                    if (relation != "writes" or components[source]["kind"] != "flow"
+                            or components[target]["kind"] != "field" or qualifiers.get("effect") != "memory"
+                            or occurrence["rule"] != "flow.assignment_destination"
+                            or not isinstance(update, dict) or set(update) != {"element", "collection", "site"}
+                            or any(not isinstance(update[key], str) or not API_NAME.fullmatch(update[key])
+                                   for key in ("element", "collection"))
+                            or not isinstance(update["site"], dict)
+                            or update["site"].get("path") != occurrence["path"]):
+                        raise DataError("Invalid Flow record update evidence.")
+                    validate_location(update["site"])
                 if relation in CUSTOM_METADATA_RELATIONS or occurrence["rule"] in _CUSTOM_METADATA_RULES.values():
                     if (_CUSTOM_METADATA_RULES.get(relation) != occurrence["rule"]
                             or occurrence["path"] != components[source]["definitions"][0]["path"]
@@ -550,6 +587,17 @@ def validate_bundle(bundle):
                           or components[target]["kind"] != "apexclass"
                           or declaration["path"] not in {site["path"] for site in components[target]["definitions"]}):
                         raise DataError("Invalid Apex static member evidence.")
+                if occurrence["rule"] == "apex.wrapper_record_field":
+                    proof = occurrence["resolution"]
+                    origin = proof["declaration"]
+                    member = proof["member_declaration"]
+                    validate_location(origin)
+                    validate_location(member)
+                    if (relation not in {"reads", "writes"} or components[source]["kind"] not in {"apexmethod", "apextrigger"}
+                            or components[target]["kind"] != "field" or qualifiers.get("effect") != "memory"
+                            or proof.get("basis") != "declared_wrapper_record_member"
+                            or origin["path"] != occurrence["path"] or not member["path"].endswith(".cls")):
+                        raise DataError("Invalid Apex wrapper member evidence.")
                 if dispatch_reason:
                     resolution = occurrence["resolution"]
                     if resolution.get("conditional") is not True or resolution.get("hook") not in components[target]["definitions"]:

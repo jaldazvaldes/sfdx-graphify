@@ -171,6 +171,9 @@ def diagnostic_context(bundle: dict, target: dict, results: list, *, mode: str =
                 site = proof.get(key)
                 if isinstance(site, dict) and isinstance(site.get("path"), str):
                     locations.append(site)
+            update = proof.get("record_update")
+            if isinstance(update, dict) and isinstance(site := update.get("site"), dict):
+                locations.append(site)
     paths.update(item["path"] for item in locations)
     spans = defaultdict(list)
     for location in locations:
@@ -332,6 +335,11 @@ def _custom_metadata_value_summary(matches: list[dict], components: dict) -> dic
                         "records": sorted(names, key=str.casefold)} for (kind, value), names in ordered]}
 
 
+def _is_custom_metadata_field(component: dict) -> bool:
+    return (component["kind"] == "field"
+            and component["api_name"].split(".", 1)[0].casefold().endswith("__mdt"))
+
+
 def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None = None,
                 limit: int = 1000, source=None, exclude_tests: bool = False, diagnostics: str = "summary",
                 value: str | None = None, index: QueryIndex | None = None) -> dict:
@@ -342,6 +350,10 @@ def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None 
     if value is not None:
         if not isinstance(value, str):
             raise QueryError("value must be a string.")
+        if relation in {None, "sets_value"} and _is_custom_metadata_field(target):
+            raise QueryError("The value filter matches write occurrences. To list configured custom metadata "
+                             "values, use --relation sets_value --format brief without --value. "
+                             "Use --relation writes --value to query literal writes explicitly.")
         if relation not in {None, "writes"}:
             raise QueryError("The value filter requires writes.")
         relation = "writes"
@@ -382,15 +394,14 @@ def _references(bundle: dict, name: str, endpoint: str, *, relation: str | None 
         result["class_references"] = _class_reference_summary(methods, matches)
     if relation == "grants" and result["coverage"].get("permission_selection", {}).get("included") is False:
         result["limitations"].append("Permission extraction was disabled for this snapshot. Use build --include-permissions to extract declared grants.")
-    if (endpoint == "target" and relation in {None, "sets_value"} and target["kind"] == "field"
-            and target["api_name"].split(".", 1)[0].casefold().endswith("__mdt")
+    if (endpoint == "target" and relation in {None, "sets_value"} and _is_custom_metadata_field(target)
             and bundle["manifest"]["schema_version"] >= 11):
         from .custom_metadata import field_default_summary
         result["custom_metadata_values"] = _custom_metadata_value_summary(matches, indexed)
         result["custom_metadata_values"].update(field_default_summary(target, relationships, indexed))
     if endpoint == "target":
         from .automation import reference_context
-        result.update(reference_context(bundle, target, relationships, indexed))
+        result.update(reference_context(bundle, target, relationships, indexed, results=result["results"], relation=relation))
     result["diagnostic_context"] = diagnostic_context(bundle, target, result["results"], mode=diagnostics)
     return result
 

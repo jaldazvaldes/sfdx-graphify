@@ -23,7 +23,7 @@ from .ui_apex import ui_source, extract_ui_apex
 from .validation_rules import extract_validation_rule
 from .inventory import extract_inventory, index_definitions, identity
 from .schema import (EXTRACTOR_VERSION, SCHEMA_VERSION, TESTED_API_VERSIONS,
-                     UPSTREAM_REVISION, DataError, FactStore, component_id, stable_id, validate_bundle)
+                     UPSTREAM_REVISION, DataError, FactStore, component_id, stable_id)
 from .snapshot import default_output, load, publish, validate_output
 from .xml_source import parse_xml
 
@@ -31,7 +31,8 @@ LIMITATIONS = [
     "Dependency evidence is incomplete; missing edges do not prove missing dependencies.",
     "Verify consequential conclusions against current source; no deployed org was inspected.",
     "A dependency graph does not describe Flow execution order or approved requirements.",
-    "Formula references and declared parent relationship paths have bounded support; formula evaluation, arbitrary aliases and layouts remain outside coverage.",
+    "Formula references and declared parent relationship paths have bounded support; formula evaluation and arbitrary aliases remain outside coverage.",
+    "Page layout field placements describe local layout items. Layout assignment and field visibility require additional evidence.",
     "Apex analysis is bounded and static; dynamic queries, unknown types and runtime data flow remain unresolved.",
     "Candidate static calls through an external caller hierarchy are explicitly marked; verify the missing base before treating dispatch as resolved.",
     "Flow, trigger, validation rule and workflow rule activation metadata describe local XML, not deployed or active org behavior.",
@@ -128,14 +129,15 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
             triggers[path] = data
         elif path.endswith(".trigger-meta.xml"):
             trigger_metadata.append(parse_xml(path, data))
-        elif path.casefold().endswith(".recordtype-meta.xml"):
-            # RecordType XML only corroborates lookup resolution. An invalid
-            # optional definition must not hide unrelated dependency evidence.
+        elif path.casefold().endswith((".recordtype-meta.xml", ".layout-meta.xml")):
+            # An invalid layout or RecordType must not hide unrelated dependency evidence.
             try:
                 document = parse_xml(path, data)
                 identity(document)
             except (ValueError, LookupError) as exc:
-                store.diagnostic("RECORD_TYPE_METADATA_UNRESOLVED", str(exc),
+                code = ("LAYOUT_METADATA_UNRESOLVED" if path.casefold().endswith(".layout-meta.xml")
+                        else "RECORD_TYPE_METADATA_UNRESOLVED")
+                store.diagnostic(code, str(exc),
                                  {"path": path, "content_hash": scan.inputs[path]}, state="unresolved")
             else:
                 documents.append(document)
@@ -215,6 +217,7 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
         "untested_api_versions": [v for v in versions if v not in TESTED_API_VERSIONS],
         "supported_metadata": ["Flow (bounded typed references, decisions and formula dependencies)", "CustomObject (inventory)",
                                "CustomField (inventory, lookup filters, controlling fields, formulas and roll-ups)",
+                               "Layout (field placements in layout section items)",
                                "RecordType (local evidence for a SOQL or Flow relationship)",
                                "ValidationRule (local activation, bounded formula references and error display fields)",
                                "ApexTrigger (events, literal handlers and bounded record references)",
@@ -265,7 +268,6 @@ def build_project(root, *, out=None, include_untracked=False, include_inactive=F
     bundle = {"manifest": manifest, "facts": facts, "diagnostics": diagnostics}
     manifest["snapshot_id"] = stable_id("snapshot", bundle)
     record_phase("manifest_and_fingerprint")
-    validate_bundle(bundle)
     publish(bundle, output, root, source_guard=scan.assert_unchanged)
     record_phase("validation_and_publication")
     return bundle

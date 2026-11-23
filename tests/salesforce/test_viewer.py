@@ -125,6 +125,25 @@ def test_schema_contains_only_fields_and_lookup_declarations(bundle):
     assert result["field_targets_grouped"] == 0
 
 
+def test_page_layout_placement_in_schema_impact_and_project_map():
+    from graphify.salesforce.graphify_adapter import projection_graph
+
+    store = FactStore()
+    account = store.ensure_component("object", "Account", location())
+    field = store.ensure_component("field", "Account.Name", location())
+    path = "force-app/main/default/layouts/Account-Details.layout-meta.xml"
+    layout = store.ensure_component("layout", "Account-Details", location(path=path))
+    store.relation(account, layout, "contains", location(path=path), "layout.owner")
+    store.relation(layout, field, "places_field", location(7, path), "layout.item_field")
+    bundle = seal(store)
+    model = viewer.SnapshotView(bundle)
+
+    assert {edge["relation"] for edge in model.view(layout, mode="schema")["edges"]} == {"contains", "places_field"}
+    assert [edge["source"] for edge in model.view(field, mode="impact")["edges"]] == [layout]
+    assert model.view(field, mode="automation")["edges"] == []
+    assert projection_graph(bundle)[layout][field]["relationship_details"][0]["layer"] == "schema"
+
+
 def test_validation_rule_automation_keeps_formula_and_display_field_evidence():
     store = FactStore()
     owner = store.ensure_component("object", "Account")

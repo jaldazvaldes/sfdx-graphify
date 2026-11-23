@@ -1,5 +1,9 @@
 """Synthetic SOQL, inner-class, async and platform-event extraction contracts."""
+import pytest
+
+from graphify.salesforce import query
 from tests.salesforce.test_apex_review_fixes import build
+from tests.salesforce.test_automation import build as build_snapshot
 
 
 def edges_from(store, source, *, rule=None):
@@ -215,6 +219,126 @@ def test_publication_treats_an_inline_event_array_as_a_collection():
     unresolved, = store.diagnostics
     assert unresolved["code"] == "APEX_PLATFORM_EVENT_PUBLISH_UNRESOLVED"
     assert unresolved["location"]["line"] == 4
+
+
+def test_fflib_publication_registers_typed_events_with_their_transaction_phase(tmp_path):
+    source = """public class Sender {
+      private fflib_ISObjectUnitOfWork work;
+      private Notice__e notice;
+      void run(fflib_ISObjectUnitOfWork injected, List<Notice__e> batch) {
+        fflib_SObjectUnitOfWork local = new fflib_SObjectUnitOfWork(new List<SObjectType>{Notice__e.SObjectType});
+        local.registerPublishAfterSuccessTransaction(batch);
+        this.work.registerPublishBeforeTransaction(new Notice__e(Payload__c = 'Synthetic'));
+        injected.REGISTERPUBLISHAFTERFAILURETRANSACTION(this.notice);
+      }
+    }"""
+    bundle = build_snapshot(tmp_path, {"classes/Sender.cls": source})
+    result = query.refs(bundle, "Notice__e", relation="publishes")
+    published = result["results"]
+    assert result["platform_event"]["publishers"] == ["sf:apexmethod:sender.run"]
+    assert len(published) == 3
+    actual = set()
+    for edge in published:
+        assert (edge["relation"], edge["target"]) == ("publishes", "sf:object:notice__e")
+        occurrence, = edge["evidence"]
+        assert occurrence["path"] == "force-app/classes/Sender.cls"
+        assert occurrence["rule"] == "apex.fflib_event_registration"
+        assert edge["qualifiers"]["effect"] == "fflib_registration"
+        actual.add((occurrence["line"], edge["qualifiers"]["timing"], edge["qualifiers"]["collection"]))
+    assert actual == {(6, "after_success_transaction", True), (7, "before_transaction", False),
+                      (8, "after_failure_transaction", False)}
+    assert not query.refs(bundle, "Notice__e", relation="writes")["results"]
+    payload, = query.refs(bundle, "Notice__e.Payload__c", relation="writes")["results"]
+    assert payload["evidence"][0]["rule"] == "apex.record_initializer"
+
+
+def test_fflib_registration_rejects_unknown_events_unrelated_receivers_and_other_api_names():
+    source = """public class Sender {
+      private fflib_ISObjectUnitOfWork work;
+      void run(Other work, fflib_ISObjectUnitOfWork real, SObject unknown, Notice__e[][] nested) {
+        work.registerPublishAfterSuccessTransaction(new Notice__e());
+        real.registerPublishAfterSuccessTransaction(unknown);
+        real.registerPublishAfterSuccessTransaction(nested);
+        real.registerPublishAfterSuccessTransaction(new Account());
+        real.registerPublishAfterSuccessTransaction(new Notice__e(), false);
+        real.registerPublishAfterSuccessTransactionLater(new Notice__e());
+        real.registerNew(new Notice__e());
+      }
+    }"""
+    store = build([("Sender", source)])
+    assert not any(e["relation"] == "publishes" for e in store.relationships.values())
+    assert {d["location"]["line"] for d in store.diagnostics if d["code"] == "APEX_PLATFORM_EVENT_PUBLISH_UNRESOLVED"} == {5, 6, 7}
+
+
+def test_fflib_registration_flags_an_external_ancestor_and_excludes_a_known_nested_type(tmp_path):
+    source = """public class Domain extends fflib_SObjectDomain {
+      void send(fflib_ISObjectUnitOfWork work, Notice__e notice) {
+        work.registerPublishAfterSuccessTransaction(notice);
+      }
+    }"""
+    shadow = """public class OtherDomain extends fflib_SObjectDomain {
+      public class fflib_ISObjectUnitOfWork { public void registerPublishAfterSuccessTransaction(Notice__e notice) {} }
+      void send(fflib_ISObjectUnitOfWork work, Notice__e notice) {
+        work.registerPublishAfterSuccessTransaction(notice);
+      }
+    }"""
+    bundle = build_snapshot(tmp_path, {"classes/Domain.cls": source, "classes/OtherDomain.cls": shadow})
+    result = query.refs(bundle, "Notice__e", relation="publishes")
+    assert result["platform_event"]["publishers"] == []
+    assert result["platform_event"]["candidate_publishers"] == ["sf:apexmethod:domain.send"]
+    edge, = result["results"]
+    assert edge["resolution"]["status"] == "candidate"
+    assert edge["resolution"]["missing_ancestors"] == ["fflib_SObjectDomain"]
+    assert edge["evidence"][0]["line"] == 3
+
+
+def test_locally_defined_fflib_receiver_must_declare_the_contract_and_preserves_normal_call_evidence():
+    sender = """public class Sender {
+      void run() {
+        fflib_SObjectUnitOfWork work = new fflib_SObjectUnitOfWork();
+        work.registerPublishAfterSuccessTransaction(new Notice__e());
+      }
+    }"""
+    class_name = "fflib_SObjectUnitOfWork"
+    local = "public class fflib_SObjectUnitOfWork { public void registerPublishAfterSuccessTransaction(SObject row) {} }"
+    implementation = local.replace(" { public", " implements fflib_ISObjectUnitOfWork { public")
+    for definition, expected in [(local, False), (implementation, True)]:
+        store = build([("Sender", sender), (class_name, definition)])
+        rows = edges_from(store, "sf:apexmethod:sender.run")
+        assert any(e["relation"] == "publishes" for e in rows) is expected
+        assert any(e["relation"] == "calls" and e["target"] == "sf:apexmethod:fflib_sobjectunitofwork.registerpublishaftersuccesstransaction"
+                   for e in rows)
+    overloaded = implementation[:-1] + "public void registerPublishAfterSuccessTransaction(Notice__e notice) {} }"
+    store = build([("Sender", sender), (class_name, overloaded)])
+    assert not any(d["code"] == "APEX_PARSE_ERROR" for d in store.diagnostics)
+    assert not any(e["relation"] == "publishes" for e in edges_from(store, "sf:apexmethod:sender.run"))
+
+
+@pytest.mark.parametrize(("overloads", "expected"), [
+    (["SObject", "List<SObject>"], {"batch", "single"}),
+    (["SObject"], {"single"}),
+    (["List<SObject>"], {"batch"}),
+    (["Object"], set()),
+    (["SObject", "List<SObject>", "Notice__e"], set()),
+    (["List<SObject>", "SObject[]"], set()),
+])
+def test_vendored_fflib_interface_must_establish_a_compatible_unambiguous_contract(overloads, expected):
+    method = "registerPublishAfterSuccessTransaction"
+    api = "fflib_ISObjectUnitOfWork"
+    implementation = "fflib_SObjectUnitOfWork"
+    interface_source = "public interface " + api + " {" + "".join(
+        f"void {method}({arg} notices);" for arg in overloads) + "}"
+    class_source = f"public class {implementation} implements {api} {{" + "".join(
+        f"public void {method}({arg} notices) {{}}" for arg in ("SObject", "List<SObject>")) + "}"
+    sender = "public class Sender {" + "".join(
+        f"void {label}{shape}({receiver} work, {arg} notices) {{ work.{method}(notices); }}"
+        for label, receiver in [("iface", api), ("impl", implementation)]
+        for shape, arg in [("single", "Notice__e"), ("batch", "Notice__e[]")]
+    ) + "}"
+    store = build([("Sender", sender), (api, interface_source), (implementation, class_source)])
+    assert not any(d["code"] == "APEX_PARSE_ERROR" for d in store.diagnostics)
+    assert {e["source"] for e in store.relationships.values() if e["relation"] == "publishes"} == {
+        f"sf:apexmethod:sender.{label}{shape}" for label in ("iface", "impl") for shape in expected}
 
 
 def test_inner_class_sees_the_enclosing_static_member_that_shadows_eventbus():

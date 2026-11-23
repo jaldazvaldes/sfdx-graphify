@@ -18,7 +18,7 @@ _EXECUTABLE_KINDS = {
     "approvalprocess", "outboundmessage",
 }
 _DEPENDENCIES = {"calls", "reads", "writes", "filters", "references", "triggered_by", "publishes", "subscribes"}
-_SCHEMA = {"contains", "instance_of", "sets_value"}
+_SCHEMA = {"contains", "instance_of", "sets_value", "places_field"}
 
 
 def _citations(steps: list[dict]) -> tuple[set[str], set[tuple[str, int]]]:
@@ -78,7 +78,7 @@ def process_dependency_bundle(model: SnapshotView, process: dict, *, step_id: st
     # which was not explicitly named in the catalog.
     for source in sorted(authored):
         for edge in edges_at(model.outgoing.get(source, [])):
-            if edge["relation"] in _DEPENDENCIES and on_cited_line(edge):
+            if (edge["relation"] in _DEPENDENCIES or edge["relation"] == "places_field") and on_cited_line(edge):
                 include(edge)
 
     if step_id is None:
@@ -108,7 +108,7 @@ def process_dependency_bundle(model: SnapshotView, process: dict, *, step_id: st
     # Give each used field or method its declared owner without pulling in the
     # owner's other fields, methods, or callers.
     for node in sorted(selected_nodes):
-        if components[node]["kind"] not in {"field", "apexmethod", "apexclass"}:
+        if components[node]["kind"] not in {"field", "apexmethod", "apexclass", "layout"}:
             continue
         for edge in edges_at(model.incoming.get(node, [])):
             if edge["relation"] == "contains":

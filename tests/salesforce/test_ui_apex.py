@@ -60,6 +60,15 @@ def test_aura_enqueues_literal_actions_with_markup_and_javascript_provenance():
     assert evidence["content_hash"] == hashlib.sha256(script).hexdigest()
     assert evidence["resolution"]["enqueue"]["line"] == 5
     assert evidence["resolution"]["controller_declaration"]["content_hash"] == hashlib.sha256(markup).hexdigest()
+    from graphify.salesforce.evidence_text import evidence_lines
+
+    rows = [{**edge, "evidence": [store.evidence[key] for key in edge["evidence_ids"]]}
+            for edge in found.values()]
+    lines = evidence_lines({"results": rows})
+    assert lines.count(f"Aura controller markup root: {AURA}.cmp:1") == 1
+    assert AURA + "Controller.js" in lines
+    assert "  3 sample calls auraexample.load [lookup, enqueue at line 5]" in lines
+    assert "  6 sample calls auraexample.direct [lookup, enqueue at line 6]" in lines
     codes = {row["code"] for row in store.diagnostics}
     assert {"AURA_APEX_TARGET_UNRESOLVED", "AURA_APEX_ACTION_USE_UNRESOLVED"} <= codes
 

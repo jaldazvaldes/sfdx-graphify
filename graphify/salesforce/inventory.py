@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 
 from .field_dependencies import FIELD_DEPENDENCY_TAGS, extract_field_dependencies
-from .schema import API_NAME, DataError, FactStore, canonical_json
+from .schema import API_NAME, DataError, FactStore, canonical_json, component_id
 from .xml_source import Document
 
 SUFFIXES = {".flow-meta.xml": ("flow", "Flow"),
+            ".layout-meta.xml": ("layout", "Layout"),
             ".object-meta.xml": ("object", "CustomObject"),
             ".field-meta.xml": ("field", "CustomField"),
             ".validationRule-meta.xml": ("validationrule", "ValidationRule"),
@@ -23,6 +24,14 @@ def identity(document):
             if document.root.tag != root_tag:
                 raise DataError(f"Expected {root_tag} root: {document.path}")
             name = path.name[:-len(suffix)]
+            if kind == "layout":
+                # Profile layout references use the same escaping as DX filenames.
+                component_id(kind, name)
+                full_names = document.root.all("fullName")
+                if (path.parent.name.casefold() != "layouts" or len(full_names) > 1
+                        or full_names and (full_names[0].children or full_names[0].text != name)):
+                    raise DataError(f"Expected a matching Salesforce DX layout filename and fullName: {document.path}")
+                return kind, name
             declared = document.root.value("fullName")
             if declared and declared != name:
                 raise DataError(f"Metadata fullName and filename differ: {document.path}")
@@ -134,6 +143,28 @@ _OBJECT_DESCRIPTIVE = {
 }
 
 
+def _extract_layout(document, store, source, owner):
+    definition = document.location(document.root)
+    owner_id = store.resolve_component("object", owner, definition)
+    if owner_id is None:
+        return
+    store.relation(owner_id, source, "contains", definition, "layout.owner")
+    for section in document.root.all("layoutSections"):
+        for column in section.all("layoutColumns"):
+            for item in column.all("layoutItems"):
+                fields = item.all("field")
+                if not fields:
+                    continue
+                if len(fields) != 1 or fields[0].children or not API_NAME.fullmatch(fields[0].text):
+                    store.diagnostic("LAYOUT_FIELD_UNRESOLVED", "Expected one direct field API name in the layout item.",
+                                     document.location(fields[0]), state="unresolved")
+                    continue
+                location = document.location(fields[0])
+                target = store.field(owner, fields[0].text, location)
+                if target:
+                    store.relation(source, target, "places_field", location, "layout.item_field")
+
+
 def extract_inventory(documents: list[Document], store: FactStore):
     field_expressions = []
     lookup_targets = store.raw_lookup_targets
@@ -144,6 +175,9 @@ def extract_inventory(documents: list[Document], store: FactStore):
         root = document.root
         source = store.resolve_component(kind, name, document.location(root))
         if source is None:
+            continue
+        if kind == "layout":
+            _extract_layout(document, store, source, name.partition("-")[0])
             continue
         if kind == "field":
             owner = name.split(".")[0]

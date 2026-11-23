@@ -54,3 +54,64 @@ def test_record_properties_respect_getter_shape_and_receiver_scope():
     assert [item["line"] for item in writes["evidence"]] == [7]
     contact, = query.refs(bundle, "Contact.Name", relation="writes")["results"]
     assert [item["line"] for item in contact["evidence"]] == [6]
+
+
+def test_typed_wrapper_record_reads_and_writes_keep_the_member_declaration():
+    wrapper = """public class Packet {
+        public Account record { get; private set; }
+        public Account plain;
+    }"""
+    source = """public class Writer {
+        public static void change(List<Packet> items, Packet argument) {
+            for (Packet item : items) {
+                item.record.Description = item.record.Description + ' revised';
+            }
+            Packet local = argument;
+            local.plain.Description = 'Ready';
+        }
+    }"""
+    store = build([("Packet", wrapper), ("Writer", source)])
+    bundle = {"manifest": {"snapshot_id": "synthetic"}, "facts": store.finish(), "diagnostics": store.diagnostics}
+    writes, = query.refs(bundle, "Account.Description", relation="writes")["results"]
+    read, = query.refs(bundle, "Account.Description", relation="reads")["results"]
+    assert {item["line"] for item in writes["evidence"]} == {4, 7}
+    assert {item["line"] for item in read["evidence"]} == {4}
+    assert writes["qualifiers"] == {"effect": "memory", "operation": "assignment"}
+    for item in [*writes["evidence"], *read["evidence"]]:
+        assert item["rule"] == "apex.wrapper_record_field"
+        proof = item["resolution"]
+        assert proof["basis"] == "declared_wrapper_record_member"
+        assert proof["declaration"]["path"] == "classes/Writer.cls"
+        assert proof["member_declaration"]["path"] == "classes/Packet.cls"
+        assert proof["member_declaration"]["line"] == (3 if item["line"] == 7 else 2)
+    literal, = query.refs(bundle, "Account.Description", relation="writes", value="Ready")["results"]
+    assert [item["line"] for item in literal["evidence"]] == [7]
+    assert "APEX_LOOP_ALIAS_UNSUPPORTED" not in {item["code"] for item in store.diagnostics}
+
+
+def test_wrapper_chain_rejects_unproven_or_inaccessible_members():
+    wrapper = """public class Packet {
+        public Account readOnly { get; }
+        public Account computed { get { return null; } set; }
+        public Account inaccessible { private get; set; }
+        public static Account staticRecord;
+        public SObject dynamicRecord;
+        public List<Account> collection;
+        public Account duplicate;
+        public Account duplicate;
+    }"""
+    source = """public class Writer {
+        public void change(Packet item, Object unknown, Vendor.Packet remote) {
+            item.readOnly.Description = 'No';
+            item.computed.Description = 'No';
+            item.inaccessible.Description = 'No';
+            item.staticRecord.Description = 'No';
+            item.dynamicRecord.Description = 'No';
+            item.collection.Description = 'No';
+            item.duplicate.Description = 'No';
+            unknown.computed.Description = 'No';
+            remote.computed.Description = 'No';
+        }
+    }"""
+    store = build([("Packet", wrapper), ("Writer", source)])
+    assert not any(item["rule"] == "apex.wrapper_record_field" for item in store.evidence.values())

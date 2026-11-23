@@ -158,6 +158,37 @@ def test_fingerprint_discovery_preserves_working_bytes_and_selection(tmp_path):
                       "changed": [FLOW], "scope_changed": False}
 
 
+@pytest.mark.parametrize("fingerprints_only", [False, True])
+def test_batched_discovery_preserves_scan_and_change_detection(tmp_path, monkeypatch, fingerprints_only):
+    from graphify.salesforce import discovery
+
+    root = project(tmp_path / "source")
+    put(root, "sfdx-project.json", json.dumps({"packageDirectories": [
+        {"path": "force-app"}, {"path": "force-app/main"},
+    ]}))
+    for number in range(20):
+        put(root, f"force-app/main/Example{number}.cls", f"class Example{number} {{}}")
+    put(root, "force-app/main/readme.txt", "tracked unsupported input")
+    put(root, "force-app/main/ignored/Example.cls", "ignored input")
+    put(root, ".forceignore", "**/ignored/\n")
+    commit(root)
+    put(root, "force-app/main/Example0.cls", "class Example0 { Integer changed; }")
+    put(root, "force-app/main/readme.txt", "changed unsupported input")
+    put(root, "force-app/main/New.cls", "class New {}")
+    options = {"include_untracked": True, "fingerprints_only": fingerprints_only}
+
+    serial = discover(root, **options)
+    monkeypatch.setattr(discovery, "_CAPTURE_BATCH_SIZE", 2)
+    batched = discover(root, **options)
+    assert batched == serial
+    assert batched.scope["changes_from_head"] == {"modified": 2, "deleted": 0, "added": 1}
+    assert batched.scope["selected_file_count"] == 23
+
+    put(root, "force-app/main/Example0.cls", "class Example0 { String changed; }")
+    with pytest.raises(DataError, match="Source changed during the build"):
+        batched.assert_unchanged()
+
+
 def test_git_deletion_and_empty_rebuild_remove_obsolete_facts(tmp_path):
     root = project(tmp_path / "source")
     commit(root)
@@ -455,7 +486,9 @@ def test_source_link_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("fingerprints_only", [False, True])
-def test_discovery_rejects_file_symlinks_inside_walked_directory(tmp_path, fingerprints_only):
+def test_discovery_rejects_file_symlinks_inside_walked_directory(tmp_path, monkeypatch, fingerprints_only):
+    from graphify.salesforce import discovery
+
     root = project(tmp_path / "source")
     target = put(tmp_path, "External.cls", "public class External {}")
     link = root / "force-app" / "Linked.cls"
@@ -463,6 +496,7 @@ def test_discovery_rejects_file_symlinks_inside_walked_directory(tmp_path, finge
         link.symlink_to(target)
     except OSError:
         pytest.skip("Symlink creation is unavailable on this host")
+    monkeypatch.setattr(discovery, "_CAPTURE_BATCH_SIZE", 1)
     with pytest.raises(DataError, match="links and junctions"):
         discover(root, fingerprints_only=fingerprints_only)
 

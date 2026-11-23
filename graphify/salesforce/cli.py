@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 
+from .evidence_text import compact_literal_hints, event_rows, record_update_text, relationship_labels
 from .schema import RELATED_EVIDENCE_SITES, RELATIONS, DataError, EXTRACTOR_VERSION, SCHEMA_VERSION
 from . import query
 
@@ -19,13 +20,16 @@ Check activity_policy in query results: older snapshots can include every local 
 Inspect coverage and diagnostics before relying on results.
 Use --format brief for one source location per relationship and diagnostic totals.
 Use --format evidence on refs, deps, and impact for compact source locations grouped by file.
+For field writes and declared Flow status, use: sfdx-graphify refs Account.Name --relation writes --format evidence --flow-status --source .
+Use --format summary for counts and representative citations. Use evidence for all returned sites.
 Use --format text for detailed evidence, --full-coverage for the complete coverage object or JSON for structured output.
 refs, deps and impact include diagnostic_context: complete counts by code/file and at most 20 focused records by default.
 Use --diagnostics full for every diagnostic in consulted files; JSONL/HTTP requests use diagnostics: "full".
 omitted_count reports records omitted from the response; no diagnostics are removed from the snapshot.
 Zero results or zero local diagnostics do not establish complete coverage of unknown consumers.
 Find exact references with: sfdx-graphify refs Account.Name --format brief
-Inspect what a Flow uses with: sfdx-graphify deps Sample_Flow --format json
+Inspect a Flow's dependencies with: sfdx-graphify deps Sample_Flow --format evidence
+Read decisions and start criteria from the Flow XML with: sfdx-graphify flow-outline Sample_Flow --element decisions start --format evidence
 Inspect validation rule inputs with: sfdx-graphify deps sf:validationrule:account.require_phone --format json
 Count declared save automation with: sfdx-graphify refs Order --relation triggered_by --limit 20 --format brief
 Find an assigned literal with: sfdx-graphify refs Order.Status --value 'Ready' --format brief
@@ -84,6 +88,13 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--timings", action="store_true", help="Report elapsed build phases in seconds on stderr.")
     build.add_argument("--format", choices=("json", "text"), default="json")
     commands.add_parser("guide", help="Print agent usage guidance without writing files.")
+    outline = commands.add_parser("flow-outline", help="List top-level Flow XML declarations and source lines.")
+    outline.add_argument("file", help="Flow API name or XML basename in the current project, or an explicit XML path.")
+    outline.add_argument("--format", choices=("json", "evidence"), default="json",
+                         help="Use evidence for file:line citations for each value.")
+    outline.add_argument("--element", nargs="+", default=(), help="Return the requested XML element types, e.g. decisions start.")
+    outline.add_argument("--offset", type=int, default=0, help="Pagination offset within the filtered elements.")
+    outline.add_argument("--limit", type=int, default=32, help="Elements per page (1 to 128).")
     install = commands.add_parser("install", help="Copy the Salesforce skill for an assistant.")
     install.add_argument("--platform", choices=("claude", "codex"), default="claude")
     install.add_argument("--project", action="store_true", help="Install in the current project directory.")
@@ -136,7 +147,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--source", type=Path)
         formats = ("json", "text", "brief")
         if name in ("refs", "deps", "impact"):
-            formats += ("evidence",)
+            formats += ("evidence", "summary")
         command.add_argument("--format", choices=formats, default="json",
                              help="JSON, detailed text, or a compact source view.")
         command.add_argument("--full-coverage", action="store_true",
@@ -150,6 +161,9 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--diagnostics", choices=("summary", "full"), default="summary",
                                  help="Summary counts and up to 20 focused records (default), or every consulted-file diagnostic.")
         if name == "refs":
+            command.add_argument("--flow-status", action="store_true",
+                                 help="Print verified write citations and declared Flow statuses. Requires "
+                                      "--relation writes --format evidence --source <checkout>.")
             command.add_argument("--value", help="Filter writes by an exact assigned literal, such as 'Ready' or true.")
         if name == "impact":
             command.add_argument("--depth", type=int, default=2)
@@ -323,7 +337,7 @@ def _candidate_label(candidate: dict) -> str:
     return api_name if api_name == candidate["id"] else f"{api_name} [{candidate['id']}]"
 
 
-def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> str:
+def _text(result: dict, *, full_coverage: bool = False, brief: bool = False, compact_hints: bool = False) -> str:
     from .automation import reference_lines
 
     lines = [f"Snapshot: {result.get('snapshot_id', 'unavailable')}"]
@@ -380,7 +394,8 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
             lines.append(f"  {_value_text(group['value'], brief=brief)} in {group['record_count']} records ({examples}).")
         if brief and len(groups) > 8:
             lines.append(f"  {len(groups) - 8} more value groups. Use JSON or detailed text for the full summary.")
-    for item in result.get("results", []):
+    rows, grants = event_rows(result)
+    for item in rows:
         if "relation" in item:
             qualifiers = item.get("qualifiers", {})
             assignment_context = {"memory": " in memory", "database": " in database operation"}.get(
@@ -394,6 +409,9 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
             if item["relation"] == "mentions":
                 relation += " (inferred)"
             relationship = f"{item['source']} --{relation}--> {item['target']}"
+            labels = " ".join(f"[{label}]" for label in relationship_labels(item))
+            if labels:
+                relationship += f" {labels}"
             lines.append(relationship if brief else f"{relationship} [{item['id']}]")
             if item["relation"] in {"triggered_by", "subscribes", "publishes"}:
                 order = qualifiers.get("trigger_order")
@@ -425,6 +443,8 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                 literal = query.assigned_write_value(occurrence)
                 if literal is not None:
                     location += f" [assigned{assignment_context} {_value_text(literal['value'], brief=True)}]"
+                if update := record_update_text(occurrence, relative=True):
+                    location += f" [{update}]"
                 extra = len(evidence) - 1
                 lines.append(f"  {location}" + (f" (+{extra} more occurrences)" if extra else ""))
             for occurrence in (() if brief else evidence):
@@ -437,6 +457,8 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
                 literal = query.assigned_write_value(occurrence)
                 if literal is not None:
                     lines.append(f"    Assigned literal{assignment_context}: {_value_text(literal['value'], brief=False)}.")
+                if update := record_update_text(occurrence):
+                    lines.append(f"    {update}.")
                 for key, label in RELATED_EVIDENCE_SITES:
                     site = proof.get(key)
                     if isinstance(site, dict) and site.get("path"):
@@ -444,6 +466,8 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
         else:
             lines.append(f"{item['api_name']} ({item['kind']})" if brief else
                          f"{item['id']} {item.get('api_name', '')}")
+    if grants:
+        lines.append(grants)
     if result.get("truncated"):
         lines.append("Results truncated by traversal depth or limit.")
     if "truncation" in result and not brief:
@@ -472,7 +496,9 @@ def _text(result: dict, *, full_coverage: bool = False, brief: bool = False) -> 
             lines.append(context["full_details"])
     if "literal_blind_spots" in result:
         mentions = result["literal_blind_spots"]
-        if mentions["state"] == "indexed":
+        if compact_hints and mentions["state"] == "indexed":
+            lines.extend(compact_literal_hints(mentions))
+        elif mentions["state"] == "indexed":
             lines.append(f"Literal search in selected metadata: {mentions['scanned_file_count']} files scanned, "
                          f"{mentions['skipped_file_count']} skipped.")
             for key, label in (("qualified", "qualified"), ("field_name", "field name"),
@@ -515,6 +541,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "guide":
         print(GUIDANCE, end="")
+        return 0
+    if args.command == "flow-outline":
+        from .flow_outline import flow_outline, flow_outline_evidence, resolve_flow_path
+
+        try:
+            path = resolve_flow_path(args.file)
+            page = flow_outline(path, element=args.element, offset=args.offset, limit=args.limit)
+        except (OSError, ValueError) as exc:
+            print(f"{args.file}: {exc}", file=sys.stderr)
+            return 1
+        if args.format == "evidence":
+            print(flow_outline_evidence(path, page, elements=args.element, offset=args.offset))
+        else:
+            print(json.dumps({"path": path.as_posix(), **page}, ensure_ascii=False, separators=(",", ":")))
         return 0
     if args.command == "check-apex":
         from .apex_source_check import check_apex_lines
@@ -584,7 +624,16 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     output_format = args.format
     bundle = None
+    flow_status = getattr(args, "flow_status", False)
+    query_source = getattr(args, "source", None)
+    if flow_status and not args.require_current:
+        # The writer-specific view checks the returned source files by hash.
+        query_source = None
     try:
+        if flow_status and (args.relation != "writes" or output_format != "evidence" or
+                            args.source is None or args.server is not None):
+            raise DataError("--flow-status requires --relation writes --format evidence --source <checkout> "
+                            "and a local snapshot.")
         code = 0
         if args.command == "build":
             from .service import build_project
@@ -648,12 +697,19 @@ def main(argv: list[str] | None = None) -> int:
                 options = {key: getattr(args, key) for key in ("relation", "limit", "depth", "kind", "exclude_tests", "diagnostics", "value")
                            if hasattr(args, key)}
                 result = query.dispatch(bundle, args.command, getattr(args, "name", ""),
-                                        source=args.source, **options)
+                                        source=query_source, **options)
         if getattr(args, "require_current", False) and result["freshness"]["state"] != "current":
             result["error"] = "The snapshot could not be verified as current."
             code = 5
+        if flow_status and not code:
+            from .evidence_text import writer_evidence_lines
+            if result["component"]["kind"] != "field":
+                raise DataError("--flow-status requires a field such as Account.Name.")
+            result["writer_evidence"] = writer_evidence_lines(
+                result, bundle["manifest"]["inputs"], args.source, full_coverage=args.full_coverage
+            )
     except query.QueryError as exc:
-        result = (query.envelope(bundle, [], source=getattr(args, "source", None))
+        result = (query.envelope(bundle, [], source=query_source)
                   if bundle is not None else
                   {"schema_version": SCHEMA_VERSION, "snapshot_id": None,
                    "freshness": {"state": "unknown"}, "coverage": {}, "results": [],
@@ -672,11 +728,15 @@ def main(argv: list[str] | None = None) -> int:
                   "error": f"Required local dependency is unavailable: {exc}"}
         code = 1
     full_coverage = args.command in {"build", "export"} or getattr(args, "full_coverage", False)
-    if output_format == "evidence":
-        from .evidence_text import evidence_lines
+    if "writer_evidence" in result:
+        output = "\n".join(result["writer_evidence"])
+    elif output_format in {"evidence", "summary"}:
+        from .evidence_text import evidence_lines, summary_lines
 
-        header = _text({**result, "results": []}, full_coverage=full_coverage, brief=True)
-        output = "\n".join([header, *evidence_lines(result)])
+        header = _text({**result, "results": []}, full_coverage=full_coverage, brief=True,
+                       compact_hints=args.relation is not None)
+        sites = evidence_lines(result) if output_format == "evidence" else summary_lines(result)
+        output = "\n".join([header, *sites])
     elif output_format == "json":
         output = json.dumps(result, ensure_ascii=False, sort_keys=True)
     else:

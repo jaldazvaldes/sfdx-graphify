@@ -9,8 +9,11 @@ import re
 import stat
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections import deque
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Literal, overload
 
@@ -32,6 +35,8 @@ _SUPPORTED = (".flow-meta.xml", ".object-meta.xml", ".field-meta.xml", ".validat
               ".cls", ".trigger", ".trigger-meta.xml")
 _MAX_FILE_BYTES = 32 * 1024 * 1024
 _GIT_TIMEOUT_ENV = "SFDX_GRAPHIFY_GIT_TIMEOUT_SECONDS"
+_CAPTURE_WORKERS = 4
+_CAPTURE_BATCH_SIZE = 48
 
 
 def lwc_bundle(relative: str) -> tuple[str, str] | None:
@@ -47,6 +52,9 @@ def lwc_bundle(relative: str) -> tuple[str, str] | None:
 def supported_source(relative: str) -> bool:
     if relative.lower().endswith(_SUPPORTED) or lwc_bundle(relative) is not None:
         return True
+    if relative.lower().endswith(".layout-meta.xml"):
+        path = PurePosixPath(relative)
+        return path.parent.name.casefold() == "layouts" and "-" in path.name[:-len(".layout-meta.xml")]
     from .ui_apex import ui_source
     return ui_source(relative)
 
@@ -90,6 +98,23 @@ def _safe_path(root: Path, relative: str, *, walked_file: bool = False) -> Path:
     return current
 
 
+def _package_directories(root: Path, project: dict) -> list[str]:
+    directories = project["packageDirectories"]
+    if not isinstance(directories, list) or not directories:
+        raise ValueError("packageDirectories must be a nonempty array")
+    package_dirs = set()
+    for item in directories:
+        value = item["path"]
+        if not isinstance(value, str) or not value or value.startswith("/"):
+            raise ValueError("invalid package directory")
+        value = value.replace("\\", "/").rstrip("/") or "."
+        candidate = _safe_path(root, value)
+        if candidate.exists() and not candidate.is_dir():
+            raise ValueError("package directory is not a directory")
+        package_dirs.add(PurePosixPath(value).as_posix())
+    return sorted(package_dirs)
+
+
 def _bytes(path: Path) -> bytes:
     try:
         if path.stat().st_size > _MAX_FILE_BYTES:
@@ -129,6 +154,32 @@ def _capture(path: Path, *, keep_bytes: bool, git_algorithm: str | None = None) 
         return b"".join(chunks) if chunks is not None else None, digest.hexdigest(), blob.hexdigest() if blob else None
     except OSError as exc:
         raise DataError(f"Cannot read input {path.name}: {exc.strerror}") from exc
+
+
+def _capture_files(
+    root: Path, candidates: Iterator[tuple[str, bool, str | None]],
+) -> Iterator[tuple[str, bytes | None, str, str | None]]:
+    """Check paths and read their bytes in a bounded window, yielding in walk order."""
+    def read_batch(batch: list[tuple[str, bool, str | None]]) -> list[tuple[str, bytes | None, str, str | None]]:
+        return [
+            (relative, *_capture(_safe_path(root, relative, walked_file=True),
+                                 keep_bytes=keep_bytes, git_algorithm=algorithm))
+            for relative, keep_bytes, algorithm in batch
+        ]
+
+    batch = list(islice(candidates, _CAPTURE_BATCH_SIZE))
+    if len(batch) < _CAPTURE_BATCH_SIZE:
+        yield from read_batch(batch)
+        return
+
+    with ThreadPoolExecutor(max_workers=_CAPTURE_WORKERS) as pool:
+        pending = deque([pool.submit(read_batch, batch)])
+        while batch := list(islice(candidates, _CAPTURE_BATCH_SIZE)):
+            pending.append(pool.submit(read_batch, batch))
+            if len(pending) == 2 * _CAPTURE_WORKERS:
+                yield from pending.popleft().result()
+        for finished in pending:
+            yield from finished.result()
 
 
 @overload
@@ -318,20 +369,7 @@ def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: 
             or not re.fullmatch(r"[1-9][0-9]*\.[0-9]+", source_api_version)
         ):
             raise ValueError("sourceApiVersion must be a version string such as 64.0")
-        directories = project["packageDirectories"]
-        if not isinstance(directories, list) or not directories:
-            raise ValueError("packageDirectories must be a nonempty array")
-        package_dirs = []
-        for item in directories:
-            value = item["path"]
-            if not isinstance(value, str) or not value or value.startswith("/"):
-                raise ValueError("invalid package directory")
-            value = value.replace("\\", "/").rstrip("/") or "."
-            candidate = _safe_path(root, value)
-            if candidate.exists() and not candidate.is_dir():
-                raise ValueError("package directory is not a directory")
-            package_dirs.append(PurePosixPath(value).as_posix())
-        package_dirs = sorted(set(package_dirs))
+        package_dirs = _package_directories(root, project)
     except (UnicodeError, ValueError, TypeError, KeyError) as exc:
         raise DataError(f"Invalid sfdx-project.json: {exc}") from exc
     try:
@@ -386,49 +424,47 @@ def discover(root: Path, include_untracked: bool = False, *, fingerprints_only: 
     def walk_error(exc: OSError) -> None:
         raise DataError("Cannot enumerate all selected source directories") from exc
 
-    for directory in package_dirs:
-        base = _safe_path(root, directory)
-        if directory != "." and (_excluded(directory)
-                                 or _force_ignored(force_spec, directory, ignored_dirs, directory=True)):
-            excluded.add(directory + "/")
-            continue
-        if not base.exists():
-            continue
-        for current, dirs, names in os.walk(base, followlinks=False, onerror=walk_error):
-            for name in list(dirs):
-                path = Path(current) / name
-                relative = path.relative_to(root).as_posix()
-                if _excluded(relative) or _force_ignored(force_spec, relative, ignored_dirs, directory=True):
-                    dirs.remove(name)
-                    excluded.add(relative + "/")
-                else:
-                    _safe_path(root, relative)
-            for name in names:
-                relative = (Path(current) / name).relative_to(root).as_posix()
-                if relative in _CONFIG_FILES:
-                    continue
-                if _excluded(relative) or _force_ignored(force_spec, relative, ignored_dirs):
-                    excluded.add(relative)
-                    continue
-                if selected is not None and relative not in selected:
-                    continue
-                if relative in paths:
-                    continue
-                path = _safe_path(root, relative, walked_file=True)
-                is_supported = supported_source(relative)
-                if is_supported:
-                    supported_paths.add(relative)
-                prior = head_files.get(relative)
-                algorithm = ("sha256" if len(prior) == 64 else "sha1") if prior else None
-                content, digest, blob_digest = _capture(
-                    path, keep_bytes=is_supported and not fingerprints_only, git_algorithm=algorithm,
-                )
-                inputs[relative] = digest
-                if content is not None:
-                    supported[relative] = content
-                if blob_digest is not None:
-                    blob_hashes[relative] = blob_digest
-                paths.add(relative)
+    def capture_candidates() -> Iterator[tuple[str, bool, str | None]]:
+        for directory in package_dirs:
+            base = _safe_path(root, directory)
+            if directory != "." and (_excluded(directory)
+                                     or _force_ignored(force_spec, directory, ignored_dirs, directory=True)):
+                excluded.add(directory + "/")
+                continue
+            if not base.exists():
+                continue
+            for current, dirs, names in os.walk(base, followlinks=False, onerror=walk_error):
+                parent = Path(current)
+                for name in list(dirs):
+                    relative = (parent / name).relative_to(root).as_posix()
+                    if _excluded(relative) or _force_ignored(force_spec, relative, ignored_dirs, directory=True):
+                        dirs.remove(name)
+                        excluded.add(relative + "/")
+                    else:
+                        _safe_path(root, relative)
+                for name in names:
+                    relative = (parent / name).relative_to(root).as_posix()
+                    if relative in _CONFIG_FILES:
+                        continue
+                    if _excluded(relative) or _force_ignored(force_spec, relative, ignored_dirs):
+                        excluded.add(relative)
+                        continue
+                    if (selected is not None and relative not in selected) or relative in paths:
+                        continue
+                    paths.add(relative)
+                    is_supported = supported_source(relative)
+                    if is_supported:
+                        supported_paths.add(relative)
+                    prior = head_files.get(relative)
+                    algorithm = ("sha256" if len(prior) == 64 else "sha1") if prior else None
+                    yield relative, is_supported and not fingerprints_only, algorithm
+
+    for relative, content, digest, blob_digest in _capture_files(root, capture_candidates()):
+        inputs[relative] = digest
+        if content is not None:
+            supported[relative] = content
+        if blob_digest is not None:
+            blob_hashes[relative] = blob_digest
 
     inputs = dict(sorted(inputs.items()))
     supported = dict(sorted(supported.items()))
